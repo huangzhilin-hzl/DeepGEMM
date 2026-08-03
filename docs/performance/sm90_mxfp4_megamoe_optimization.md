@@ -1121,3 +1121,47 @@ reduce generated-code spill when it is converted into a separate FP32 array
 before the epilogue. The next controlled variant must let the L2 epilogue
 consume the packed accumulator directly, eliminating the overlapping FP32
 array rather than relying on compiler lifetime reuse.
+
+## Rejected experiment: direct packed-BF16 L2 epilogue
+
+Iteration 12c keeps Iteration 12b's packed-BF16 promotion but removes the
+post-loop BF16-to-FP32 array conversion. The regular L2 epilogue instead stores
+each `nv_bfloat162` pair directly into the CTA BF16 scratch tile before the
+existing NVLink scatter. This makes `final_accum` dead throughout the
+processed L2 specialization and tests whether the original 1,064-byte stack
+frame came only from overlapping packed and unpacked epilogue lifetimes.
+
+Fresh-JIT one-rank Flash and eight-rank Flash/Pro correctness all pass with
+`calc_diff=0.0006`. The generated one-rank L2 cubin nevertheless remains at
+168 registers per thread with a 1,064-byte stack frame, identical to Iteration
+12b. Directly consuming the packed array therefore does not remove the local
+frame.
+
+| Model | Iteration 12a FP32 (us) | Iteration 12b (us) | Direct epilogue (us) | Candidate range (us) | Change vs Iter. 12b |
+|---|---:|---:|---:|---:|---:|
+| Flash M128 | 1,727.848 | 1,944.157 | 1,963.323 | 1,922.132-1,978.560 | +0.99% |
+| Pro M128 | 6,065.000 | 6,844.000 | 6,842.000 | 6,820-6,848 | -0.03% |
+
+The standard NCU boundary shows only noise-level reductions versus Iteration
+12b. More than 27 million spill requests remain, so the candidate stays about
+13% slower than the original FP32 BN256 experiment.
+
+| NCU metric | Iteration 12b L1 | Direct L1 | Change | Iteration 12b L2 | Direct L2 | Change |
+|---|---:|---:|---:|---:|---:|---:|
+| Duration | 934.688 us | 928.320 us | -0.68% | 1,067.232 us | 1,064.256 us | -0.28% |
+| Executed instructions | 129,334,049 | 129,329,332 | ~0% | 100,887,046 | 100,335,536 | -0.55% |
+| Local-memory spill requests | 0 | 0 | 0 | 27,073,344 | 27,065,152 | -0.03% |
+| Launch registers per thread | 168 | 168 | 0 | 168 | 168 | 0 |
+| Achieved occupancy | 9.45% | 9.45% | ~0 pp | 18.35% | 18.34% | ~0 pp |
+
+NSYS records L1 at 854,787 ns and L2 at 990,852 ns. The L2 kernel is only
+0.36% shorter than Iteration 12b's 994,467 ns and remains 23.7% slower than
+Iteration 12a's 801,027 ns.
+
+Iteration 12c is rejected. The result falsifies the narrower epilogue-overlap
+hypothesis: packed-BF16 accumulation itself and its surrounding promotion
+state still exceed the 168-register ceiling. The next direction should stop
+carrying the persistent accumulator in thread-local arrays, for example by
+staging partial scaled sums in the existing CTA scratch between K-block
+chunks, or return to the accepted BN128 schedule and target scheduler/decoder
+work without adding a second live math warpgroup.

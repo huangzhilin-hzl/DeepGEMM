@@ -418,10 +418,10 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     // The L2 BN256 split-N experiment has two math warpgroups in one CTA, so
     // its launch bound caps each thread at 168 registers. Keep only the
     // persistent scaled sum in packed BF16; WGMMA's transient accumulation
-    // remains FP32 and the existing epilogue still consumes FP32 values.
+    // remains FP32 and the regular L2 epilogue consumes the packed pairs.
     constexpr bool kMXFP4PackedBF16Accum =
         kProcessedMXFP4Scales and MegaMoEPhase::runs_linear2 and
-        kSplitNWarpgroups and WG_BLOCK_N == 128;
+        kSplitNWarpgroups and WG_BLOCK_N == 128 and not kDirectL2Scatter;
     using L1WGMMA = typename mma::sm90::FP8MMASelector<WG_BLOCK_N>::type;
     static_assert(L1WGMMA::M == 64 and L1WGMMA::N == WG_BLOCK_N and L1WGMMA::K == 32,
                   "Unexpected WGMMA shape");
@@ -1177,6 +1177,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     final_accum[i] = 0.0f;
             }
             float accum[kAccumPerThread];
+            nv_bfloat162 mxfp4_final_bf16[kAccumPerThread / 2];
 
             const auto run_mxfp4_gemm_loop = [&]() {
                 if constexpr (kMXFP4Weights) {
@@ -1192,7 +1193,6 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     constexpr uint32_t kL2WeightSFPerExpert =
                         kHidden * kL2WeightSFK;
                     const uint32_t wg_thread_idx = warp_idx_in_wg * 32 + lane_idx;
-                    nv_bfloat162 mxfp4_final_bf16[kAccumPerThread / 2];
                     if constexpr (kMXFP4PackedBF16Accum) {
                         #pragma unroll
                         for (uint32_t i = 0; i < kAccumPerThread / 2; ++ i)
@@ -1483,15 +1483,6 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             }
                         }
                         arrive_empty_barrier(stage_idx);
-                    }
-                    if constexpr (kMXFP4PackedBF16Accum) {
-                        #pragma unroll
-                        for (uint32_t i = 0; i < kAccumPerThread / 2; ++ i) {
-                            const float2 pair =
-                                __bfloat1622float2(mxfp4_final_bf16[i]);
-                            final_accum[i * 2] = pair.x;
-                            final_accum[i * 2 + 1] = pair.y;
-                        }
                     }
                 }
             };
@@ -2619,30 +2610,61 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         #pragma unroll
                         for (uint32_t i = 0; i < kAccumPerThread / 8; ++ i) {
                             const uint32_t chunk_lo = 2 * i, chunk_hi = 2 * i + 1;
-                            auto write_pair = [&](const uint32_t row,
-                                                  const uint32_t col,
-                                                  const float value0,
-                                                  const float value1) {
+                            auto pair_elem_idx = [&](const uint32_t row,
+                                                     const uint32_t col) {
                                 const uint32_t elem_idx =
                                     epilogue_wg_idx * WG_BLOCK_M * WG_BLOCK_N +
                                     row * WG_BLOCK_N + col;
-                                store_l2_pair(elem_idx, value0, value1);
+                                return elem_idx;
                             };
-                            if (valid_r0) {
-                                write_pair(r_0, chunk_lo * 8 + col_idx * 2,
-                                    final_accum[chunk_lo * 4 + 0],
-                                    final_accum[chunk_lo * 4 + 1]);
-                                write_pair(r_0, chunk_hi * 8 + col_idx * 2,
-                                    final_accum[chunk_hi * 4 + 0],
-                                    final_accum[chunk_hi * 4 + 1]);
-                            }
-                            if (valid_r1) {
-                                write_pair(r_1, chunk_lo * 8 + col_idx * 2,
-                                    final_accum[chunk_lo * 4 + 2],
-                                    final_accum[chunk_lo * 4 + 3]);
-                                write_pair(r_1, chunk_hi * 8 + col_idx * 2,
-                                    final_accum[chunk_hi * 4 + 2],
-                                    final_accum[chunk_hi * 4 + 3]);
+                            if constexpr (kMXFP4PackedBF16Accum) {
+                                auto write_packed_pair = [&](const uint32_t row,
+                                                             const uint32_t col,
+                                                             const uint32_t packed_idx) {
+                                    *reinterpret_cast<nv_bfloat162*>(
+                                        smem_cd_l2 + pair_elem_idx(row, col)) =
+                                        mxfp4_final_bf16[packed_idx];
+                                };
+                                if (valid_r0) {
+                                    write_packed_pair(
+                                        r_0, chunk_lo * 8 + col_idx * 2,
+                                        chunk_lo * 2);
+                                    write_packed_pair(
+                                        r_0, chunk_hi * 8 + col_idx * 2,
+                                        chunk_hi * 2);
+                                }
+                                if (valid_r1) {
+                                    write_packed_pair(
+                                        r_1, chunk_lo * 8 + col_idx * 2,
+                                        chunk_lo * 2 + 1);
+                                    write_packed_pair(
+                                        r_1, chunk_hi * 8 + col_idx * 2,
+                                        chunk_hi * 2 + 1);
+                                }
+                            } else {
+                                auto write_pair = [&](const uint32_t row,
+                                                      const uint32_t col,
+                                                      const float value0,
+                                                      const float value1) {
+                                    store_l2_pair(
+                                        pair_elem_idx(row, col), value0, value1);
+                                };
+                                if (valid_r0) {
+                                    write_pair(r_0, chunk_lo * 8 + col_idx * 2,
+                                        final_accum[chunk_lo * 4 + 0],
+                                        final_accum[chunk_lo * 4 + 1]);
+                                    write_pair(r_0, chunk_hi * 8 + col_idx * 2,
+                                        final_accum[chunk_hi * 4 + 0],
+                                        final_accum[chunk_hi * 4 + 1]);
+                                }
+                                if (valid_r1) {
+                                    write_pair(r_1, chunk_lo * 8 + col_idx * 2,
+                                        final_accum[chunk_lo * 4 + 2],
+                                        final_accum[chunk_lo * 4 + 3]);
+                                    write_pair(r_1, chunk_hi * 8 + col_idx * 2,
+                                        final_accum[chunk_hi * 4 + 2],
+                                        final_accum[chunk_hi * 4 + 3]);
+                                }
                             }
                         }
                     }
