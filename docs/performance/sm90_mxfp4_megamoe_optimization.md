@@ -702,3 +702,100 @@ NSYS, and the eight-rank campaign were intentionally not run on an invalid
 kernel. The next structural experiment should target the sampled latency
 hotspot instead: overlap expansion of the next packed-B stage with WGMMA on
 the current stage using the two currently idle non-epilogue warps.
+
+## Rejected sub-experiment: two-warp decoder overlap with a 64-register frontend
+
+### Hypothesis and implementation
+
+The processed path moved E2M1-to-E4M3 expansion out of the math warpgroup and
+onto the two previously idle non-epilogue warps. Each decoder warp owns 64 of
+the BN128 rows in two 32-row halves, waits for the packed-B TMA stage, expands
+the complete BK128 tile into the existing swizzled shared-memory buffer, and
+arrives on a new per-stage decoded-ready barrier. The math warpgroup waits on
+that barrier and can therefore consume one stage while the frontend advances
+to the next stage. A shared-to-WGMMA async-proxy fence precedes each readiness
+arrival.
+
+The launch-side shared-memory calculation adds one eight-byte barrier per
+MXFP4 pipeline stage. Five-stage Flash kernels consequently use 200.92 KiB of
+dynamic shared memory, only 40 bytes more than accepted Iteration 7. The raw
+scale fallback remains in the math warpgroup and gained the corresponding
+generic shared-store-to-WGMMA proxy fence. The first overlap variant capped
+the four non-epilogue frontend warps at 64 registers each.
+
+The mapping oracle now checks all 2,048 packed words and 16,384 expanded
+elements, exact ownership and use of every K32 scale, and exact-once coverage
+of the physical B64 source bytes and B128 destination bytes after their CUTE
+swizzles.
+
+### Correctness gate
+
+| Scenario | Scale representation | `calc_diff` | Tolerance | Result |
+|---|---|---:|---:|---|
+| Mapping and physical-byte oracle | processed triple | exact | exact | PASS |
+| L1 smoke, one rank | processed triple | 0.0006 | 0.01 | PASS |
+| L1 forced requant, one rank | processed triple | 0.0005 | 0.01 | PASS |
+| L1 smoke, one rank | raw pair fallback | 0.0006 | 0.01 | PASS |
+| Flash M128 L3, one rank | processed triple | 0.0006 | 0.01 | PASS |
+| Pro M128 L3, one rank | processed triple | 0.0006 | 0.01 | PASS |
+| Flash M128 L3, one rank | raw pair fallback | 0.0006 | 0.01 | PASS |
+| Flash M128 L3, eight ranks | processed triple | 0.0006 | 0.01 | PASS |
+| Pro M128 L3, eight ranks | processed triple | 0.0006 | 0.01 | PASS |
+
+An additional 640-wide ancillary case stops before kernel launch because the
+existing MegaMoE scale-buffer layout requires 16-byte TMA alignment while a
+`hidden / 32` row contains 20 bytes. That broader layout-contract mismatch is
+not counted as a failure of this kernel candidate, and the temporary test case
+was removed instead of expanding the experiment's scope.
+
+### Eight-rank quick gate
+
+The standard three observations and 20 Kineto tests were run at M128. The
+candidate was already more than twice as slow for both production shapes, so
+the remaining six M points were intentionally not run.
+
+| Model | Accepted Iteration 7 (us) | Decoder overlap reg64 (us) | Candidate range (us) | Candidate / Iter. 7 | Change |
+|---|---:|---:|---:|---:|---:|
+| Flash M128 | 1,338.252 | 2,712.259 | 2,692.014-2,713.262 | 2.027x | +102.67% |
+| Pro M128 | 4,601.000 | 10,181.000 | 10,166-10,210 | 2.213x | +121.28% |
+
+Flash rank-zero L1 takes 1,996-2,017 us and L2 takes 695.259-697.262 us.
+Pro rank-zero L1 takes 7,368-7,401 us and L2 takes 2,792-2,807 us. Both
+phases therefore regress rather than exposing a single isolated tail.
+
+### NCU and NSYS attribution
+
+Detailed NCU and SourceCounters use one rank, Flash M128, and 32 local
+experts, matching the previous iteration's attribution boundary.
+
+| Metric | Iteration 7 L1 | reg64 L1 | Change | Iteration 7 L2 | reg64 L2 | Change |
+|---|---:|---:|---:|---:|---:|---:|
+| NCU duration | 911.104 us | 2,058.080 us | +125.89% | 473.216 us | 740.288 us | +56.44% |
+| Executed instructions | 128,956,122 | 121,720,099 | -5.61% | 69,289,384 | 66,207,438 | -4.45% |
+| Local-memory spill requests | 0 | 2,915,820 | new | 0 | 1,206,072 | new |
+| Spill-request overhead | 0% | 100% | +100 pp | 0% | 100% | +100 pp |
+| Achieved occupancy | 9.45% | 12.51% | +3.06 pp | 15.27% | 18.10% | +2.83 pp |
+| Excessive global sectors | 3,692,178 | 3,692,185 | ~0% | 1,835,136 | 1,835,136 | 0% |
+| Excessive shared wavefronts | 71,218 | 71,218 | 0% | 336,384 | 336,384 | 0% |
+
+The launch report still shows 168 registers per thread because that is the
+kernel-wide maximum from the math role. SourceCounters SASS nevertheless
+contains 96 L1 and 75 L2 local `LDL`/`STL` instructions whose aggregate
+executions exactly match the 2,915,820 and 1,206,072 spill requests. The
+candidate executes fewer instructions and reports higher achieved occupancy,
+yet takes substantially longer; the new local-memory traffic and the two-warp
+decoder critical path dominate both apparent improvements.
+
+| NSYS selected hot path | Iteration 7 | reg64 overlap | Change |
+|---|---:|---:|---:|
+| L1 kernel | 825,700 ns | 1,932,199 ns | +134.01% |
+| L1-to-L2 gap | 126,881 ns | 170,049 ns | +34.02% |
+| L2 kernel | 428,737 ns | 687,714 ns | +60.40% |
+| L1 + gap + L2 | 1,381,318 ns | 2,789,962 ns | +101.98% |
+
+This 64-register variant is rejected. The overlap direction is not yet
+discarded because the register cap is a controlled confounder: raising it to
+168 registers keeps the CTA role budget at 54,272 registers, below the 64,512
+limit, and should remove or sharply reduce spills. The next sub-experiment
+therefore changes only that cap and reruns the same correctness, M128 quick
+gate, and NCU spill checks before considering a full eight-point campaign.

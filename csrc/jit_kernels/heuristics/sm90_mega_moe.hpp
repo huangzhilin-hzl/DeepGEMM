@@ -300,9 +300,11 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     // Barriers (8 bytes each):
     //   * dispatch: num_dispatch_warps
     //   * GEMM full + empty: 2 * num_stages
+    //   * MXFP4 decoded-ready: num_stages (processed path uses it; raw keeps
+    //     the same conservative launch layout)
     //   * combine: 2 * num_epilogue_warps
     const int smem_barriers_fixed = (num_dispatch_warps + 2 * num_epilogue_warps) * 8;
-    const int smem_barriers_per_stage = 2 * 8;
+    const int smem_barriers_per_stage = (mxfp4_weights ? 3 : 2) * 8;
 
     const int smem_fixed = smem_dispatch_size + smem_cd + smem_sfb_scratch +
                            smem_barriers_fixed;
@@ -838,8 +840,9 @@ static bool try_apply_sm90_moe_tuning(
            try_materialize_sm90_moe_phase_tuning(input, config.l2, tuning.l2);
 }
 
-// Correctness-first Hopper MXFP4 schedule.  One math warpgroup owns the whole
-// BN128 packed-weight tile and expands it without a CTA-wide synchronization.
+// Correctness-first Hopper MXFP4 schedule. One math warpgroup owns the whole
+// BN128 WGMMA tile; processed scales use two frontend warps to expand the next
+// packed-weight stage, while raw scales retain math-warpgroup expansion.
 // Specialized FP8 swap-AB/BK256/BF16 accumulation schedules are intentionally
 // excluded until separately tuned.
 static Sm90MoeLaunchConfig select_mxfp4_mega_moe_sm90(
