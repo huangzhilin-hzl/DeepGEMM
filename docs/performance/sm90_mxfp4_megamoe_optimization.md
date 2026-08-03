@@ -670,3 +670,35 @@ the final 20-byte scale row. A tail fallback could preserve the shape contract,
 but cannot justify the measured regression and added control flow. The device
 change was reverted, so accepted Iteration 7 remains the implementation and
 only this profiler record is retained.
+
+## Rejected experiment: natural-layout scale TMA
+
+NCU on accepted Iteration 7 attributes virtually all excessive global sectors
+to the processed exponent load: one `LDG.E.CONSTANT` contributes 3,670,016 of
+3,692,186 excessive sectors in L1 and 1,835,008 of 1,835,136 in L2. A narrow
+experiment therefore added a stage-private 512-byte `[N128,K32x4]` shared tile
+and attempted to load it through the packed-B producer's existing TMA barrier.
+The math warpgroup kept the accepted half-warp decoder mapping and replaced
+only the strided global scale word with a conflict-free shared load. Legal
+shapes whose K32 row stride was not 16-byte aligned retained the original
+scalar fallback, so the public `%128` shape contract was not narrowed.
+
+The CUDA tensor maps encoded and both kernels JIT-compiled, but the first
+processed smoke launch failed with `CUDA_ERROR_ILLEGAL_INSTRUCTION`. The
+natural layout makes the contiguous TMA box dimension only four bytes; Hopper
+cannot execute that 2D TMA load even though the whole `128 x 4` tile is 512
+bytes. Compute Sanitizer localized the failure to the L1 kernel around
+`+0x7fe0`; disassembly shows the new scale `UTMALDG.2D` immediately beside the
+valid packed-weight `UTMALDG.2D` at `+0x8150/+0x8160`.
+
+Expanding every row to the 16-byte minimum would transfer four adjacent BK128
+scale groups for every stage. That multiplies useful scale bytes and
+stage-private shared storage by four, while Iteration 8 already demonstrated
+that reducing scale-sector counts alone does not improve the hot path. A
+blocked/transposed scale layout could make N contiguous, but the equivalent
+Iteration 4 layout lost natural K-step locality and regressed both kernels.
+The implementation was therefore reverted at the correctness gate; NCU,
+NSYS, and the eight-rank campaign were intentionally not run on an invalid
+kernel. The next structural experiment should target the sampled latency
+hotspot instead: overlap expansion of the next packed-B stage with WGMMA on
+the current stage using the two currently idle non-epilogue warps.
