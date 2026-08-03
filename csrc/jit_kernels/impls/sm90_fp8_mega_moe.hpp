@@ -81,11 +81,10 @@ public:
     static std::string generate_impl(const Args& args) {
         const char* kernel_symbol = args.kernel_phase == KernelPhase::Linear1 ? "sm90_fp8_mega_moe_l1_impl" :
             "sm90_fp8_mega_moe_l2_impl";
-        constexpr int kMaxLatencyOverlapTokens = 4096;
         const bool overlap_processed_scale_path =
             args.processed_mxfp4_scales and
             (args.hidden > 4096 or
-             args.num_tokens <= kMaxLatencyOverlapTokens);
+             args.num_tokens <= kSM90MoeMaxLatencyOverlapTokens);
         const auto phase_template_args = args.kernel_phase == KernelPhase::Linear1 ?
             fmt::format(",\n        {}", args.config.nmajor_schedule ? "true" : "false") :
             fmt::format(",\n        {}, {}, {}",
@@ -210,7 +209,8 @@ static void sm90_fp8_mega_moe(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk,
         hidden, intermediate_hidden,
-        num_padded_sf_pool_tokens
+        num_padded_sf_pool_tokens,
+        processed_mxfp4_scales
     };
     const auto launch_config = mxfp4_weights ?
         select_mxfp4_mega_moe_sm90(heuristic_input) :

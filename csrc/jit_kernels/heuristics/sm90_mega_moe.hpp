@@ -68,6 +68,8 @@ enum class Sm90MoeHardwareProfile {
     HighSm
 };
 
+constexpr int kSM90MoeMaxLatencyOverlapTokens = 4096;
+
 struct Sm90MoeHeuristicInput {
     int launch_num_sms;
 
@@ -75,6 +77,7 @@ struct Sm90MoeHeuristicInput {
     int num_max_tokens_per_rank, num_tokens, num_topk;
     int hidden, intermediate_hidden;
     int num_padded_sf_pool_tokens;
+    bool processed_mxfp4_scales;
 };
 
 struct Sm90MoeNumericalConfig {
@@ -247,8 +250,10 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     const bool& swap_ab = false,
     const bool& require_exact_default_stages = false,
     const bool& mxfp4_weights = false,
-    const bool& stage_mxfp4_sfb = false) {
+    const bool& stage_mxfp4_sfb = false,
+    const bool& double_buffer_mxfp4_expanded_b = false) {
     constexpr int kSmemAlignment = 1024;
+    DG_HOST_ASSERT(not double_buffer_mxfp4_expanded_b or mxfp4_weights);
 
     // Dispatch region (same as SM100)
     const int smem_expert_count_size = align(
@@ -294,11 +299,12 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
         mxfp4_weights and not stage_mxfp4_sfb ? smem_sfb_per_stage : 0;
     const int smem_sfb_staged_per_stage =
         stage_mxfp4_sfb ? smem_sfb_per_stage : 0;
-    // The sole MXFP4 math warpgroup expands and consumes one B tile at a time,
-    // so the expanded FP8 tile is fixed CTA scratch. A, packed E2M1 B, and SFA
-    // remain staged so the two TMA producers can run ahead.
+    // The sole MXFP4 math warpgroup normally expands into fixed CTA scratch.
+    // Flash L1 can reserve a second tile to pipeline next-stage decoding. A,
+    // packed E2M1 B, and SFA remain staged for producer runahead.
     const int smem_expanded_b_scratch =
-        mxfp4_weights ? block_n * block_k : 0;
+        mxfp4_weights ? block_n * block_k *
+            (double_buffer_mxfp4_expanded_b ? 2 : 1) : 0;
     const int smem_b_per_stage =
         mxfp4_weights ? 0 : block_n * block_k;
     const int smem_packed_b_per_stage =
@@ -855,8 +861,9 @@ static bool try_apply_sm90_moe_tuning(
            try_materialize_sm90_moe_phase_tuning(input, config.l2, tuning.l2);
 }
 
-// Compact Hopper MXFP4 schedule. One math warpgroup owns a fixed expanded-B
-// scratch tile while A, packed-B, and SFA retain a three-stage TMA pipeline.
+// Compact Hopper MXFP4 schedule. One math warpgroup owns fixed expanded-B
+// scratch, with a second ping-pong tile for the Flash latency-overlap path,
+// while A, packed-B, and SFA retain a three-stage TMA pipeline.
 // Two logical worker CTAs are launched per physical H20 SM; launch bounds and
 // an exact-kernel occupancy check are the hard safety gate for grid barriers.
 static Sm90MoeLaunchConfig select_mxfp4_mega_moe_sm90(
@@ -900,7 +907,10 @@ static Sm90MoeLaunchConfig select_mxfp4_mega_moe_sm90(
         swap_ab,
         true,
         true,
-        stage_l1_mxfp4_sfb);
+        stage_l1_mxfp4_sfb,
+        input.processed_mxfp4_scales and
+            input.hidden == 4096 and
+            input.num_tokens <= kSM90MoeMaxLatencyOverlapTokens);
     const auto [l2_num_stages, l2_smem_size] = get_pipeline_config_for_mega_moe_sm90(
         SM90ArchSpec::smem_capacity,
         input.num_experts, input.hidden,
@@ -911,7 +921,8 @@ static Sm90MoeLaunchConfig select_mxfp4_mega_moe_sm90(
         swap_ab,
         true,
         true,
-        true);
+        true,
+        false);
     // `smem_capacity` is the opt-in per-block limit. Reserve the remaining
     // 1 KiB/CTA implementation overhead in the two-CTA static precheck; the
     // exact JIT kernel still goes through the runtime occupancy hard gate.
