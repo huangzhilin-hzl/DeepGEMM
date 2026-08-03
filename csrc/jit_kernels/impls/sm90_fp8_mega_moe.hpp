@@ -58,9 +58,9 @@ public:
         int num_tokens;
         layout::SymBuffer<> sym_buffer_ptrs;
 
-        // Tensormaps for activations and weights. Weight scale factors are
-        // loaded by the math warpgroup directly from global memory (no TMA
-        // descriptor required).
+        // Tensormaps for activations and weights. The B producer can stage
+        // MXFP4 weight scale factors with ordinary global/shared instructions
+        // because their natural-layout four-byte TMA box is not legal on SM90.
         CUtensorMap tensor_map_l1_acts;
         CUtensorMap tensor_map_l1_acts_sf;
         CUtensorMap tensor_map_l1_weights;

@@ -1637,3 +1637,112 @@ so the remaining 1.56-1.87x M128 gap is dominated by the kernels, especially
 L1 decode/promotion, rather than by host submission. The next structural
 candidate should stage processed weight scales with packed-B TMA or reduce
 decode work while preserving two-CTA residency.
+
+## Accepted experiment: phase-aware MXFP4 weight-scale producer prefetch
+
+### Design and rejected variants
+
+Iteration 18 moves each row's four contiguous UE8M0 weight-scale bytes from
+the math warpgroup's critical path to the packed-B producer warp. Hopper TMA
+cannot describe the natural scale layout because each row contributes only
+four contiguous bytes, below the 16-byte TMA-box requirement, so the producer
+uses one aligned 32-bit global load and one shared-memory store per row. The
+scale words share the packed-B transaction barrier and are therefore visible
+when the math warpgroup acquires the corresponding pipeline stage.
+
+The first scalar-staging prototype improved Pro but was not stable on Flash.
+A `cp.async` variant, a split-producer variant, and unconditional all-phase
+staging were also rejected: the extra producer work or shared-memory footprint
+regressed Flash without a reproducible compensating gain. The accepted policy
+stages every L2 tile and stages L1 only when `hidden / block_k >= 48`. This
+keeps Flash H4096/BK128 on its direct-load path while prefetching Pro
+H7168/BK128. The shared policy helper is used by both host selection and the
+kernel specialization, preventing launch/JIT shared-memory accounting drift.
+
+The direct Flash L1 specialization reserves one fixed 512-byte raw-scale
+scratch region and launches with 93,312 bytes of dynamic shared memory. Staged
+Flash L2 uses three 512-byte scale stages and 94,336 bytes. Pro stages both
+phases and launches each with 101,504 bytes. All production specializations
+retain the two-CTA residency hard gate. Independent kernel and host/JIT reviews
+found no P0-P2 issue; their only P3 observation, duplicated policy constants,
+was removed before the final measurements.
+
+### Correctness and paired acceptance test
+
+Fresh-JIT one-rank and eight-rank production checks cover Flash and Pro with
+both processed and raw scale inputs. All eight checks pass the existing `0.01`
+tolerance; the maximum observed `calc_diff` is `0.0010` in the one-rank Flash
+raw case and `0.0009` in the eight-rank Flash raw case.
+
+The acceptance decision uses a back-to-back eight-rank M128 run with 50
+observations, 20 internal tests per observation, and median maximum-rank
+latency. Against a fresh Iteration 17 checkout and JIT cache, Iteration 18
+improves Flash by 1.81% and Pro by 2.78%.
+
+| Model | Paired Iteration 17 (us) | Iteration 18 (us) | Latency change |
+|---|---:|---:|---:|
+| Flash | 683.215 | 670.827 | -1.81% |
+| Pro | 2,296.687 | 2,232.833 | -2.78% |
+
+### Full H20 matrix
+
+The full eight-rank PR383 contract completes all 44 co-measured cases: FP8 and
+MXFP4, Flash and Pro, 11 token counts, 50 observations for M at most 128,
+three for larger M, and 20 internal tests per observation. Relative to the
+previous formal Iteration 17 matrix, Iteration 18's geometric-mean throughput
+speedup is 1.016x for Flash and 1.015x for Pro. The co-measured geometric-mean
+MXFP4/FP8 latency ratio is 1.580x/1.660x. At M128 the ratio is 1.518x/1.866x.
+
+| M | Flash FP8 (us) | Flash Iter. 18 (us) | vs Iter. 17 | Pro FP8 (us) | Pro Iter. 18 (us) | vs Iter. 17 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 294.966 | 561.180 | -4.48% | 678.772 | 1,427.365 | -2.28% |
+| 16 | 303.081 | 631.181 | -1.96% | 965.319 | 2,025.079 | -1.46% |
+| 32 | 321.694 | 651.445 | -0.70% | 1,042.957 | 2,188.616 | -2.28% |
+| 64 | 366.844 | 663.448 | -0.48% | 1,098.587 | 2,222.416 | -1.92% |
+| 128 | 442.446 | 671.669 | +0.14% | 1,200.873 | 2,240.607 | -2.01% |
+| 256 | 507.238 | 665.027 | -4.80% | 1,648.365 | 2,263.864 | -2.32% |
+| 512 | 915.997 | 1,263.580 | -0.82% | 2,427.039 | 3,355.000 | -2.73% |
+| 1,024 | 1,513.478 | 2,111.217 | -1.05% | 4,026.000 | 5,649.000 | -1.17% |
+| 2,048 | 2,748.433 | 3,819.000 | -0.60% | 7,022.000 | 9,949.000 | +0.08% |
+| 4,096 | 5,106.000 | 7,205.000 | -0.88% | 12,974.000 | 18,223.000 | -0.46% |
+| 8,192 | 9,887.000 | 13,922.000 | -1.21% | 25,158.000 | 35,704.000 | +0.37% |
+
+The isolated +0.14%, +0.08%, and +0.37% historical comparisons are within the
+observed cross-run drift. The back-to-back M128 comparison improves both
+production shapes, while the geometric mean improves across all 11 points, so
+the phase-aware policy is accepted. This is not FP8 parity or a SOTA claim.
+
+### NCU and NSYS attribution
+
+Full-set one-rank Flash M128/E32 NCU shows zero spills and preserves the
+two-CTA register/shared-memory limits. Replay duration is not faster than the
+historical Iteration 17 profile, but it attributes the remaining bottleneck:
+66-68% of cycles have no eligible warp, and both launches are limited to two
+blocks per SM by registers and shared memory. NCU replay-cache timing is used
+for attribution only; the paired eight-rank end-to-end run remains the
+acceptance measurement.
+
+| NCU metric | Iteration 18 L1 | Iteration 18 L2 |
+|---|---:|---:|
+| Duration | 448.67 us | 248.99 us |
+| Executed instructions | 68,882,553 | 40,083,650 |
+| Issued instructions | 68,900,822 | 40,130,565 |
+| Registers per thread | 128 | 127 |
+| Dynamic shared memory | 93.31 KiB | 94.34 KiB |
+| Achieved occupancy | 18.06% | 23.88% |
+| No eligible warp | 68.05% | 66.35% |
+| L1/TEX hit rate | 27.62% | 68.93% |
+| L2 hit rate | 65.25% | 62.38% |
+| Memory throughput | 678.00 GB/s | 632.04 GB/s |
+| Local spill requests | 0 | 0 |
+
+Final-source NSYS records L1 at 408.673 us, the inter-kernel gap at 112.481
+us, and L2 at 219.680 us, for 740.834 us across the selected hot path. The
+Iteration 17 reference is 410.945 + 104.353 + 225.729 = 741.027 us. L1 and L2
+are shorter, but a longer launch gap leaves the single-rank hot-path total
+nearly unchanged. Together with the stronger Pro and max-rank end-to-end gains,
+this indicates that Iteration 18 primarily improves longer K loops and the
+multi-rank tail rather than host submission. The next iteration should target
+the persistent 66-68% no-eligible-warp fraction by reducing decode/promotion
+dependencies or overlapping scale delivery without increasing per-CTA shared
+memory.

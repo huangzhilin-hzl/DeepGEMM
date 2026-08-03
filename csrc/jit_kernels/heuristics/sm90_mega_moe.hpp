@@ -246,7 +246,8 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     const int& default_num_stages = 0,
     const bool& swap_ab = false,
     const bool& require_exact_default_stages = false,
-    const bool& mxfp4_weights = false) {
+    const bool& mxfp4_weights = false,
+    const bool& stage_mxfp4_sfb = false) {
     constexpr int kSmemAlignment = 1024;
 
     // Dispatch region (same as SM100)
@@ -281,14 +282,18 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     // SF on SM90:
     //   * SFA per stage must hold one aligned BLOCK_M-float vector for every
     //     per-64-K L2 scale group (two for BK128, four for BK256)
-    //   * MXFP4 SFB keeps one byte for every (N, K32) group.  The math
-    //     warpgroup loads each UE8M0 scale once, then reuses it from SMEM
-    //     across all WGMMA accumulator rows.
+    //   * MXFP4 SFB reserves one byte for every (N, K32) group. Producer
+    //     prefetch uses one copy per pipeline stage; direct-load phases retain
+    //     one fixed scratch copy for raw-scale promotion.
     const int smem_sfa_half_stride_bytes = align(block_m * static_cast<int>(sizeof(float)), 128);
     const int smem_sfa_per_stage =
         (block_k / 64) * smem_sfa_half_stride_bytes;
-    const int smem_sfb_scratch =
+    const int smem_sfb_per_stage =
         mxfp4_weights ? block_n * (block_k / 32) : 0;
+    const int smem_sfb_fixed =
+        mxfp4_weights and not stage_mxfp4_sfb ? smem_sfb_per_stage : 0;
+    const int smem_sfb_staged_per_stage =
+        stage_mxfp4_sfb ? smem_sfb_per_stage : 0;
     // The sole MXFP4 math warpgroup expands and consumes one B tile at a time,
     // so the expanded FP8 tile is fixed CTA scratch. A, packed E2M1 B, and SFA
     // remain staged so the two TMA producers can run ahead.
@@ -299,7 +304,8 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     const int smem_packed_b_per_stage =
         mxfp4_weights ? block_n * block_k / 2 : 0;
     const int smem_per_stage = block_m * block_k + smem_b_per_stage +
-                               smem_packed_b_per_stage + smem_sfa_per_stage;
+                               smem_packed_b_per_stage + smem_sfa_per_stage +
+                               smem_sfb_staged_per_stage;
 
     // Barriers (8 bytes each):
     //   * dispatch: num_dispatch_warps
@@ -309,7 +315,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     const int smem_barriers_per_stage = 2 * 8;
 
     const int smem_fixed = smem_dispatch_size + smem_cd +
-                           smem_expanded_b_scratch + smem_sfb_scratch +
+                           smem_expanded_b_scratch + smem_sfb_fixed +
                            smem_barriers_fixed;
 
     const int max_num_stages = (smem_capacity - smem_fixed) /
@@ -881,7 +887,10 @@ static Sm90MoeLaunchConfig select_mxfp4_mega_moe_sm90(
     const int num_experts_per_wave =
         normalize_num_experts_per_wave_for_mega_moe_sm90(
             input.num_experts_per_rank, requested_epw);
-    const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90(
+    const bool stage_l1_mxfp4_sfb =
+        layout::should_stage_sm90_mxfp4_weight_sf(
+            true, input.hidden, block_k);
+    const auto [l1_num_stages, l1_smem_size] = get_pipeline_config_for_mega_moe_sm90(
         SM90ArchSpec::smem_capacity,
         input.num_experts, input.hidden,
         block_m, block_n, block_k,
@@ -890,26 +899,43 @@ static Sm90MoeLaunchConfig select_mxfp4_mega_moe_sm90(
         3,
         swap_ab,
         true,
+        true,
+        stage_l1_mxfp4_sfb);
+    const auto [l2_num_stages, l2_smem_size] = get_pipeline_config_for_mega_moe_sm90(
+        SM90ArchSpec::smem_capacity,
+        input.num_experts, input.hidden,
+        block_m, block_n, block_k,
+        num_dispatch_threads / 32, num_epilogue_threads / 32,
+        direct_l2_scatter,
+        3,
+        swap_ab,
+        true,
+        true,
         true);
     // `smem_capacity` is the opt-in per-block limit. Reserve the remaining
     // 1 KiB/CTA implementation overhead in the two-CTA static precheck; the
     // exact JIT kernel still goes through the runtime occupancy hard gate.
-    DG_HOST_ASSERT(num_stages == 3 and smem_size > 0 and
-                   2 * smem_size <= SM90ArchSpec::smem_capacity - 1024);
+    DG_HOST_ASSERT(l1_num_stages == 3 and l1_smem_size > 0 and
+                   l2_num_stages == 3 and l2_smem_size > 0 and
+                   2 * std::max(l1_smem_size, l2_smem_size) <=
+                       SM90ArchSpec::smem_capacity - 1024);
     const int sf_pool_stride_tokens =
         layout::get_num_padded_sf_pool_tokens(num_max_pool_tokens, block_m);
-    MegaMoESM90Config phase {
+    MegaMoESM90Config l1_phase {
         block_m, block_n, block_k,
         num_max_pool_tokens, input.num_padded_sf_pool_tokens,
         sf_pool_stride_tokens,
         num_experts_per_wave,
         num_worker_ctas,
-        num_stages, smem_size,
+        l1_num_stages, l1_smem_size,
         num_dispatch_threads, num_non_epilogue_threads,
         num_epilogue_threads,
         direct_l2_scatter, nmajor_schedule, one_warp_cleanup, swap_ab,
     };
-    return {phase, phase, {false}};
+    auto l2_phase = l1_phase;
+    l2_phase.num_stages = l2_num_stages;
+    l2_phase.smem_size = l2_smem_size;
+    return {l1_phase, l2_phase, {false}};
 }
 
 static Sm90MoeLaunchConfig select_mega_moe_sm90(
