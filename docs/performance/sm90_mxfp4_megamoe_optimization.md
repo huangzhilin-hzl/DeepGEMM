@@ -1454,3 +1454,96 @@ Iteration 15 is accepted as the new MXFP4 baseline. It preserves the Iteration
 executed instructions and every formal latency point. The primary remaining
 target is the two-CTA compiler spill path or a register-source WGMMA design;
 M128 MXFP4 is still 1.85-2.34x slower than matching FP8 MegaMoE.
+
+## Accepted experiment: packed BF16 persistent accumulation
+
+### Rejected prototype and accepted semantics
+
+NCU attributed 97.55% of the Iteration 15 L1 spill requests and 96.31% of the
+L2 requests to the mainloop. The live-range overlap came from a 64-element
+FP32 WGMMA fragment and a second 64-element FP32 persistent sum under the
+two-CTA 128-register budget, rather than from the MXFP4 decoder.
+
+An initial Iteration 16 prototype replaced the promotion with `__hfma2`. It
+removed the stack frame and reduced the profiler duration to 445.89/244.00 us,
+but it rounded the scale and arithmetic inputs as well as the persistent sum.
+Although Flash and Pro M128 still reported `calc_diff=0.0007`, that broader
+numeric-contract change was rejected and is retained only as a performance
+upper bound.
+
+Iteration 16b instead stores the cross-promotion sum as 32 packed BF16 pairs.
+At each promotion it converts one pair to FP32, evaluates
+`fmaf(combined_scale, accum, persistent)` in FP32, and rounds only the updated
+persistent storage back to BF16. After the final K block, all 64 values are
+expanded to the existing FP32 `final_accum` fragment. The specialization is
+enabled only for processed MXFP4 scales; FP8 and raw-scale MXFP4 retain their
+previous paths.
+
+The one-rank layered plan plus 100 seeded random stress cases passed all 139
+scenarios with maximum `calc_diff=0.0007`. Eight-rank production Flash M128
+and Pro M128 passed with `calc_diff=0.0006` and `0.0007`, respectively. A
+separate raw-scale L1 smoke passed with `calc_diff=0.0007`. All use the existing
+`0.01` tolerance.
+
+### Formal H20 performance
+
+The full eight-rank PR383 contract again completed all 22 cases: 50
+observations for M at most 128, three for larger M, 20 internal tests per
+observation, and the median of the maximum rank. Every point improves on
+Iteration 15. The geometric-mean speedup is 1.116x for Flash and 1.136x for
+Pro. M128 improves by 9.91%/11.99% in latency terms and narrows the matching
+FP8 gap to 1.66x/2.06x.
+
+| Model, M128 | FP8 (us) | Iteration 15 MXFP4 (us) | Iteration 16b MXFP4 (us) | Change vs Iter. 15 | MXFP4 / FP8 |
+|---|---:|---:|---:|---:|---:|
+| Flash | 430.344 | 794.383 | 715.655 | -9.91% | 1.66x |
+| Pro | 1,222.618 | 2,860.000 | 2,517.176 | -11.99% | 2.06x |
+
+| M | Flash Iter. 16b (us) | Change vs Iter. 15 | Pro Iter. 16b (us) | Change vs Iter. 15 |
+|---:|---:|---:|---:|---:|
+| 8 | 620.143 | -9.38% | 1,595.375 | -12.57% |
+| 16 | 683.727 | -10.76% | 2,251.695 | -11.94% |
+| 32 | 701.281 | -10.37% | 2,456.421 | -12.71% |
+| 64 | 712.612 | -9.87% | 2,476.741 | -12.64% |
+| 128 | 715.655 | -9.91% | 2,517.176 | -11.99% |
+| 256 | 719.283 | -12.70% | 2,546.148 | -11.87% |
+| 512 | 1,349.991 | -11.40% | 3,781.000 | -11.64% |
+| 1,024 | 2,294.730 | -10.66% | 6,295.000 | -11.98% |
+| 2,048 | 4,149.000 | -10.16% | 10,938.000 | -11.56% |
+| 4,096 | 7,835.000 | -9.60% | 20,131.000 | -11.78% |
+| 8,192 | 15,162.000 | -9.57% | 39,227.000 | -11.37% |
+
+The table reports latency reduction, while the reciprocal throughput speedups
+range from 1.104x to 1.145x for Flash and 1.128x to 1.146x for Pro. The
+full-matrix geometric-mean FP8 gap is now 1.722x for Flash and 1.840x for Pro.
+This is the largest accepted gain after two-CTA residency, but it is still not
+FP8 parity.
+
+### NCU and NSYS attribution
+
+Full-set one-rank Flash M128/E32 NCU confirms that the mainloop spill is
+eliminated. Both kernels report zero local-memory spill requests, 127
+registers per thread, and unchanged two-CTA occupancy. The BF16 unpack/FP32
+FMA/repack sequence increases executed instructions, but removing local-memory
+traffic reduces L1/L2 duration by 11.90%/5.07% versus Iteration 15.
+
+| NCU metric | Iteration 15 L1 | Iteration 16b L1 | Iteration 15 L2 | Iteration 16b L2 |
+|---|---:|---:|---:|---:|
+| Duration | 540.260 us | 475.970 us | 275.300 us | 261.340 us |
+| Executed instructions | 75,112,182 | 85,538,512 | 44,259,506 | 56,390,056 |
+| Local-memory spill requests | 2,687,344 | 0 | 2,177,584 | 0 |
+| Launch registers per thread | 128 | 127 | 128 | 127 |
+| Achieved occupancy | 18.03% | 18.05% | 23.93% | 23.91% |
+| Achieved active warps/SM | 11.54 | 11.55 | 15.32 | 15.30 |
+
+NSYS independently records L1 at 435,042 ns, the inter-kernel gap at 122,272
+ns, and L2 at 239,138 ns, for 796,452 ns across the selected hot path. The
+total is 9.43% below Iteration 15; L1 and L2 are 16.09% and 4.28% shorter,
+while the gap is 10.11% longer.
+
+Iteration 16b is accepted as the new MXFP4 baseline because the spill removal
+reproduces across every formal point and both profilers, while the 139-case
+stress plan, eight-rank production shapes, and raw-scale smoke preserve the
+tested numeric contract. The next optimization must address the remaining
+decode and promotion instruction overhead or the inter-phase launch gap;
+M128 MXFP4 remains 1.66-2.06x slower than matching FP8 MegaMoE.
