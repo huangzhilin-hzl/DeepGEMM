@@ -504,3 +504,107 @@ For B64 loads the full warp then touches all 32 banks once; for B128 `STS.64`,
 each half warp also touches all 32 banks once. This preserves the exact same
 logical coverage and shuffle ownership while targeting both remaining replay
 sources rather than only the loads.
+
+## Iteration 7: half-warp-tile the processed MXFP4 decoder
+
+### Hypothesis and implementation
+
+Iteration 7 keeps the accepted B64 packed tile and changes only the processed
+decoder's lane coordinates. Within a warp, both half warps cover the same
+eight rows; lanes 0-15 select packed words 0-1 and lanes 16-31 select words
+2-3. Four row groups and four K32 groups cover the complete B128 output tile:
+
+```text
+row_in_group = (lane % 16) / 2
+word_in_k32 = (lane / 16) * 2 + lane % 2
+row = warp * 32 + row_group * 8 + row_in_group
+packed_word = k32 * 4 + word_in_k32
+```
+
+Each row's original 32-bit offset word is broadcast from lane
+`row_group * 8 + row_in_group`. The raw-scale fallback is unchanged. This
+mapping gives each full-warp B64 load one request per bank, and each half-warp
+B128 `STS.64` transaction one 64-bit bank word per bank.
+
+### Correctness and review
+
+Two independent reviews found no coordinate, scale-owner, swizzle, aliasing,
+out-of-bounds, synchronization, or raw-fallback issue. A new exact mapping
+contract enumerates all 2,048 `(N, packed-word)` destinations, requires every
+destination exactly once, and checks the K32 scale byte and source-row owner.
+This closes the gap left by the aggregate `calc_diff` check, where a sparse
+lane error could otherwise be hidden by the tolerance.
+
+| Scenario | Scale representation | `calc_diff` | Tolerance | Result |
+|---|---|---:|---:|---|
+| Mapping contract, 2,048 destinations | processed triple | exact | exact | PASS |
+| L1 smoke, one rank | processed triple | 0.0006 | 0.01 | PASS |
+| L1 forced requant, one rank | processed triple | 0.0005 | 0.01 | PASS |
+| L1 smoke, one rank | raw pair fallback | 0.0006 | 0.01 | PASS |
+| Flash M128, eight ranks | processed triple | 0.0006 | 0.01 | PASS |
+| Pro M128, eight ranks | processed triple | 0.0006 | 0.01 | PASS |
+
+### NCU and NSYS attribution
+
+SourceCounters confirms that the targeted processed-decoder `LDS` and
+`STS.64` instructions now have zero excessive shared-memory wavefronts. The
+small residual totals come from other kernel regions.
+
+| Metric (Flash M128, single rank, E32) | Rejected iter. 6 L1 | Iteration 7 L1 | Change | Rejected iter. 6 L2 | Iteration 7 L2 | Change |
+|---|---:|---:|---:|---:|---:|---:|
+| NCU duration | 940.48 us | 911.10 us | -3.1% | 488.86 us | 473.22 us | -3.2% |
+| Executed instructions | 129,596,259 | 128,956,122 | -0.5% | 69,741,293 | 69,289,384 | -0.6% |
+| Excessive shared wavefronts | 4,265,522 | 71,218 | -98.3% | 2,433,536 | 336,384 | -86.2% |
+| Total shared wavefronts | 17,139,280 | 12,944,976 | -24.5% | 9,150,542 | 7,053,390 | -22.9% |
+| L1/TEX hit rate | 83.30% | 83.30% | ~0 pp | 79.21% | 79.21% | ~0 pp |
+
+Relative to accepted Iteration 5, NCU duration improves by 3.2% for L1 and
+6.1% for L2 even though the shuffle-based mapping still executes 5.8% and
+4.2% more instructions. Eliminating the shared replay cost therefore more
+than pays for the coordinate and shuffle work.
+
+| NSYS selected hot path | Rejected iter. 6 | Iteration 7 | Change |
+|---|---:|---:|---:|
+| L1 kernel | 859,972 ns | 825,700 ns | -4.0% |
+| L1-to-L2 gap | 125,344 ns | 126,881 ns | +1.2% |
+| L2 kernel | 444,194 ns | 428,737 ns | -3.5% |
+
+The 1.5 us gap increase is negligible relative to the 49.7 us removed from
+the two kernels, so NCU and NSYS agree on the source of the gain.
+
+### Eight-rank performance
+
+FP8 and Iteration 7 were measured together with the standard three
+observations and 20 Kineto tests. The gain column uses accepted Iteration 5;
+the rejected Iteration 6 is not treated as a baseline.
+
+| Model | M | Co-measured FP8 (us) | MXFP4 iter. 5 (us) | MXFP4 iter. 7 (us) | Iteration gain | Iter. 7 / FP8 |
+|---|---:|---:|---:|---:|---:|---:|
+| Flash | 8 | 313.1 | 1,153.9 | 1,135.7 | 1.6% | 3.63x |
+| Flash | 128 | 435.8 | 1,397.5 | 1,338.3 | 4.2% | 3.07x |
+| Flash | 512 | 920.6 | 2,587.5 | 2,460.0 | 4.9% | 2.67x |
+| Flash | 8192 | 9,884.0 | 29,828.0 | 28,797.0 | 3.5% | 2.91x |
+| Pro | 8 | 702.7 | 2,997.6 | 2,899.6 | 3.3% | 4.13x |
+| Pro | 128 | 1,249.4 | 4,744.0 | 4,601.0 | 3.0% | 3.68x |
+| Pro | 512 | 2,425.0 | 7,175.0 | 6,971.0 | 2.8% | 2.87x |
+| Pro | 8192 | 25,143.0 | 75,629.0 | 73,156.0 | 3.3% | 2.91x |
+
+Iteration 7 is accepted because all eight production points improve, and it
+also beats the rejected Iteration 6 by 1.7-4.0% at every point. Across the
+four M values, Iteration 0 to Iteration 7 geometric-mean speedup is 2.80x for
+Flash and 3.09x for Pro.
+
+### Remaining bottleneck and next direction
+
+The accepted kernel is still 2.67-4.13x slower than FP8 and therefore has not
+reached the SOTA goal. With decoder shared conflicts removed, NCU again makes
+the natural-layout exponent loads the largest concrete source issue:
+3,692,178 excessive global sectors in L1 and 1,835,136 in L2. The rejected
+blocked layout showed that fully transposing the tensor destroys useful K-step
+cache locality. The next experiment should retain natural `[E,N,K/32]`
+storage but cooperatively load each row's four-byte word with fewer active
+lanes, then broadcast it within a small row group. This can reduce global
+sectors without changing the K traversal order or the checkpoint-facing
+layout. A larger structural alternative is to overlap expansion of the next
+pipeline stage with the current WGMMA, since H20 has no native FP4 tensor-core
+instruction and runtime E2M1-to-E4M3 expansion remains unavoidable.

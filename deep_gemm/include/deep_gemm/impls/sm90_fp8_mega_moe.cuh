@@ -1176,18 +1176,13 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             local_expert_idx * weight_sf_per_expert;
 
                         // K32 scale groups are contiguous, so each math-WG
-                        // thread moves all four scales for one output column
-                        // with a single 32-bit global load. Processed weights
-                        // consume those bytes as bounded E4M3 exponent offsets
-                        // while decoding the same row; the raw fallback stages
-                        // them for the per-K32 accumulator promotion below.
+                        // thread owns one output column and moves all four
+                        // scales with a single 32-bit global load. Processed
+                        // decoding remaps lanes across eight rows and shares
+                        // each owner's word with warp shuffles; the raw
+                        // fallback stages it for accumulator promotion below.
                         const uint32_t local_n = wg_thread_idx;
                         const uint32_t global_n = n_idx + local_n;
-                        const uint32_t packed_row_base =
-                            (wg_n_idx + local_n) * (BLOCK_K / 2);
-                        const uint32_t packed_row_xor =
-                            cute::Swizzle<2, 4, 3>::apply(packed_row_base) ^
-                            packed_row_base;
                         const uint32_t weight_sf_k =
                             k_block_idx * kNumMXFP4SFBKGroups;
                         const uint32_t scale_word = __ldg(
@@ -1196,25 +1191,63 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         if constexpr (kProcessedMXFP4Scales) {
                             DG_STATIC_ASSERT(WG_BLOCK_N == kWGThreads,
                                              "Processed MXFP4 assigns one N row per WG thread");
+                            constexpr uint32_t kPackedWordsPerK32 = 32 / 8;
+                            constexpr uint32_t kRowsPerDecodeGroup = 8;
+                            DG_STATIC_ASSERT(
+                                kPackedWordsPerK32 == 4 and
+                                32 % kRowsPerDecodeGroup == 0,
+                                "Processed MXFP4 warp mapping requires 8 rows x 4 words");
+
+                            // Each half warp covers the same eight rows and
+                            // two disjoint words. This distributes B64 loads
+                            // over all 32 banks and also gives each half-warp
+                            // B128 STS.64 transaction one bank-word per bank.
+                            const uint32_t lane_in_half_warp = lane_idx % 16;
+                            const uint32_t row_in_decode_group =
+                                lane_in_half_warp / 2;
+                            const uint32_t packed_k_in_k32 =
+                                (lane_idx / 16) * 2 + lane_in_half_warp % 2;
                             #pragma unroll
-                            for (uint32_t packed_k = 0;
-                                 packed_k < BLOCK_K / 8; ++ packed_k) {
-                                const uint32_t exponent_offset =
-                                    (scale_word >> ((packed_k / 4u) * 8u)) & 0xffu;
-                                const uint32_t packed_byte_offset =
-                                    packed_row_base +
-                                    ((packed_k * sizeof(uint32_t)) ^ packed_row_xor);
-                                const uint2 decoded =
-                                    sm90_mxfp4_e2m1x8_to_e4m3x8_bits(
-                                        ptx::ld_shared(reinterpret_cast<const uint32_t*>(
-                                            packed + packed_byte_offset)),
-                                        exponent_offset);
-                                const uint32_t logical_n = wg_n_idx + local_n;
-                                const uint32_t logical_k0 = packed_k * 8;
-                                const uint32_t flat0 = logical_n * BLOCK_K + logical_k0;
-                                const uint32_t swizzled0 = cute::Swizzle<3, 4, 3>::apply(flat0);
-                                ptx::st_shared(
-                                    expanded + swizzled0, decoded.x, decoded.y);
+                            for (uint32_t row_group = 0;
+                                 row_group < 32 / kRowsPerDecodeGroup; ++ row_group) {
+                                const uint32_t row_in_warp =
+                                    row_group * kRowsPerDecodeGroup +
+                                    row_in_decode_group;
+                                const uint32_t decoded_local_n =
+                                    warp_idx_in_wg * 32 + row_in_warp;
+                                const uint32_t decoded_scale_word = __shfl_sync(
+                                    0xffffffffu, scale_word, row_in_warp);
+                                const uint32_t packed_row_base =
+                                    (wg_n_idx + decoded_local_n) * (BLOCK_K / 2);
+                                const uint32_t packed_row_xor =
+                                    cute::Swizzle<2, 4, 3>::apply(packed_row_base) ^
+                                    packed_row_base;
+
+                                #pragma unroll
+                                for (uint32_t k32_idx = 0;
+                                     k32_idx < kNumMXFP4SFBKGroups; ++ k32_idx) {
+                                    const uint32_t packed_k =
+                                        k32_idx * kPackedWordsPerK32 + packed_k_in_k32;
+                                    const uint32_t exponent_offset =
+                                        (decoded_scale_word >> (k32_idx * 8u)) & 0xffu;
+                                    const uint32_t packed_byte_offset =
+                                        packed_row_base +
+                                        ((packed_k * sizeof(uint32_t)) ^ packed_row_xor);
+                                    const uint2 decoded =
+                                        sm90_mxfp4_e2m1x8_to_e4m3x8_bits(
+                                            ptx::ld_shared(reinterpret_cast<const uint32_t*>(
+                                                packed + packed_byte_offset)),
+                                            exponent_offset);
+                                    const uint32_t logical_n =
+                                        wg_n_idx + decoded_local_n;
+                                    const uint32_t logical_k0 = packed_k * 8;
+                                    const uint32_t flat0 =
+                                        logical_n * BLOCK_K + logical_k0;
+                                    const uint32_t swizzled0 =
+                                        cute::Swizzle<3, 4, 3>::apply(flat0);
+                                    ptx::st_shared(
+                                        expanded + swizzled0, decoded.x, decoded.y);
+                                }
                             }
                         } else {
                             ptx::st_shared(

@@ -120,9 +120,50 @@ def _deinterleave_weights(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
     return out
 
 
+def _check_mxfp4_processed_decode_mapping() -> None:
+    """Prove the processed decoder covers every B128 tile word exactly once.
+
+    Keep this coordinate oracle in lockstep with the half-warp mapping in
+    ``sm90_fp8_mega_moe.cuh``.  The end-to-end tolerance check can hide a
+    sparse lane error; this contract cannot.
+    """
+    block_n = 128
+    packed_words_per_row = 128 // 8
+    rows_per_decode_group = 8
+    visits = []
+
+    for warp_idx in range(4):
+        for lane_idx in range(32):
+            lane_in_half_warp = lane_idx % 16
+            row_in_decode_group = lane_in_half_warp // 2
+            packed_k_in_k32 = (
+                (lane_idx // 16) * 2 + lane_in_half_warp % 2)
+            for row_group in range(32 // rows_per_decode_group):
+                row_in_warp = (
+                    row_group * rows_per_decode_group + row_in_decode_group)
+                decoded_local_n = warp_idx * 32 + row_in_warp
+                scale_source_lane = row_in_warp
+                assert warp_idx * 32 + scale_source_lane == decoded_local_n
+                for k32_idx in range(128 // 32):
+                    packed_k = k32_idx * 4 + packed_k_in_k32
+                    assert packed_k // 4 == k32_idx
+                    visits.append((decoded_local_n, packed_k))
+
+    expected = [
+        (row, packed_k)
+        for row in range(block_n)
+        for packed_k in range(packed_words_per_row)
+    ]
+    assert len(visits) == block_n * packed_words_per_row
+    assert len(set(visits)) == len(visits)
+    assert sorted(visits) == expected
+
+
 def _check_mxfp4_format_contract(device: torch.device) -> None:
     """Check raw Humming bytes, nibble order, and UE8M0 endpoint semantics."""
     from deep_gemm.mega import _normalize_mxfp4_ue8m0, _process_mxfp4_fused_e8m0
+
+    _check_mxfp4_processed_decode_mapping()
 
     # Low nibble is the even-K value and high nibble is the odd-K value.
     golden_bytes = torch.tensor(
@@ -714,7 +755,7 @@ def _test_worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace
 
     if args.weight_format == 'mxfp4':
         _check_mxfp4_format_contract(torch.device('cuda'))
-        dist_print('MXFP4 raw-format contract: PASS', once_in_node=True)
+        dist_print('MXFP4 format/decode mapping contract: PASS', once_in_node=True)
 
     diff_tol = args.diff_tol
     layers: List[Tuple[str, Dict[str, Any]]] = []
