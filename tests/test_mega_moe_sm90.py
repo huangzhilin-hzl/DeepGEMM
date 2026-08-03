@@ -258,16 +258,15 @@ def _check_mxfp4_prmt_decode_contract() -> None:
         lookup_hi = (
             exponent_offset * 0x08080808 + 0x1c181410) & 0xffffffff
 
-        sign_even = ((packed & 0x08080808) << 4) & 0xffffffff
-        sign_odd = packed & 0x80808080
-        out_lo = byte_perm(sign_even, sign_odd, 0x5140)
-        magnitude_lo = byte_perm(
-            lookup_lo, lookup_hi, packed & 0x77777777)
+        sign_source = (packed << 4) & 0xffffffff
+        out_lo = byte_perm(sign_source, packed, 0x5140)
+        out_hi = byte_perm(sign_source, packed, 0x7362)
+        magnitude_source = packed & 0x77777777
+        magnitude_lo = byte_perm(lookup_lo, lookup_hi, magnitude_source)
         out_lo = (out_lo & 0x80808080) | magnitude_lo
 
-        out_hi = byte_perm(sign_even, sign_odd, 0x7362)
         magnitude_hi = byte_perm(
-            lookup_lo, lookup_hi, (packed >> 16) & 0x77777777)
+            lookup_lo, lookup_hi, magnitude_source >> 16)
         out_hi = (out_hi & 0x80808080) | magnitude_hi
         decoded = out_lo.to_bytes(4, 'little') + out_hi.to_bytes(4, 'little')
         return list(decoded)
@@ -290,15 +289,13 @@ def _check_mxfp4_prmt_decode_contract() -> None:
                 for value in repeated
             ]
             for target_position in range(8):
-                mixed = [
-                    (code + 3 * position + 1) & 0xf
-                    for position in range(8)
-                ]
-                mixed[target_position] = code
-                assert decode_prmt(mixed, exponent_offset) == [
-                    decode_reference(value, exponent_offset)
-                    for value in mixed
-                ]
+                for background_code in range(16):
+                    mixed = [background_code] * 8
+                    mixed[target_position] = code
+                    assert decode_prmt(mixed, exponent_offset) == [
+                        decode_reference(value, exponent_offset)
+                        for value in mixed
+                    ]
 
     # Raw fallback uses the decoder's default offset and must preserve -0.
     assert decode_prmt([0x8] * 8, 6) == [0x80] * 8

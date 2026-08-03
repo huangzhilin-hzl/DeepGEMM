@@ -1370,3 +1370,87 @@ one/eight-rank execution, and both host launch APIs retain correctness. The
 next optimization should reduce the new spill traffic without sacrificing
 two-CTA residency, or remove the expanded shared-memory tile with a
 register-source WGMMA path. MXFP4 remains 1.90-2.36x behind FP8 at M128.
+
+## Accepted experiment: compressed PRMT/LOP3 decoder
+
+### Hypothesis, implementation, and correctness
+
+Iteration 15 removes redundant masks and shifts from Iteration 13's decoder
+without changing the Iteration 14 two-CTA schedule. The even-nibble sign bits
+are gathered from `packed << 4`, the odd-nibble signs directly from `packed`,
+and two PRMT instructions construct both output sign words before the packed
+magnitudes are reused for the low and high lookups. The following LOP3 keeps
+only bit 7 from each gathered sign byte, so cross-byte low-bit carry from the
+unmasked shift cannot affect the output. This replaces two complete sign
+mask/shift sequences with one shift and removes one repeated magnitude mask.
+
+The host oracle now enumerates every target code, nibble position, background
+code, and exponent offset 1 through 12, including negative zero. Independent
+bit-level review additionally compared the old decoder, new decoder, and a
+scalar reference over 49,152 directed cases and 250,000 seeded random packed
+words without a mismatch. Fresh-JIT processed Flash M128 passed on one rank,
+processed Flash and Pro M128 passed on eight ranks, and raw L1 passed on one
+rank; all four cases reported `calc_diff=0.0006` at tolerance `0.01`.
+
+The compiled L1/L2 cubins retain 128 registers, the same stack frames and the
+same spill count as Iteration 14. Static SASS size falls from 6,064 to 5,952
+instructions in L1 and from 6,432 to 6,336 in L2. The removed code is visible
+primarily as 48 fewer static LOP3 instructions in each specialization.
+
+### Formal H20 performance
+
+The full eight-rank PR383 contract completes all 22 cases and every point is
+faster than Iteration 14. The geometric-mean speedup over all 11 shapes is
+1.023x for Flash and 1.017x for Pro. M128 improves by 2.80%/1.06% and narrows
+the matching FP8 gap to 1.85x/2.34x.
+
+| Model, M128 | FP8 (us) | Iteration 14 MXFP4 (us) | Iteration 15 MXFP4 (us) | Change vs Iter. 14 | MXFP4 / FP8 |
+|---|---:|---:|---:|---:|---:|
+| Flash | 430.344 | 817.269 | 794.383 | -2.80% | 1.85x |
+| Pro | 1,222.618 | 2,890.500 | 2,860.000 | -1.06% | 2.34x |
+
+| M | Flash Iter. 15 (us) | Change vs Iter. 14 | Pro Iter. 15 (us) | Change vs Iter. 14 |
+|---:|---:|---:|---:|---:|
+| 8 | 684.331 | -3.67% | 1,824.726 | -1.97% |
+| 16 | 766.173 | -1.92% | 2,557.136 | -2.20% |
+| 32 | 782.421 | -3.50% | 2,814.232 | -1.70% |
+| 64 | 790.675 | -2.53% | 2,834.927 | -1.44% |
+| 128 | 794.383 | -2.80% | 2,860.000 | -1.06% |
+| 256 | 823.892 | -0.64% | 2,889.000 | -0.79% |
+| 512 | 1,523.601 | -0.77% | 4,279.000 | -1.47% |
+| 1,024 | 2,568.649 | -2.04% | 7,152.000 | -0.72% |
+| 2,048 | 4,618.000 | -2.16% | 12,368.000 | -2.21% |
+| 4,096 | 8,667.000 | -2.54% | 22,818.000 | -1.92% |
+| 8,192 | 16,766.000 | -2.41% | 44,260.000 | -2.70% |
+
+The full-matrix geometric-mean FP8 gap is now 1.922x for Flash and 2.091x for
+Pro. This remains an optimization milestone rather than parity.
+
+### NCU and NSYS attribution
+
+Full-set one-rank Flash M128/E32 NCU directly attributes the gain to reduced
+instruction count. L1 executes 75,112,182 instructions, down 7.73%, and L2
+executes 44,259,506, down 6.73%. Duration falls 2.14%/1.62%. Register count,
+local-memory spill requests, and occupancy stay effectively unchanged, so the
+decoder compression does not trade additional resource pressure for speed.
+
+| NCU metric | Iteration 14 L1 | Iteration 15 L1 | Iteration 14 L2 | Iteration 15 L2 |
+|---|---:|---:|---:|---:|
+| Duration | 552.060 us | 540.260 us | 279.840 us | 275.300 us |
+| Executed instructions | 81,400,657 | 75,112,182 | 47,451,611 | 44,259,506 |
+| Local-memory spill requests | 2,687,344 | 2,687,344 | 2,177,584 | 2,177,584 |
+| Launch registers per thread | 128 | 128 | 128 | 128 |
+| Achieved occupancy | 18.04% | 18.03% | 23.87% | 23.93% |
+| Achieved active warps/SM | 11.55 | 11.54 | 15.28 | 15.32 |
+
+NSYS records L1 at 518,467 ns, the inter-kernel gap at 111,041 ns, and L2 at
+249,825 ns, for 879,333 ns across the selected hot path. The total is 2.12%
+below Iteration 14. The isolated L1 sample is 2.08% longer, while the gap and
+L2 are 16.43% and 3.01% shorter; the independent NCU full replay and the full
+formal matrix provide the stronger phase-level and end-to-end evidence.
+
+Iteration 15 is accepted as the new MXFP4 baseline. It preserves the Iteration
+14 residency/resource contract and all correctness boundaries while reducing
+executed instructions and every formal latency point. The primary remaining
+target is the two-CTA compiler spill path or a register-source WGMMA design;
+M128 MXFP4 is still 1.85-2.34x slower than matching FP8 MegaMoE.
