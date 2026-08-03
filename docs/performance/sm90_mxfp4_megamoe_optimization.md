@@ -608,3 +608,65 @@ sectors without changing the K traversal order or the checkpoint-facing
 layout. A larger structural alternative is to overlap expansion of the next
 pipeline stage with the current WGMMA, since H20 has no native FP4 tensor-core
 instruction and runtime E2M1-to-E4M3 expansion remains unavoidable.
+
+## Rejected experiment: four-stage `uint4` exponent prefetch
+
+### Hypothesis and implementation
+
+The processed path temporarily replaced four consecutive 32-bit exponent
+loads from the natural `[E,N,K/32]` row with one 128-bit `uint4` load. The four
+words stayed in registers and were selected by `k_block_idx % 4`. This retained
+the accepted row-major layout and attempted to amortize the sector cost across
+four BK128 stages without reintroducing the blocked-layout cache regression.
+The raw-scale fallback remained on its original scalar load.
+
+Single-rank processed, forced-requantization, and raw-fallback correctness all
+passed (`calc_diff=0.0005-0.0006`, tolerance `0.01`). Detailed NCU reported the
+same 168 registers per thread and zero local-memory spill.
+
+### NCU and NSYS attribution
+
+SASS emitted the intended `LDG.E.128.CONSTANT`. SourceCounters shows that it
+removed most redundant global sectors, but the run-time cache-word selection
+added branches and the end-to-end hot path did not improve consistently.
+
+| Metric (Flash M128, single rank, E32) | Iteration 7 L1 | `uint4` L1 | Change | Iteration 7 L2 | `uint4` L2 | Change |
+|---|---:|---:|---:|---:|---:|---:|
+| NCU duration | 911.10 us | 901.22 us | -1.1% | 473.22 us | 480.38 us | +1.5% |
+| Executed instructions | 128,956,122 | 128,921,259 | ~0% | 69,289,384 | 69,207,124 | -0.1% |
+| Excessive global sectors | 3,692,178 | 546,455 | -85.2% | 1,835,136 | 262,272 | -85.7% |
+| Total global sectors | 4,270,924 | 1,125,605 | -73.6% | 2,368,300 | 795,806 | -66.4% |
+| Registers per thread | 168 | 168 | 0 | 168 | 168 | 0 |
+| Local-memory spill requests | 0 | 0 | 0 | 0 | 0 | 0 |
+
+| NSYS selected hot path | Iteration 7 | `uint4` prefetch | Change |
+|---|---:|---:|---:|
+| L1 kernel | 825,700 ns | 828,738 ns | +0.4% |
+| L1-to-L2 gap | 126,881 ns | 140,001 ns | +10.3% |
+| L2 kernel | 428,737 ns | 442,337 ns | +3.2% |
+
+### Eight-rank performance and rejection decision
+
+The full paired campaign used three observations and 20 Kineto tests. Changes
+are relative to accepted Iteration 7; lower is better.
+
+| Model | M | Co-measured FP8 (us) | Iteration 7 (us) | `uint4` prefetch (us) | Change |
+|---|---:|---:|---:|---:|---:|
+| Flash | 8 | 334.5 | 1,135.7 | 1,125.4 | -0.9% |
+| Flash | 128 | 454.1 | 1,338.3 | 1,326.7 | -0.9% |
+| Flash | 512 | 937.5 | 2,460.0 | 2,479.6 | +0.8% |
+| Flash | 8192 | 9,877.0 | 28,797.0 | 28,609.0 | -0.7% |
+| Pro | 8 | 705.9 | 2,899.6 | 2,956.0 | +1.9% |
+| Pro | 128 | 1,228.3 | 4,601.0 | 4,638.0 | +0.8% |
+| Pro | 512 | 2,444.2 | 6,971.0 | 7,015.0 | +0.6% |
+| Pro | 8192 | 25,148.0 | 73,156.0 | 73,746.0 | +0.8% |
+
+Five of eight production points regress, and the geometric-mean change is a
+0.32% slowdown. Independent review also found that an unconditional `uint4`
+load requires each scale row to contain a multiple of 16 bytes. That silently
+narrows the public `%128` hidden-size contract to `%512`; for example, a valid
+640-wide shape would either fail the temporary static assertion or over-read
+the final 20-byte scale row. A tail fallback could preserve the shape contract,
+but cannot justify the measured regression and added control flow. The device
+change was reverted, so accepted Iteration 7 remains the implementation and
+only this profiler record is retained.
