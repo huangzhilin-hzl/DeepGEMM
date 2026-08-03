@@ -425,6 +425,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr uint32_t kNumL2SFAKGroups = BLOCK_K / kL2ActsSFGranK;
     constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE =
         kNumL2SFAKGroups * kL2SFAHalfStride * sizeof(float);
+    // MXFP4 weight scales are laid out as one UE8M0 byte per (N, K32)
+    // group.  Stage them once per pipeline tile so the accumulator-row
+    // promotion does not repeatedly issue identical global loads.
+    constexpr uint32_t kNumMXFP4SFBKGroups = BLOCK_K / 32;
+    constexpr uint32_t SMEM_SFB_SIZE = kMXFP4Weights ?
+        BLOCK_N * kNumMXFP4SFBKGroups * sizeof(uint8_t) : 0u;
     // CD output: max of L1 FP8 (BLOCK_M * (BLOCK_N/2) * 1 byte * num_wg) and
     // L2 BF16 contribution.
     constexpr uint32_t SMEM_CD_ACCUM_SIZE = 0u;
@@ -514,9 +520,11 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     auto smem_sfa = utils::PatternVisitor([=](const uint32_t& i) {
         return reinterpret_cast<float*>(sf_start_ptr + i * SMEM_SFA_SIZE_PER_STAGE);
     });
-    // Barriers live after the activation-SF stages.
+    auto sfb_start_ptr = sf_start_ptr + kNumStages * SMEM_SFA_SIZE_PER_STAGE;
+    auto smem_sfb = sfb_start_ptr;
+    // Barriers live after the activation- and weight-SF stages.
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(
-        sf_start_ptr + kNumStages * SMEM_SFA_SIZE_PER_STAGE);
+        sfb_start_ptr + SMEM_SFB_SIZE);
     auto dispatch_barriers = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + i; });
     auto full_barriers     = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + kNumDispatchWarps + i; });
     auto empty_barriers    = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + kNumDispatchWarps + kNumStages + i; });
@@ -1126,10 +1134,33 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         kHidden * kL2WeightSFK;
                     const uint32_t wg_thread_idx = warp_idx_in_wg * 32 + lane_idx;
 
-                    const auto expand_stage_weights = [&]() {
+                    const auto prepare_stage_weights = [&](const uint32_t& k_block_idx) {
                         const auto* packed = smem_b_packed[stage_idx] +
                             wg_n_idx * BLOCK_K / 2;
                         auto* expanded = reinterpret_cast<uint8_t*>(smem_b[stage_idx]);
+                        const uint32_t weight_sf_stride_k = is_linear1_phase ?
+                            kL1WeightSFK : kL2WeightSFK;
+                        const uint32_t weight_sf_per_expert = is_linear1_phase ?
+                            kL1WeightSFPerExpert : kL2WeightSFPerExpert;
+                        const auto* sf_base = (is_linear1_phase ?
+                            l1_mxfp4_weights_sf : l2_mxfp4_weights_sf) +
+                            local_expert_idx * weight_sf_per_expert;
+
+                        // K32 scale groups are contiguous, so each math-WG
+                        // thread moves all four scales for one output column
+                        // with a single 32-bit global load/store pair.
+                        const uint32_t local_n = wg_thread_idx;
+                        const uint32_t global_n = n_idx + local_n;
+                        const uint32_t weight_sf_k =
+                            k_block_idx * kNumMXFP4SFBKGroups;
+                        const uint32_t scale_word = __ldg(
+                            reinterpret_cast<const uint32_t*>(
+                                sf_base + global_n * weight_sf_stride_k + weight_sf_k));
+                        ptx::st_shared(
+                            reinterpret_cast<uint32_t*>(smem_sfb) +
+                                (wg_n_idx + local_n),
+                            scale_word);
+
                         #pragma unroll
                         for (uint32_t packed_idx = wg_thread_idx;
                              packed_idx < kPackedBytesPerWG;
@@ -1164,26 +1195,18 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             smem_sfa[stage_idx] +
                                 activation_sf_group * kL2SFAHalfStride +
                                 row_offset_r1);
-                        const uint32_t weight_sf_k =
-                            k_block_idx * (BLOCK_K / kWeightGranK) + k32_idx;
-                        const uint32_t weight_sf_stride_k = is_linear1_phase ?
-                            kL1WeightSFK : kL2WeightSFK;
-                        const uint32_t weight_sf_per_expert = is_linear1_phase ?
-                            kL1WeightSFPerExpert : kL2WeightSFPerExpert;
-                        const auto* sf_base = (is_linear1_phase ?
-                            l1_mxfp4_weights_sf : l2_mxfp4_weights_sf) +
-                            local_expert_idx * weight_sf_per_expert;
 
                         #pragma unroll
                         for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
-                            const uint32_t output_n0 = n_idx + i * 8u + col_idx * 2u;
+                            const uint32_t output_n0 =
+                                wg_n_idx + i * 8u + col_idx * 2u;
                             const uint32_t output_n1 = output_n0 + 1u;
                             const float scale_b_0 = sm90_mxfp4_ue8m0_to_float(
-                                __ldg(sf_base + output_n0 * weight_sf_stride_k +
-                                      weight_sf_k));
+                                smem_sfb[output_n0 * kNumMXFP4SFBKGroups +
+                                         k32_idx]);
                             const float scale_b_1 = sm90_mxfp4_ue8m0_to_float(
-                                __ldg(sf_base + output_n1 * weight_sf_stride_k +
-                                      weight_sf_k));
+                                smem_sfb[output_n1 * kNumMXFP4SFBKGroups +
+                                         k32_idx]);
                             final_accum[i * 4 + 0] +=
                                 scale_a_0 * scale_b_0 * accum[i * 4 + 0];
                             final_accum[i * 4 + 1] +=
@@ -1198,7 +1221,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks;
                          advance_pipeline(k_block_idx)) {
                         full_barriers[stage_idx]->wait(phase);
-                        expand_stage_weights();
+                        prepare_stage_weights(k_block_idx);
 
                         #pragma unroll
                         for (uint32_t k32_idx = 0;

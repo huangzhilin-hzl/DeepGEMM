@@ -281,11 +281,14 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     // SF on SM90:
     //   * SFA per stage must hold one aligned BLOCK_M-float vector for every
     //     per-64-K L2 scale group (two for BK128, four for BK256)
-    //   * SFB is loaded directly from global by the math warpgroup (block-(128,128)
-    //     weight quantization), so no SMEM is reserved for it.
+    //   * MXFP4 SFB keeps one byte for every (N, K32) group.  The math
+    //     warpgroup loads each UE8M0 scale once, then reuses it from SMEM
+    //     across all WGMMA accumulator rows.
     const int smem_sfa_half_stride_bytes = align(block_m * static_cast<int>(sizeof(float)), 128);
     const int smem_sfa_per_stage =
         (block_k / 64) * smem_sfa_half_stride_bytes;
+    const int smem_sfb_scratch =
+        mxfp4_weights ? block_n * (block_k / 32) : 0;
     // Per-stage: A tile + expanded FP8 B tile + SFA tile.  The SM90 MXFP4
     // path additionally keeps one packed E2M1 B tile (half a byte/weight)
     // until the math warpgroup expands it into the normal WGMMA layout.
@@ -301,7 +304,8 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     const int smem_barriers_fixed = (num_dispatch_warps + 2 * num_epilogue_warps) * 8;
     const int smem_barriers_per_stage = 2 * 8;
 
-    const int smem_fixed = smem_dispatch_size + smem_cd + smem_barriers_fixed;
+    const int smem_fixed = smem_dispatch_size + smem_cd + smem_sfb_scratch +
+                           smem_barriers_fixed;
 
     const int max_num_stages = (smem_capacity - smem_fixed) /
                                (smem_per_stage + smem_barriers_per_stage);
