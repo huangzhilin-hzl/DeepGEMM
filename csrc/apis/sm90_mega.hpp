@@ -141,12 +141,12 @@ get_symm_buffer_size_for_sm90_mega_moe(
     return {reinterpret_cast<int64_t>(combine_token_buffer.get_end_ptr()), slice_input_buffers};
 }
 
-// SM90 (Hopper) FP8 MegaMoE entry point.
+// SM90 (Hopper) FP8-activation MegaMoE entry point.
 //
-// Mirrors `fp8_fp4_mega_moe` but expects FP8 (e4m3) weights with per-128 channel
-// float scale factors. Top-level routing (which entry to call) is the caller's
+// Shared validation and dispatch for FP8 weights (per-128 float scales) and
+// packed MXFP4 weights (K32 UE8M0 scales). Top-level routing is the caller's
 // responsibility (see `deep_gemm/mega/__init__.py`).
-static void fp8_mega_moe(
+static void sm90_mega_moe(
     const torch::Tensor& y,
     const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
     const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
@@ -158,7 +158,8 @@ static void fp8_mega_moe(
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool mxfp4_weights
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -167,11 +168,16 @@ static void fp8_mega_moe(
     const auto arch_major = device_runtime->get_arch_major();
     DG_HOST_ASSERT(arch_major == 9);
 
-    // Config checks: SM90 uses block (128, 128) float SF for weights,
-    // per-token per-128-K float SF for activations.
+    // Config checks: the FP8-weight path uses block (128, 128) float SF; the
+    // MXFP4 path uses K32 UE8M0 SF. Activations use per-token per-128-K float
+    // SF in both cases.
     const auto num_tokens = static_cast<int>(y.size(0));
     const auto [rm, rn, rk] = recipe;
-    DG_HOST_ASSERT(rm == 128 and rn == 128 and rk == 128);
+    if (mxfp4_weights) {
+        DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == 32);
+    } else {
+        DG_HOST_ASSERT(rm == 128 and rn == 128 and rk == 128);
+    }
     DG_HOST_ASSERT(activation == "swiglu");
 
     // Activation checks
@@ -179,13 +185,26 @@ static void fp8_mega_moe(
         activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
     DG_HOST_ASSERT(activation_clamp >= 0);
 
-    // Tensor checks: SM90 weights must be FP8 e4m3, K-major
+    // Tensor checks: both paths are K-major. MXFP4 follows Humming's native
+    // packed-E2M1 contract: int8 [E, N, K/2] plus natural-layout uint8 UE8M0
+    // scales [E, N, K/32].
     DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
     DG_HOST_ASSERT(get_major_type_ab(l2_weights) == cute::UMMA::Major::K);
-    DG_HOST_ASSERT(l1_weights.scalar_type() == torch::kFloat8_e4m3fn);
-    DG_HOST_ASSERT(l2_weights.scalar_type() == torch::kFloat8_e4m3fn);
-    const auto [num_experts_per_rank, intermediate_hidden_2, hidden] = get_shape<3>(l1_weights);
-    const auto [num_experts_per_rank_, hidden_, intermediate_hidden] = get_shape<3>(l2_weights);
+    if (mxfp4_weights) {
+        DG_HOST_ASSERT(l1_weights.scalar_type() == kPackedFP4);
+        DG_HOST_ASSERT(l2_weights.scalar_type() == kPackedFP4);
+    } else {
+        DG_HOST_ASSERT(l1_weights.scalar_type() == torch::kFloat8_e4m3fn);
+        DG_HOST_ASSERT(l2_weights.scalar_type() == torch::kFloat8_e4m3fn);
+    }
+    const auto [num_experts_per_rank, intermediate_hidden_2, l1_stored_k] =
+        get_shape<3>(l1_weights);
+    const auto [num_experts_per_rank_, hidden_, l2_stored_k] =
+        get_shape<3>(l2_weights);
+    const int hidden = static_cast<int>(l1_stored_k) *
+        (mxfp4_weights ? 2 : 1);
+    const int intermediate_hidden = static_cast<int>(l2_stored_k) *
+        (mxfp4_weights ? 2 : 1);
     DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
     DG_HOST_ASSERT(num_experts_per_rank == num_experts_per_rank_);
     DG_HOST_ASSERT(hidden == hidden_);
@@ -199,14 +218,30 @@ static void fp8_mega_moe(
     DG_HOST_ASSERT(hidden % 128 == 0 and intermediate_hidden % 128 == 0);
     DG_HOST_ASSERT(intermediate_hidden / 64 <= 64);
 
-    // Check weight SF layout (block (128, 128) float, MN-major; not TMA-loaded
-    // so no TMA-stride alignment is required, but we do require contiguity in
-    // the K-direction within each expert).
-    constexpr int kGranMN = 128, kGranK = 128;
-    check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,
-                    num_experts_per_rank, false, true, torch::kFloat);
-    check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
-                    num_experts_per_rank, false, true, torch::kFloat);
+    // Check weight SF layout. SF is not TMA-loaded, so no TMA-stride alignment
+    // is required; the K direction must still be contiguous within each expert.
+    if (mxfp4_weights) {
+        DG_HOST_ASSERT(l1_weights_sf.scalar_type() == torch::kUInt8 and
+                       l2_weights_sf.scalar_type() == torch::kUInt8);
+        DG_HOST_ASSERT(l1_weights_sf.is_contiguous() and
+                       l2_weights_sf.is_contiguous());
+        DG_HOST_ASSERT(l1_weights_sf.dim() == 3 and
+                       l1_weights_sf.size(0) == num_experts_per_rank and
+                       l1_weights_sf.size(1) == intermediate_hidden * 2 and
+                       l1_weights_sf.size(2) == hidden / 32);
+        DG_HOST_ASSERT(l2_weights_sf.dim() == 3 and
+                       l2_weights_sf.size(0) == num_experts_per_rank and
+                       l2_weights_sf.size(1) == hidden and
+                       l2_weights_sf.size(2) == intermediate_hidden / 32);
+    } else {
+        constexpr int kGranMN = 128, kGranK = 128;
+        check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden,
+                        kGranMN, kGranK, num_experts_per_rank,
+                        false, true, torch::kFloat);
+        check_sf_layout(l2_weights_sf, hidden, intermediate_hidden,
+                        kGranMN, kGranK, num_experts_per_rank,
+                        false, true, torch::kFloat);
+    }
 
     // Check stats counter
     if (cumulative_local_expert_recv_stats.has_value()) {
@@ -241,10 +276,52 @@ static void fp8_mega_moe(
                      num_experts_per_rank,
                      num_tokens, num_topk,
                      hidden, intermediate_hidden,
-                     activation_clamp, fast_math);
+                     activation_clamp, fast_math, mxfp4_weights);
 
     if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();
+}
+
+static void fp8_mega_moe(
+    const torch::Tensor& y,
+    const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
+    const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
+    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+    const torch::Tensor& sym_buffer,
+    const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
+    const int& num_max_tokens_per_rank,
+    const int& num_experts, const int& num_topk,
+    const std::tuple<int, int, int>& recipe,
+    const std::string& activation,
+    const std::optional<float>& activation_clamp_opt,
+    const bool& fast_math) {
+    sm90_mega_moe(
+        y, l1_weights_tuple, l2_weights_tuple,
+        cumulative_local_expert_recv_stats,
+        sym_buffer, sym_buffer_ptrs, rank_idx,
+        num_max_tokens_per_rank, num_experts, num_topk,
+        recipe, activation, activation_clamp_opt, fast_math, false);
+}
+
+static void fp8_mxfp4_mega_moe(
+    const torch::Tensor& y,
+    const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
+    const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
+    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+    const torch::Tensor& sym_buffer,
+    const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
+    const int& num_max_tokens_per_rank,
+    const int& num_experts, const int& num_topk,
+    const std::tuple<int, int, int>& recipe,
+    const std::string& activation,
+    const std::optional<float>& activation_clamp_opt,
+    const bool& fast_math) {
+    sm90_mega_moe(
+        y, l1_weights_tuple, l2_weights_tuple,
+        cumulative_local_expert_recv_stats,
+        sym_buffer, sym_buffer_ptrs, rank_idx,
+        num_max_tokens_per_rank, num_experts, num_topk,
+        recipe, activation, activation_clamp_opt, fast_math, true);
 }
 
 static void register_sm90_apis(pybind11::module_& m) {
@@ -252,6 +329,7 @@ static void register_sm90_apis(pybind11::module_& m) {
     m.def("get_token_alignment_for_sm90_mega_moe", &get_token_alignment_for_sm90_mega_moe);
     m.def("get_symm_buffer_size_for_sm90_mega_moe", &get_symm_buffer_size_for_sm90_mega_moe);
     m.def("fp8_mega_moe", &fp8_mega_moe);
+    m.def("fp8_mxfp4_mega_moe", &fp8_mxfp4_mega_moe);
 #endif
 }
 

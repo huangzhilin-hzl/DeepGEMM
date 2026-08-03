@@ -151,6 +151,64 @@ def transform_weights_for_mega_moe_sm90(
     return (_interleave_weights(l1_fp8), l1_sf), l2_weights
 
 
+def _normalize_mxfp4_ue8m0(sf: torch.Tensor) -> torch.Tensor:
+    """Return natural-layout UE8M0 exponent bytes.
+
+    Raw MXFP4 checkpoints commonly expose these tensors as ``uint8`` or
+    ``float8_e8m0fnu``.  The float path is convenient for DeepGEMM's
+    ``per_token_cast_to_fp4`` test utility, which returns the same powers of
+    two as FP32 values.
+    """
+    if sf.dtype == torch.uint8:
+        return sf.contiguous()
+    e8m0_dtype = getattr(torch, 'float8_e8m0fnu', None)
+    if e8m0_dtype is not None and sf.dtype == e8m0_dtype:
+        return sf.contiguous().view(torch.uint8)
+    assert sf.dtype == torch.float32
+    bits = sf.contiguous().view(torch.int32)
+    exponent = (bits >> 23) & 0xff
+    mantissa = bits & ((1 << 23) - 1)
+    is_min_subnormal = bits == (1 << 22)  # UE8M0 code 0: 2^-127.
+    is_normal_power_of_two = (
+        ((bits >> 31) == 0) & (mantissa == 0) &
+        (exponent >= 1) & (exponent <= 254)
+    )
+    assert (is_min_subnormal | is_normal_power_of_two).all()
+    return torch.where(
+        is_min_subnormal, torch.zeros_like(exponent), exponent).to(torch.uint8)
+
+
+def _normalize_mxfp4_packed_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Return raw Humming checkpoint bytes in DeepGEMM's packed-int8 view."""
+    assert weight.dtype in (torch.uint8, torch.int8)
+    weight = weight.contiguous()
+    return weight if weight.dtype == torch.int8 else weight.view(torch.int8)
+
+
+def transform_weights_for_fp8_mxfp4_mega_moe_sm90(
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor]
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+    """Prepare raw Humming-compatible MXFP4 weights for Hopper MegaMoE.
+
+    Raw ``uint8`` or DeepGEMM ``int8`` weight tensors stay packed E2M1 with
+    shape ``[E, N, K/2]``.
+    Scale tensors are natural-layout UE8M0 bytes with shape ``[E, N, K/32]``.
+    L1 gate/up rows are interleaved at granularity 8 for the fused SwiGLU
+    epilogue; L2 needs no layout change.
+    """
+    l1_w, l1_sf = l1_weights
+    l2_w, l2_sf = l2_weights
+    l1_w = _normalize_mxfp4_packed_weight(l1_w)
+    l2_w = _normalize_mxfp4_packed_weight(l2_w)
+    l1_transformed = (
+        _interleave_weights(l1_w),
+        _interleave_weights(_normalize_mxfp4_ue8m0(l1_sf)),
+    )
+    l2_transformed = (l2_w.contiguous(), _normalize_mxfp4_ue8m0(l2_sf))
+    return l1_transformed, l2_transformed
+
+
 def fp8_fp4_mega_moe(y: torch.Tensor,
                      l1_weights: Tuple[torch.Tensor, torch.Tensor],
                      l2_weights: Tuple[torch.Tensor, torch.Tensor],
@@ -190,6 +248,36 @@ def fp8_mega_moe(y: torch.Tensor,
     DeepEP path and this kernel.
     """
     _C.fp8_mega_moe(
+        y,
+        l1_weights, l2_weights,
+        cumulative_local_expert_recv_stats,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts, sym_buffer.num_topk,
+        recipe,
+        activation, activation_clamp,
+        fast_math
+    )
+
+
+def fp8_mxfp4_mega_moe(y: torch.Tensor,
+                       l1_weights: Tuple[torch.Tensor, torch.Tensor],
+                       l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                       sym_buffer: SM90SymmBuffer,
+                       cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                       recipe: Tuple[int, int, int] = (1, 1, 32),
+                       activation: str = 'swiglu',
+                       activation_clamp: Optional[float] = None,
+                       fast_math: bool = True):
+    """SM90 MegaMoE with FP8 activations and packed MXFP4 weights.
+
+    ``l1_weights`` and ``l2_weights`` must be the packed-int8/uint8-scale
+    outputs of ``transform_weights_for_fp8_mxfp4_mega_moe_sm90``. Raw Humming
+    checkpoint tensors must pass through that transform first; tensors already
+    repacked by Humming are not accepted.
+    """
+    _C.fp8_mxfp4_mega_moe(
         y,
         l1_weights, l2_weights,
         cumulative_local_expert_recv_stats,

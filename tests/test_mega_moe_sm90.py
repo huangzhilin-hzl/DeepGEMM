@@ -41,7 +41,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 import deep_gemm
-from deep_gemm.utils import per_token_cast_to_fp8
+from deep_gemm.utils import per_token_cast_to_fp4, per_token_cast_to_fp8
 from deep_gemm.utils.dist import dist_print, init_dist, uneven_all_gather
 from deep_gemm.testing import calc_diff, get_arch_major
 
@@ -79,6 +79,92 @@ def _dequant_block_128_128(w_fp8: torch.Tensor, sf: torch.Tensor) -> torch.Tenso
     assert n % 128 == 0 and k % 128 == 0
     w_view = w_fp8.float().view(*prefix, n // 128, 128, k // 128, 128)
     return (w_view * sf.unsqueeze(-1).unsqueeze(-3)).view(*prefix, n, k)
+
+
+def _quantize_grouped_mxfp4(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Humming-format packed E2M1 weights plus float UE8M0 powers of two."""
+    g, n, k = w.shape
+    packed = torch.empty((g, n, k // 2), dtype=torch.int8, device=w.device)
+    sf = torch.empty((g, n, k // 32), dtype=torch.float32, device=w.device)
+    for group_idx in range(g):
+        packed[group_idx], sf[group_idx] = per_token_cast_to_fp4(
+            w[group_idx], use_ue8m0=True, gran_k=32)
+    return packed, sf
+
+
+def _dequant_mxfp4(packed: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
+    """Dequantize arbitrary-prefix packed E2M1 tensors with K32 scales."""
+    *prefix, n, packed_k = packed.shape
+    k = packed_k * 2
+    codes = torch.empty((*prefix, n, k), dtype=torch.int8, device=packed.device)
+    codes[..., 0::2] = packed & 0x0f
+    codes[..., 1::2] = (packed >> 4) & 0x0f
+    magnitudes = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        dtype=torch.float32, device=packed.device)
+    value_idx = (codes & 0x07).to(torch.long)
+    values = magnitudes[value_idx]
+    values = torch.where((codes & 0x08) != 0, -values, values)
+    return (values.view(*prefix, n, k // 32, 32) *
+            sf.unsqueeze(-1)).view(*prefix, n, k)
+
+
+def _check_mxfp4_format_contract(device: torch.device) -> None:
+    """Check raw Humming bytes, nibble order, and UE8M0 endpoint semantics."""
+    from deep_gemm.mega import _normalize_mxfp4_ue8m0
+
+    # Low nibble is the even-K value and high nibble is the odd-K value.
+    golden_bytes = torch.tensor(
+        [0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe] * 2,
+        dtype=torch.uint8, device=device).view(torch.int8).reshape(1, 1, 16)
+    golden_sf = torch.ones((1, 1, 1), dtype=torch.float32, device=device)
+    positive = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+    negative = [0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+    expected = torch.tensor(
+        (positive + negative) * 2, dtype=torch.float32, device=device).reshape(1, 1, 32)
+    assert torch.equal(_dequant_mxfp4(golden_bytes, golden_sf), expected)
+
+    # Raw checkpoints use uint8 packed weights and uint8/float8_e8m0fnu scales.
+    l1_raw = torch.arange(32 * 16, dtype=torch.int32, device=device).to(
+        torch.uint8).reshape(1, 32, 16)
+    l2_raw = torch.arange(16 * 16, dtype=torch.int32, device=device).to(
+        torch.uint8).reshape(1, 16, 16)
+    endpoint_codes = torch.tensor(
+        [0, 1, 127, 254, 255], dtype=torch.uint8, device=device)
+    l1_sf_raw = endpoint_codes[torch.arange(32, device=device) % 5].reshape(1, 32, 1)
+    l2_sf_raw = endpoint_codes[torch.arange(16, device=device) % 5].reshape(1, 16, 1)
+    e8m0_dtype = getattr(torch, 'float8_e8m0fnu', None)
+    l1_sf_input = l1_sf_raw if e8m0_dtype is None else l1_sf_raw.view(e8m0_dtype)
+    l2_sf_input = l2_sf_raw if e8m0_dtype is None else l2_sf_raw.view(e8m0_dtype)
+    (l1_w, l1_sf), (l2_w, l2_sf) = \
+        deep_gemm.transform_weights_for_fp8_mxfp4_mega_moe_sm90(
+            (l1_raw, l1_sf_input), (l2_raw, l2_sf_input))
+    l1_order = torch.tensor(
+        list(range(8)) + list(range(16, 24)) +
+        list(range(8, 16)) + list(range(24, 32)),
+        dtype=torch.long, device=device)
+    assert l1_w.dtype == torch.int8 and l2_w.dtype == torch.int8
+    assert torch.equal(l1_w.view(torch.uint8), l1_raw[:, l1_order])
+    assert torch.equal(l1_sf, l1_sf_raw[:, l1_order])
+    assert torch.equal(l2_w.view(torch.uint8), l2_raw)
+    assert torch.equal(l2_sf, l2_sf_raw)
+
+    # FP32 input supports every finite UE8M0 power of two, including the
+    # subnormal 2^-127 endpoint, but rejects zero and infinity.
+    fp32_scales = torch.tensor(
+        [2.0 ** -127, 2.0 ** -126, 1.0, 2.0 ** 127],
+        dtype=torch.float32, device=device)
+    assert torch.equal(
+        _normalize_mxfp4_ue8m0(fp32_scales),
+        torch.tensor([0, 1, 127, 254], dtype=torch.uint8, device=device))
+    for invalid in (0.0, float('inf')):
+        try:
+            _normalize_mxfp4_ue8m0(torch.tensor(
+                [invalid], dtype=torch.float32, device=device))
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(f'invalid FP32 UE8M0 scale accepted: {invalid}')
 
 
 def _dequant_per_token_per_128_k(x_fp8: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
@@ -120,6 +206,7 @@ def _reference_fused(
     num_experts: int, num_topk: int,
     hidden: int, intermediate_hidden: int,
     activation_clamp: float,
+    weight_format: str = 'fp8',
 ) -> torch.Tensor:
     """Reference: returns (num_tokens, hidden) bf16 result for *this* rank.
 
@@ -195,10 +282,14 @@ def _reference_fused(
             dst_local = (eids % num_experts_per_rank).long()
 
             # L1 GEMM (per-token): y = x @ W^T  shape (S, 2*IH)
-            l1_w_sel = _dequant_block_128_128(
-                l1_w_all[dst_rank, dst_local],                     # (S, 2*IH, H)
-                l1_sf_all[dst_rank, dst_local],
-            )
+            if weight_format == 'mxfp4':
+                l1_w_sel = _dequant_mxfp4(
+                    l1_w_all[dst_rank, dst_local],
+                    l1_sf_all[dst_rank, dst_local])
+            else:
+                l1_w_sel = _dequant_block_128_128(
+                    l1_w_all[dst_rank, dst_local],                 # (S, 2*IH, H)
+                    l1_sf_all[dst_rank, dst_local])
             l1_y = torch.einsum('sk,snk->sn', x_sel, l1_w_sel)     # (S, 2*IH)
             del l1_w_sel
 
@@ -215,10 +306,14 @@ def _reference_fused(
             l2_in = (l1_q * sf2.unsqueeze(-1)).view(s_, ih)        # (S, IH) fp32
 
             # L2 GEMM
-            l2_w_sel = _dequant_block_128_128(
-                l2_w_all[dst_rank, dst_local],                     # (S, H, IH)
-                l2_sf_all[dst_rank, dst_local],
-            )
+            if weight_format == 'mxfp4':
+                l2_w_sel = _dequant_mxfp4(
+                    l2_w_all[dst_rank, dst_local],
+                    l2_sf_all[dst_rank, dst_local])
+            else:
+                l2_w_sel = _dequant_block_128_128(
+                    l2_w_all[dst_rank, dst_local],                 # (S, H, IH)
+                    l2_sf_all[dst_rank, dst_local])
             l2_y = torch.einsum('sn,smn->sm', l2_in, l2_w_sel)     # (S, H)
             del l2_w_sel
 
@@ -251,6 +346,7 @@ def _run_scenario(
     masked_ratio = cfg.get('masked_ratio', 0.0)
     activation_clamp = cfg.get('activation_clamp', 10.0)
     fast_math = cfg.get('fast_math', True)
+    weight_format = cfg.get('weight_format', 'fp8')
 
     assert num_experts % num_ranks == 0, f'{name}: experts {num_experts} not divisible by ranks {num_ranks}'
     num_experts_per_rank = num_experts // num_ranks
@@ -285,17 +381,22 @@ def _run_scenario(
     # Quantize x to FP8 with per-128 K float SF (SM90 format)
     x_fp8, x_sf = per_token_cast_to_fp8(x_bf, use_ue8m0=False, gran_k=128,
                                         use_packed_ue8m0=False)
-    # Quantize weights with block (128, 128) — matches DeepSeekV4FlashFp8 / DeepEP.
-    l1_w_fp8, l1_w_sf = _quantize_grouped_fp8_block_128_128(l1_bf)
-    l2_w_fp8, l2_w_sf = _quantize_grouped_fp8_block_128_128(l2_bf)
+    if weight_format == 'mxfp4':
+        l1_w_fp8, l1_w_sf = _quantize_grouped_mxfp4(l1_bf)
+        l2_w_fp8, l2_w_sf = _quantize_grouped_mxfp4(l2_bf)
+    else:
+        # Block (128, 128), matching DeepSeekV4FlashFp8 / DeepEP.
+        l1_w_fp8, l1_w_sf = _quantize_grouped_fp8_block_128_128(l1_bf)
+        l2_w_fp8, l2_w_sf = _quantize_grouped_fp8_block_128_128(l2_bf)
 
-    # SM90 weight transform (gate/up interleave only). With block (128, 128)
-    # SF, the SF tensor is consumed by the kernel as-is — no MN-major TMA
-    # transform and no SF-side gate/up interleave is needed.
     _trace('weight_transform')
-    transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe_sm90(
-        (l1_w_fp8, l1_w_sf), (l2_w_fp8, l2_w_sf)
-    )
+    if weight_format == 'mxfp4':
+        transformed_l1, transformed_l2 = \
+            deep_gemm.transform_weights_for_fp8_mxfp4_mega_moe_sm90(
+                (l1_w_fp8, l1_w_sf), (l2_w_fp8, l2_w_sf))
+    else:
+        transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe_sm90(
+            (l1_w_fp8, l1_w_sf), (l2_w_fp8, l2_w_sf))
 
     # ---- Allocate symm buffer -----------------------------------------------
     _trace('alloc_symm_buffer')
@@ -315,10 +416,12 @@ def _run_scenario(
 
     y_fused = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
     _trace('launch_sm90 (may JIT-compile, can take minutes)')
-    deep_gemm.fp8_mega_moe(
+    mega_moe = deep_gemm.fp8_mxfp4_mega_moe \
+        if weight_format == 'mxfp4' else deep_gemm.fp8_mega_moe
+    mega_moe(
         y_fused, transformed_l1, transformed_l2, buffer,
         cumulative_local_expert_recv_stats=cum_stats,
-        recipe=(128, 128, 128),
+        recipe=(1, 1, 32) if weight_format == 'mxfp4' else (128, 128, 128),
         activation='swiglu',
         activation_clamp=activation_clamp if math.isfinite(activation_clamp) else None,
         fast_math=fast_math,
@@ -339,6 +442,7 @@ def _run_scenario(
         num_experts, num_topk,
         hidden, intermediate_hidden,
         activation_clamp,
+        weight_format,
     )
 
     diff = calc_diff(y_fused, y_ref)
@@ -346,7 +450,7 @@ def _run_scenario(
     failed = torch.tensor([not ok], dtype=torch.int, device='cuda')
     dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=group)
     any_rank_failed = bool(failed.item())
-    dist_print(f'  [{name:<32}] diff={diff:.4f} '
+    dist_print(f'  [{name:<32}] format={weight_format:<6} diff={diff:.4f} '
                f'(tol={diff_tol:.2f}) {"OK" if not any_rank_failed else "FAIL"}',
                once_in_node=True)
 
@@ -496,6 +600,10 @@ def _test_worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace
         dist.destroy_process_group()
         return
 
+    if args.weight_format == 'mxfp4':
+        _check_mxfp4_format_contract(torch.device('cuda'))
+        dist_print('MXFP4 raw-format contract: PASS', once_in_node=True)
+
     diff_tol = args.diff_tol
     layers: List[Tuple[str, Dict[str, Any]]] = []
 
@@ -512,6 +620,8 @@ def _test_worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace
 
     if args.filter:
         layers = [(n, c) for n, c in layers if args.filter in n]
+    for _, cfg in layers:
+        cfg['weight_format'] = args.weight_format
 
     dist_print(f'SM90 MegaMoE test plan: {len(layers)} scenarios across '
                f'layers {sorted(args.layers)} on {num_ranks} ranks',
@@ -553,6 +663,8 @@ if __name__ == '__main__':
                         help='Substring filter on scenario names')
     parser.add_argument('--diff-tol', type=float, default=0.01,
                         help='calc_diff tolerance (default: 0.01)')
+    parser.add_argument('--weight-format', choices=('fp8', 'mxfp4'), default='fp8',
+                        help='SM90 weight path to test (default: fp8)')
     parser.add_argument('--fail-fast', action='store_true',
                         help='Stop on first failing scenario')
     args = parser.parse_args()

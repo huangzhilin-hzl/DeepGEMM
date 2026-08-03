@@ -169,6 +169,40 @@ The input activation SF is FP32 with shape `[num_tokens, hidden / 128]`, using o
 
 For the distributed correctness and benchmark driver, refer to `tests/test_mega_moe_sm90.py`.
 
+##### SM90 FP8xMXFP4
+
+The Hopper MXFP4 path consumes the raw Humming E2M1 checkpoint format
+(`uint8`, two weights per byte) and natural-layout UE8M0 scales at K32
+granularity. The scale input may be `uint8`, `float8_e8m0fnu`, or exact FP32
+powers of two. Packed weights are moved as ordinary bytes, so this path keeps
+the same CUDA 12.3 baseline as the existing SM90 implementation. Activations
+and the symmetric buffer use the same FP8/FP32-scale contract as the SM90 FP8
+path above. Only pre-transform checkpoint tensors in natural K-packed layout
+are accepted. No output of Humming's `transform_humming_tensors` is accepted:
+both its regular repacked layout and fused exponent-offset representation are
+different kernel contracts.
+
+```python
+transformed_l1, transformed_l2 = \
+    deep_gemm.transform_weights_for_fp8_mxfp4_mega_moe_sm90(
+        (l1_weight_packed_e2m1, l1_weight_ue8m0),
+        (l2_weight_packed_e2m1, l2_weight_ue8m0),
+    )
+
+deep_gemm.fp8_mxfp4_mega_moe(
+    y, transformed_l1, transformed_l2, buffer,
+    recipe=(1, 1, 32),
+)
+```
+
+Raw packed L1/L2 weights are `uint8` with shapes `[E, 2 * I, H / 2]` and
+`[E, H, I / 2]`; the transform returns the same bytes viewed as DeepGEMM's
+packed `int8` type. UE8M0 scale tensors are contiguous `uint8` with shapes
+`[E, 2 * I, H / 32]` and `[E, H, I / 32]`. The transform interleaves both
+the L1 packed rows and their per-channel scale rows for the fused SwiGLU
+epilogue. Run the MXFP4 distributed correctness plan with
+`python tests/test_mega_moe_sm90.py --weight-format mxfp4`.
+
 #### Utilities
 
 The library provides some utility functions besides the above kernels:

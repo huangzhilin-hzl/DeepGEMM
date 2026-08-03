@@ -18,8 +18,10 @@
 
 namespace deep_gemm {
 
-// SM90 uses register-resident WGMMA accumulators and FP8 weights with per-128
-// float scale factors; it has no TMEM, FP4, cluster MMA, or TMA multicast.
+// SM90 uses register-resident WGMMA accumulators. The FP8 path consumes
+// per-128 float weight scales; the MXFP4 path expands E2M1 weights to FP8 and
+// promotes K32 results with UE8M0 scales. It has no TMEM, cluster MMA, or TMA
+// multicast.
 
 struct MegaMoESM90Config {
     // Block tiling (no STORE_BLOCK_M / SF_BLOCK_M concept on SM90)
@@ -243,7 +245,8 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     const bool& direct_l2_scatter_enabled = false,
     const int& default_num_stages = 0,
     const bool& swap_ab = false,
-    const bool& require_exact_default_stages = false) {
+    const bool& require_exact_default_stages = false,
+    const bool& mxfp4_weights = false) {
     constexpr int kSmemAlignment = 1024;
 
     // Dispatch region (same as SM100)
@@ -283,9 +286,13 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     const int smem_sfa_half_stride_bytes = align(block_m * static_cast<int>(sizeof(float)), 128);
     const int smem_sfa_per_stage =
         (block_k / 64) * smem_sfa_half_stride_bytes;
-    // Per-stage: A tile + B tile + SFA tile. Weight SF is loaded directly.
+    // Per-stage: A tile + expanded FP8 B tile + SFA tile.  The SM90 MXFP4
+    // path additionally keeps one packed E2M1 B tile (half a byte/weight)
+    // until the math warpgroup expands it into the normal WGMMA layout.
+    const int smem_packed_b_per_stage =
+        mxfp4_weights ? block_n * block_k / 2 : 0;
     const int smem_per_stage = block_m * block_k + block_n * block_k +
-                               smem_sfa_per_stage;
+                               smem_packed_b_per_stage + smem_sfa_per_stage;
 
     // Barriers (8 bytes each):
     //   * dispatch: num_dispatch_warps
@@ -825,6 +832,64 @@ static bool try_apply_sm90_moe_tuning(
         return true;
     return try_materialize_sm90_moe_phase_tuning(input, config.l1, tuning.l1) and
            try_materialize_sm90_moe_phase_tuning(input, config.l2, tuning.l2);
+}
+
+// Correctness-first Hopper MXFP4 schedule.  One math warpgroup owns the whole
+// BN128 packed-weight tile and expands it without a CTA-wide synchronization.
+// Specialized FP8 swap-AB/BK256/BF16 accumulation schedules are intentionally
+// excluded until separately tuned.
+static Sm90MoeLaunchConfig select_mxfp4_mega_moe_sm90(
+    const Sm90MoeHeuristicInput& input) {
+    constexpr int block_m = 64;
+    constexpr int block_n = 128;
+    constexpr int block_k = 128;
+    constexpr int num_dispatch_threads = 128;
+    constexpr int num_non_epilogue_threads = 128;
+    constexpr int num_epilogue_threads = 128;
+    constexpr bool direct_l2_scatter = false;
+    constexpr bool nmajor_schedule = false;
+    constexpr bool one_warp_cleanup = false;
+    constexpr bool swap_ab = false;
+
+    DG_HOST_ASSERT((2 * input.intermediate_hidden) % block_n == 0 and
+                   input.hidden % block_n == 0);
+    DG_HOST_ASSERT(input.hidden % block_k == 0 and
+                   input.intermediate_hidden % block_k == 0);
+
+    const int num_max_pool_tokens = layout::get_num_max_pool_tokens(
+        input.num_ranks, input.num_max_tokens_per_rank,
+        input.num_topk, input.num_experts_per_rank);
+    const int requested_epw = get_generic_num_experts_per_wave_for_mega_moe_sm90(
+        input.num_experts_per_rank, input.num_tokens, input.num_topk,
+        input.intermediate_hidden, block_m, block_n, input.launch_num_sms);
+    const int num_experts_per_wave =
+        normalize_num_experts_per_wave_for_mega_moe_sm90(
+            input.num_experts_per_rank, requested_epw);
+    const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90(
+        SM90ArchSpec::smem_capacity,
+        input.num_experts, input.hidden,
+        block_m, block_n, block_k,
+        num_dispatch_threads / 32, num_epilogue_threads / 32,
+        direct_l2_scatter,
+        0,
+        swap_ab,
+        false,
+        true);
+    DG_HOST_ASSERT(num_stages >= 2 and smem_size > 0);
+    const int sf_pool_stride_tokens =
+        layout::get_num_padded_sf_pool_tokens(num_max_pool_tokens, block_m);
+    MegaMoESM90Config phase {
+        block_m, block_n, block_k,
+        num_max_pool_tokens, input.num_padded_sf_pool_tokens,
+        sf_pool_stride_tokens,
+        num_experts_per_wave,
+        input.launch_num_sms,
+        num_stages, smem_size,
+        num_dispatch_threads, num_non_epilogue_threads,
+        num_epilogue_threads,
+        direct_l2_scatter, nmajor_schedule, one_warp_cleanup, swap_ab,
+    };
+    return {phase, phase, {false}};
 }
 
 static Sm90MoeLaunchConfig select_mega_moe_sm90(
