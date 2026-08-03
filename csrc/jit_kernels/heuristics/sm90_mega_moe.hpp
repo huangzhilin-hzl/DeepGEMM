@@ -289,12 +289,16 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
         (block_k / 64) * smem_sfa_half_stride_bytes;
     const int smem_sfb_scratch =
         mxfp4_weights ? block_n * (block_k / 32) : 0;
-    // Per-stage: A tile + expanded FP8 B tile + SFA tile.  The SM90 MXFP4
-    // path additionally keeps one packed E2M1 B tile (half a byte/weight)
-    // until the math warpgroup expands it into the normal WGMMA layout.
+    // The sole MXFP4 math warpgroup expands and consumes one B tile at a time,
+    // so the expanded FP8 tile is fixed CTA scratch. A, packed E2M1 B, and SFA
+    // remain staged so the two TMA producers can run ahead.
+    const int smem_expanded_b_scratch =
+        mxfp4_weights ? block_n * block_k : 0;
+    const int smem_b_per_stage =
+        mxfp4_weights ? 0 : block_n * block_k;
     const int smem_packed_b_per_stage =
         mxfp4_weights ? block_n * block_k / 2 : 0;
-    const int smem_per_stage = block_m * block_k + block_n * block_k +
+    const int smem_per_stage = block_m * block_k + smem_b_per_stage +
                                smem_packed_b_per_stage + smem_sfa_per_stage;
 
     // Barriers (8 bytes each):
@@ -304,7 +308,8 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     const int smem_barriers_fixed = (num_dispatch_warps + 2 * num_epilogue_warps) * 8;
     const int smem_barriers_per_stage = 2 * 8;
 
-    const int smem_fixed = smem_dispatch_size + smem_cd + smem_sfb_scratch +
+    const int smem_fixed = smem_dispatch_size + smem_cd +
+                           smem_expanded_b_scratch + smem_sfb_scratch +
                            smem_barriers_fixed;
 
     const int max_num_stages = (smem_capacity - smem_fixed) /
@@ -353,7 +358,12 @@ static bool is_sm90_moe_phase_config_legal(
         input.hidden % config.block_k != 0 or
         input.intermediate_hidden % config.block_k != 0)
         return false;
-    if (config.num_sms <= 0 or config.num_sms > input.launch_num_sms)
+    // `num_sms` is the logical persistent-worker count. Most schedules use one
+    // worker per physical SM; the compact MXFP4 schedule may use two after an
+    // exact-kernel occupancy check at launch.
+    if (config.num_sms <= 0 or
+        config.num_sms % input.launch_num_sms != 0 or
+        config.num_sms / input.launch_num_sms > 2)
         return false;
     if (config.num_experts_per_wave <= 0 or
         config.num_experts_per_wave > input.num_experts_per_rank or
@@ -413,8 +423,9 @@ static bool is_sm90_moe_launch_config_legal(
     const Sm90MoeHeuristicInput& input,
     const Sm90MoeLaunchConfig& config,
     const bool require_exact_pipeline = true) {
-    if (config.l1.num_sms != input.launch_num_sms or
-        config.l2.num_sms != input.launch_num_sms)
+    if (config.l1.num_sms != config.l2.num_sms or
+        (config.l1.num_sms != input.launch_num_sms and
+         config.l1.num_sms != 2 * input.launch_num_sms))
         return false;
     if (not is_sm90_moe_phase_config_legal(
             input, config.l1, 2 * input.intermediate_hidden,
@@ -838,17 +849,17 @@ static bool try_apply_sm90_moe_tuning(
            try_materialize_sm90_moe_phase_tuning(input, config.l2, tuning.l2);
 }
 
-// Correctness-first Hopper MXFP4 schedule.  One math warpgroup owns the whole
-// BN128 packed-weight tile and expands it without a CTA-wide synchronization.
-// Specialized FP8 swap-AB/BK256/BF16 accumulation schedules are intentionally
-// excluded until separately tuned.
+// Compact Hopper MXFP4 schedule. One math warpgroup owns a fixed expanded-B
+// scratch tile while A, packed-B, and SFA retain a three-stage TMA pipeline.
+// Two logical worker CTAs are launched per physical H20 SM; launch bounds and
+// an exact-kernel occupancy check are the hard safety gate for grid barriers.
 static Sm90MoeLaunchConfig select_mxfp4_mega_moe_sm90(
     const Sm90MoeHeuristicInput& input) {
     constexpr int block_m = 64;
     constexpr int block_n = 128;
     constexpr int block_k = 128;
-    constexpr int num_dispatch_threads = 128;
-    constexpr int num_non_epilogue_threads = 128;
+    constexpr int num_dispatch_threads = 64;
+    constexpr int num_non_epilogue_threads = 64;
     constexpr int num_epilogue_threads = 128;
     constexpr bool direct_l2_scatter = false;
     constexpr bool nmajor_schedule = false;
@@ -863,9 +874,10 @@ static Sm90MoeLaunchConfig select_mxfp4_mega_moe_sm90(
     const int num_max_pool_tokens = layout::get_num_max_pool_tokens(
         input.num_ranks, input.num_max_tokens_per_rank,
         input.num_topk, input.num_experts_per_rank);
+    const int num_worker_ctas = 2 * input.launch_num_sms;
     const int requested_epw = get_generic_num_experts_per_wave_for_mega_moe_sm90(
         input.num_experts_per_rank, input.num_tokens, input.num_topk,
-        input.intermediate_hidden, block_m, block_n, input.launch_num_sms);
+        input.intermediate_hidden, block_m, block_n, num_worker_ctas);
     const int num_experts_per_wave =
         normalize_num_experts_per_wave_for_mega_moe_sm90(
             input.num_experts_per_rank, requested_epw);
@@ -875,11 +887,15 @@ static Sm90MoeLaunchConfig select_mxfp4_mega_moe_sm90(
         block_m, block_n, block_k,
         num_dispatch_threads / 32, num_epilogue_threads / 32,
         direct_l2_scatter,
-        0,
+        3,
         swap_ab,
-        false,
+        true,
         true);
-    DG_HOST_ASSERT(num_stages >= 2 and smem_size > 0);
+    // `smem_capacity` is the opt-in per-block limit. Reserve the remaining
+    // 1 KiB/CTA implementation overhead in the two-CTA static precheck; the
+    // exact JIT kernel still goes through the runtime occupancy hard gate.
+    DG_HOST_ASSERT(num_stages == 3 and smem_size > 0 and
+                   2 * smem_size <= SM90ArchSpec::smem_capacity - 1024);
     const int sf_pool_stride_tokens =
         layout::get_num_padded_sf_pool_tokens(num_max_pool_tokens, block_m);
     MegaMoESM90Config phase {
@@ -887,7 +903,7 @@ static Sm90MoeLaunchConfig select_mxfp4_mega_moe_sm90(
         num_max_pool_tokens, input.num_padded_sf_pool_tokens,
         sf_pool_stride_tokens,
         num_experts_per_wave,
-        input.launch_num_sms,
+        num_worker_ctas,
         num_stages, smem_size,
         num_dispatch_threads, num_non_epilogue_threads,
         num_epilogue_threads,

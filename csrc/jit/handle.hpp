@@ -36,6 +36,7 @@ static auto lazy_##name(Args&&... args) -> decltype(name(args...)) { \
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuGetErrorName);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuGetErrorString);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuFuncSetAttribute);
+DECL_LAZY_CUDA_DRIVER_FUNCTION(cuOccupancyMaxActiveBlocksPerMultiprocessor);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuModuleLoad);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuModuleUnload);
 DECL_LAZY_CUDA_DRIVER_FUNCTION(cuModuleGetFunction);
@@ -105,6 +106,21 @@ static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
     }
 
     return config;
+}
+
+static void prefer_max_shared_memory_carveout(const KernelHandle& kernel) {
+    DG_CUDA_RUNTIME_CHECK(cudaFuncSetAttribute(
+        kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+        cudaSharedmemCarveoutMaxShared));
+}
+
+static int get_max_active_blocks_per_sm(
+    const KernelHandle& kernel, const int num_threads, const int smem_size) {
+    int num_blocks = 0;
+    DG_CUDA_RUNTIME_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &num_blocks, reinterpret_cast<const void*>(kernel),
+        num_threads, smem_size));
+    return num_blocks;
 }
 
 template<typename... ActTypes>
@@ -210,6 +226,20 @@ static LaunchConfigHandle construct_launch_config(const KernelHandle& kernel,
     }
 
     return config;
+}
+
+static void prefer_max_shared_memory_carveout(const KernelHandle& kernel) {
+    DG_CUDA_DRIVER_CHECK(lazy_cuFuncSetAttribute(
+        kernel, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+        CU_SHAREDMEM_CARVEOUT_MAX_SHARED));
+}
+
+static int get_max_active_blocks_per_sm(
+    const KernelHandle& kernel, const int num_threads, const int smem_size) {
+    int num_blocks = 0;
+    DG_CUDA_DRIVER_CHECK(lazy_cuOccupancyMaxActiveBlocksPerMultiprocessor(
+        &num_blocks, kernel, num_threads, smem_size));
+    return num_blocks;
 }
 
 template<typename... ActTypes>

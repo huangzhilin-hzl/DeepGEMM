@@ -134,6 +134,20 @@ static void __instantiate_kernel() {{
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
+        if (args.mxfp4_weights) {
+            const int num_threads =
+                args.config.num_dispatch_threads +
+                args.config.num_non_epilogue_threads +
+                args.config.num_epilogue_threads;
+            DG_HOST_ASSERT(num_threads == 256 and args.config.num_stages == 3 and
+                           args.config.num_sms == 2 * device_runtime->get_num_sms() and
+                           args.launch_args.grid_dim.first == args.config.num_sms);
+            prefer_max_shared_memory_carveout(kernel);
+            const int max_active_blocks = get_max_active_blocks_per_sm(
+                kernel, num_threads, args.config.smem_size);
+            DG_HOST_ASSERT(max_active_blocks >= 2 and
+                           "MXFP4 logical 2x-SM grid requires two resident CTAs per physical SM");
+        }
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.y,
             args.cumulative_local_expert_recv_stats,
@@ -309,7 +323,8 @@ static void sm90_fp8_mega_moe(
         .launch_args = LaunchArgs(l1_config.num_sms,
                                   l1_config.num_dispatch_threads + l1_config.num_non_epilogue_threads +
                                       l1_config.num_epilogue_threads,
-                                  l1_config.smem_size, 1)
+                                  l1_config.smem_size, 1,
+                                  not mxfp4_weights)
     };
     const auto launch_with_phase = [&](const SM90FP8MegaMoERuntime::KernelPhase kernel_phase,
                                        const char* kernel_name) {
@@ -322,7 +337,8 @@ static void sm90_fp8_mega_moe(
             split_args.config.num_sms,
             split_args.config.num_dispatch_threads + split_args.config.num_non_epilogue_threads +
                 split_args.config.num_epilogue_threads,
-            split_args.config.smem_size, 1);
+            split_args.config.smem_size, 1,
+            not mxfp4_weights);
         const auto code = SM90FP8MegaMoERuntime::generate(split_args);
         const auto runtime = compiler->build(kernel_name, code);
         SM90FP8MegaMoERuntime::launch(runtime, split_args);

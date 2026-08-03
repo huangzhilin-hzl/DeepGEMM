@@ -1266,3 +1266,107 @@ state: M128 is still 2.42-2.95x slower than the matching FP8 MegaMoE. The next
 controlled directions are to reduce the number of staged expanded-weight tiles
 so two CTAs can reside on an H20 SM, and to evaluate a register-source WGMMA
 path that avoids materializing expanded E4M3 weights in shared memory.
+
+## Accepted experiment: two resident MXFP4 worker CTAs per H20 SM
+
+### Hypothesis and implementation
+
+Iteration 14 implements the first Iteration 13 follow-up. The MXFP4 schedule
+keeps three staged A, packed-B, and SFA tiles, but replaces the three expanded
+FP8 B stages with one fixed 16 KiB CTA scratch tile. The single math warpgroup
+fully consumes that tile before the next packed weight tile overwrites it. This
+reduces dynamic shared memory to 93,312 bytes for Flash and 100,480 bytes for
+Pro, allowing two 256-thread CTAs to reside on one H20 SM.
+
+The heuristic now launches `2 * physical_sms` logical persistent workers. That
+logical worker count is used consistently by the launch grid, persistent
+scheduler, dispatch/combine strides, and grid/NVLink arrival counters. MXFP4
+uses `__launch_bounds__(256, 2)`, a half-SM 32,768-register CTA budget, maximum
+shared-memory carveout, and an exact compiled-kernel occupancy query as a hard
+launch gate. Both CUDA Driver and opt-in CUDA Runtime API paths require at
+least two active blocks per SM. PDL is disabled for this residency-sensitive
+path so an overlapping predecessor cannot consume resources before a grid
+barrier.
+
+The compact frontend uses 64 dispatch threads and 64 TMA threads. Together
+they execute one warpgroup-collective `setmaxnreg.dec 48`; the 128-thread math
+warpgroup executes one `setmaxnreg.inc 208`. Static assertions pin all shared
+memory tile sizes, 128-byte region alignment, barrier alignment, and the exact
+register budget. The generated L1/L2 PTX contains `.maxntid 256`,
+`.minnctapersm 2`, one register deallocation and one allocation instruction.
+The final cubins report 128 registers per thread, 48/64-byte L1/L2 stack frames,
+and zero separately declared local memory.
+
+### Correctness and backend coverage
+
+Fresh-JIT processed Flash M128 passed on one rank, processed Flash and Pro M128
+passed on eight ranks, and the independent raw L1 smoke passed on one rank.
+All four checks reported `calc_diff=0.0006` against the existing `0.01`
+tolerance. The default CUDA Driver API produced the full correctness and
+performance campaign. A separate force rebuild with
+`DG_JIT_USE_RUNTIME_API=1` also passed fresh-JIT processed Flash M128 with
+`calc_diff=0.0006`; the pod was then rebuilt back to the default Driver API.
+
+### Formal H20 performance
+
+The full eight-rank PR383 contract completed all 22 MXFP4 cases: 50
+observations for M at most 128, three for larger M, 20 internal tests per
+observation, and the median of the maximum rank. Every point improves on
+Iteration 13. The geometric-mean speedup over all 11 shapes is 1.271x for
+Flash and 1.249x for Pro.
+
+| Model, M128 | FP8 (us) | Iteration 13 MXFP4 (us) | Iteration 14 MXFP4 (us) | Change vs Iter. 13 | MXFP4 / FP8 |
+|---|---:|---:|---:|---:|---:|
+| Flash | 430.344 | 1,041.838 | 817.269 | -21.56% | 1.90x |
+| Pro | 1,222.618 | 3,601.000 | 2,890.500 | -19.73% | 2.36x |
+
+| M | Flash Iter. 14 (us) | Change vs Iter. 13 | Pro Iter. 14 (us) | Change vs Iter. 13 |
+|---:|---:|---:|---:|---:|
+| 8 | 710.410 | -19.84% | 1,861.390 | -17.73% |
+| 16 | 781.130 | -17.65% | 2,614.731 | -19.51% |
+| 32 | 810.788 | -20.26% | 2,862.996 | -19.04% |
+| 64 | 811.207 | -21.80% | 2,876.267 | -19.55% |
+| 128 | 817.269 | -21.56% | 2,890.500 | -19.73% |
+| 256 | 829.220 | -20.12% | 2,912.000 | -20.02% |
+| 512 | 1,535.472 | -21.09% | 4,343.000 | -20.59% |
+| 1,024 | 2,622.244 | -22.69% | 7,204.000 | -20.50% |
+| 2,048 | 4,720.000 | -22.48% | 12,647.000 | -20.81% |
+| 4,096 | 8,893.000 | -23.35% | 23,265.000 | -20.97% |
+| 8,192 | 17,180.000 | -23.72% | 45,486.000 | -20.54% |
+
+Iteration 14 narrows the full-matrix geometric-mean FP8 gap to 1.967x for
+Flash and 2.127x for Pro. At M128 the gap is 1.90x and 2.36x, so this is a
+material accepted step but not FP8 parity.
+
+### NCU and NSYS attribution
+
+Detailed one-rank Flash M128/E32 NCU confirms that two-CTA residency improves
+latency and achieved occupancy despite compiler spill traffic. L1/L2 duration
+falls by 22.79%/23.72% versus Iteration 13. The launch uses 128 registers per
+thread and reaches 18.04%/23.87% achieved occupancy, up by 8.56/8.60
+percentage points. The tradeoff is 2,687,344/2,177,584 local-memory spill
+requests and short 48/64-byte stack frames. The net result remains decisively
+positive in the profiler and every formal shape.
+
+| NCU metric | Iteration 13 L1 | Iteration 14 L1 | Iteration 13 L2 | Iteration 14 L2 |
+|---|---:|---:|---:|---:|
+| Duration | 714.980 us | 552.060 us | 366.880 us | 279.840 us |
+| Executed instructions | 79,133,688 | 81,400,657 | 44,354,612 | 47,451,611 |
+| Local-memory spill requests | 0 | 2,687,344 | 0 | 2,177,584 |
+| Launch registers per thread | 168 | 128 | 168 | 128 |
+| Achieved occupancy | 9.48% | 18.04% | 15.27% | 23.87% |
+| Achieved active warps/SM | 6.07 | 11.55 | 9.77 | 15.28 |
+| L1/TEX hit rate | 83.28% | 16.74% | 79.33% | 55.43% |
+| L2 hit rate | 58.79% | 75.05% | 57.28% | 76.20% |
+
+NSYS independently records L1 at 507,908 ns, the inter-kernel gap at 132,864
+ns, and L2 at 257,570 ns, for 898,342 ns across the selected hot path. The
+total is 19.74% below Iteration 13; the L1 and L2 kernels are 22.66% and 23.72%
+shorter, while the gap increases by 6.41%.
+
+Iteration 14 is accepted as the new MXFP4 baseline because its gain reproduces
+across every formal point, NCU, and NSYS, while raw/processed formats,
+one/eight-rank execution, and both host launch APIs retain correctness. The
+next optimization should reduce the new spill traffic without sacrificing
+two-CTA residency, or remove the expanded shared-memory tile with a
+register-source WGMMA path. MXFP4 remains 1.90-2.36x behind FP8 at M128.

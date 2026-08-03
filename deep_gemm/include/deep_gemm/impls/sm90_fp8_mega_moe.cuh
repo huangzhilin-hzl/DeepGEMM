@@ -322,8 +322,10 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                      "GEMM K dimensions must be divisible by BLOCK_K");
     DG_STATIC_ASSERT(not kMXFP4Weights or
                      (BLOCK_M == 64 and BLOCK_N == 128 and BLOCK_K == 128 and
-                      kNumEpilogueWarpgroups == 1),
-                     "SM90 MXFP4 uses the conservative BM64/BN128/BK128 schedule");
+                      kNumDispatchThreads == 64 and
+                      kNumNonEpilogueThreads == 64 and
+                      kNumEpilogueWarpgroups == 1 and kNumStages == 3),
+                     "SM90 MXFP4 uses the compact BM64/BN128/BK128 three-stage schedule");
     DG_STATIC_ASSERT(not kMXFP4Weights or not kFP8SwapAB,
                      "MXFP4 does not use the FP8 swap-AB schedule");
     DG_STATIC_ASSERT(not kMXFP4Weights or not kBF16ScaledAccumRequested,
@@ -450,7 +452,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr uint32_t SMEM_SEND_BUFFER_SIZE =
         math::constexpr_align(fp8_token_layout.get_num_bytes() * kNumDispatchWarps, kSharedMemoryAlignment);
     constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(a_dtype_t);
-    constexpr uint32_t SMEM_B_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t);
+    constexpr uint32_t SMEM_B_SIZE_PER_STAGE =
+        LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t);
+    // The sole MXFP4 math WG expands one stage at a time into a fixed tile.
+    // FP8 retains the original independently staged B tiles.
+    constexpr uint32_t SMEM_B_STORAGE_SIZE = kMXFP4Weights ?
+        SMEM_B_SIZE_PER_STAGE : kNumStages * SMEM_B_SIZE_PER_STAGE;
     // Packed MXFP4 is TMA-loaded with B64 swizzle into a temporary half-sized
     // region. The packed row is exactly 64 bytes at BK128, so B64 spreads the
     // one-word-per-row decoder loads across banks. The math warpgroup expands
@@ -494,8 +501,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
 
     constexpr uint32_t SMEM_BEFORE_BARRIER_SIZE =
         SMEM_EXPERT_COUNT_SIZE + SMEM_SEND_BUFFER_SIZE + SMEM_CD_SIZE +
-        kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE +
-                      SMEM_B_PACKED_SIZE_PER_STAGE);
+        kNumStages * SMEM_A_SIZE_PER_STAGE + SMEM_B_STORAGE_SIZE +
+        kNumStages * SMEM_B_PACKED_SIZE_PER_STAGE;
 
     constexpr uint32_t kCombineInputHiddenBytes = kHidden * kCombineElementBytes;
     constexpr uint32_t kCombineOutputHiddenBytes = kHidden * sizeof(nv_bfloat16);
@@ -541,21 +548,47 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     auto smem_cd_swap_l1_fp8 = reinterpret_cast<cutlass::float_e4m3_t*>(
         math::advance_ptr(smem_cd_base, SMEM_CD_SWAP_L1_FP32_SIZE));
 
+    constexpr uint32_t SMEM_A_OFFSET = SMEM_CD_SIZE;
+    constexpr uint32_t SMEM_B_OFFSET =
+        SMEM_A_OFFSET + kNumStages * SMEM_A_SIZE_PER_STAGE;
+    constexpr uint32_t SMEM_B_PACKED_OFFSET =
+        SMEM_B_OFFSET + SMEM_B_STORAGE_SIZE;
+    constexpr uint32_t SMEM_SFA_OFFSET =
+        SMEM_B_PACKED_OFFSET + kNumStages * SMEM_B_PACKED_SIZE_PER_STAGE;
+    constexpr uint32_t SMEM_BARRIER_OFFSET =
+        SMEM_SFA_OFFSET + kNumStages * SMEM_SFA_SIZE_PER_STAGE +
+        SMEM_SFB_SIZE;
+    DG_STATIC_ASSERT(not kMXFP4Weights or
+                     (SMEM_A_SIZE_PER_STAGE == 8192 and
+                      SMEM_B_STORAGE_SIZE == 16384 and
+                      SMEM_B_PACKED_SIZE_PER_STAGE == 8192 and
+                      SMEM_SFA_SIZE_PER_STAGE == 512 and
+                      SMEM_SFB_SIZE == 512),
+                     "Unexpected compact MXFP4 shared-memory tile sizes");
+    DG_STATIC_ASSERT(SMEM_A_OFFSET % 128 == 0 and
+                     SMEM_B_OFFSET % 128 == 0 and
+                     SMEM_B_PACKED_OFFSET % 128 == 0 and
+                     SMEM_SFA_OFFSET % 128 == 0 and
+                     SMEM_BARRIER_OFFSET % alignof(Barrier) == 0,
+                     "SM90 MegaMoE shared-memory regions must be 128-byte aligned");
+
     auto smem_a = utils::PatternVisitor([=](const uint32_t& i) {
-        return math::advance_ptr<a_dtype_t>(smem_gemm_base, SMEM_CD_SIZE + i * SMEM_A_SIZE_PER_STAGE);
+        return math::advance_ptr<a_dtype_t>(
+            smem_gemm_base, SMEM_A_OFFSET + i * SMEM_A_SIZE_PER_STAGE);
     });
+    auto smem_b_expanded = math::advance_ptr<b_dtype_t>(
+        smem_gemm_base, SMEM_B_OFFSET);
     auto smem_b = utils::PatternVisitor([=](const uint32_t& i) {
-        return math::advance_ptr<b_dtype_t>(smem_gemm_base, SMEM_CD_SIZE + kNumStages * SMEM_A_SIZE_PER_STAGE + i * SMEM_B_SIZE_PER_STAGE);
+        return smem_b_expanded +
+            (kMXFP4Weights ? 0u : i * SMEM_B_SIZE_PER_STAGE);
     });
     auto smem_b_packed = utils::PatternVisitor([=](const uint32_t& i) {
         return math::advance_ptr<uint8_t>(
-            smem_gemm_base,
-            SMEM_CD_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE) +
+            smem_gemm_base, SMEM_B_PACKED_OFFSET +
                 i * SMEM_B_PACKED_SIZE_PER_STAGE);
     });
     auto sf_start_ptr = math::advance_ptr<uint8_t>(smem_gemm_base,
-        SMEM_CD_SIZE + kNumStages * (SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE +
-                                     SMEM_B_PACKED_SIZE_PER_STAGE));
+        SMEM_SFA_OFFSET);
     auto smem_sfa = utils::PatternVisitor([=](const uint32_t& i) {
         return reinterpret_cast<float*>(sf_start_ptr + i * SMEM_SFA_SIZE_PER_STAGE);
     });
@@ -563,7 +596,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     auto smem_sfb = sfb_start_ptr;
     // Barriers live after the activation- and weight-SF stages.
     auto barrier_start_ptr = reinterpret_cast<Barrier*>(
-        sfb_start_ptr + SMEM_SFB_SIZE);
+        math::advance_ptr(smem_gemm_base, SMEM_BARRIER_OFFSET));
     auto dispatch_barriers = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + i; });
     auto full_barriers     = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + kNumDispatchWarps + i; });
     auto empty_barriers    = utils::PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + kNumDispatchWarps + kNumStages + i; });
@@ -643,10 +676,14 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         (kCompactFrontendWarpgroup ? kNumDispatchRegisters : 40);
     constexpr uint32_t kNumEpilogueRegisters    =
         kNumEpilogueThreads == 512 ? 112 : 208;
-    DG_STATIC_ASSERT(kNumDispatchRegisters * kNumDispatchThreads +
-                     kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
-                     kNumEpilogueRegisters * kNumEpilogueThreads <= 64512,
+    constexpr uint32_t kCTARegisterBudget =
+        kNumDispatchRegisters * kNumDispatchThreads +
+        kNumNonEpilogueRegisters * kNumNonEpilogueThreads +
+        kNumEpilogueRegisters * kNumEpilogueThreads;
+    DG_STATIC_ASSERT(kCTARegisterBudget <= 64512,
                      "Too many registers");
+    DG_STATIC_ASSERT(not kMXFP4Weights or kCTARegisterBudget == 32768,
+                     "Two-CTA MXFP4 must use half the SM register file");
 
     constexpr uint32_t kDispatchGridSyncIndex = 0;
     constexpr uint32_t kEpilogueGridSyncIndex = 1;
@@ -707,6 +744,20 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         }
     };
 
+    // The compact frontend's dispatch and TMA warps share one warpgroup.
+    // `setmaxnreg` is warpgroup-collective, so all four warps must execute this
+    // single dynamic instruction rather than equivalent role-local call sites.
+    if constexpr (kCompactFrontendWarpgroup) {
+        DG_STATIC_ASSERT(kNumDispatchWarps + kNumMMANonEpilogueWarps == 4,
+                         "Compact frontend must fill one warpgroup");
+        DG_STATIC_ASSERT(kNumDispatchRegisters == kNumNonEpilogueRegisters,
+                         "Compact frontend roles must use one register count");
+        if (warp_idx < kNumDispatchWarps + kNumMMANonEpilogueWarps)
+            cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
+        else
+            cutlass::arch::warpgroup_reg_alloc<kNumEpilogueRegisters>();
+    }
+
     // =====================================================================
     // ROLE 1: DISPATCH WARPS
     //   Mirrors SM100 dispatch with two changes:
@@ -717,7 +768,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     //       per-block linear mapping (no 4×32 transpose).
     // =====================================================================
     if (warp_idx < kNumDispatchWarps) {
-        cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
+        if constexpr (not kCompactFrontendWarpgroup)
+            cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
 
         if constexpr (MegaMoEPhase::runs_linear2) {
             scheduler.fetch_expert_recv_count();
@@ -949,7 +1001,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     //   warpgroup, reducing total CTA threads for the M128/2WG path.
     // =====================================================================
     } else if (warp_idx == kNumDispatchWarps) {
-        cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
+        if constexpr (not kCompactFrontendWarpgroup)
+            cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
         for_each_selected_block([&](const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
@@ -1034,7 +1087,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         });
 
     } else if (warp_idx == kNumDispatchWarps + 1) {
-        cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
+        if constexpr (not kCompactFrontendWarpgroup)
+            cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
         for_each_selected_block([&](const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
@@ -1092,13 +1146,15 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         // Idle non-epilogue warps (kNumDispatchWarps+2, +3). They must still
         // participate in the warpgroup-collective `setmaxnreg.dec.sync.aligned`
         // so that the math warpgroup's `warpgroup_reg_alloc` can succeed.
-        cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
+        if constexpr (not kCompactFrontendWarpgroup)
+            cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
     } else if (warp_idx >= kNumDispatchWarps + kNumMMANonEpilogueWarps) {
     // =====================================================================
     // ROLE 3: MATH WARPGROUPS (WGMMA + epilogue + combine)
     // =====================================================================
-        cutlass::arch::warpgroup_reg_alloc<kNumEpilogueRegisters>();
+        if constexpr (not kCompactFrontendWarpgroup)
+            cutlass::arch::warpgroup_reg_alloc<kNumEpilogueRegisters>();
 
         const uint32_t epilogue_warp_idx  = warp_idx - (kNumDispatchWarps + kNumMMANonEpilogueWarps);
         const uint32_t epilogue_wg_idx    = epilogue_warp_idx / 4;
@@ -1175,7 +1231,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
 
                     const auto prepare_stage_weights = [&](const uint32_t& k_block_idx) {
                         const auto* packed = smem_b_packed[stage_idx];
-                        auto* expanded = reinterpret_cast<uint8_t*>(smem_b[stage_idx]);
+                        auto* expanded = reinterpret_cast<uint8_t*>(smem_b_expanded);
                         const uint32_t weight_sf_stride_k = is_linear1_phase ?
                             kL1WeightSFK : kL2WeightSFK;
                         const uint32_t weight_sf_per_expert = is_linear1_phase ?
@@ -1343,7 +1399,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 smem_a[stage_idx] + row_block_offset * BLOCK_K +
                                     k32_idx * kWeightGranK, 1);
                             auto desc_b = mma::sm90::make_smem_desc(
-                                smem_b[stage_idx] + wg_n_idx * BLOCK_K +
+                                smem_b_expanded + wg_n_idx * BLOCK_K +
                                     k32_idx * kWeightGranK, 1);
                             WGMMA::wgmma(desc_a, desc_b, accum, k != 0);
                         }
@@ -1425,7 +1481,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                     smem_a[stage_idx] + row_block_offset * BLOCK_K +
                                         k32_idx * kWeightGranK, 1);
                                 auto desc_b = mma::sm90::make_smem_desc(
-                                    smem_b[stage_idx] + wg_n_idx * BLOCK_K +
+                                    smem_b_expanded + wg_n_idx * BLOCK_K +
                                         k32_idx * kWeightGranK, 1);
                                 WGMMA::wgmma(desc_a, desc_b, accum, false);
                                 ptx::warpgroup_commit_batch();
@@ -2796,7 +2852,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
 template <DG_SM90_FP8_MOE_TEMPLATE_PARAMS,
           bool kNMajorScheduleRequested = false>
 CUTLASS_GLOBAL __launch_bounds__(
-    kNumDispatchThreads + kNumNonEpilogueThreads + kNumEpilogueThreads, 1) void
+    kNumDispatchThreads + kNumNonEpilogueThreads + kNumEpilogueThreads,
+    kMXFP4Weights ? 2 : 1) void
 sm90_fp8_mega_moe_l1_impl(DG_SM90_FP8_MOE_KERNEL_ARGS_DECL) {
     using Phase = MegaMoEPhasePolicy<
         MegaMoEPhaseKind::Linear1, kNMajorScheduleRequested>;
@@ -2809,7 +2866,8 @@ template <DG_SM90_FP8_MOE_TEMPLATE_PARAMS,
           bool kNMajorScheduleRequested = false,
           bool kOneWarpCleanupRequested = false>
 CUTLASS_GLOBAL __launch_bounds__(
-    kNumDispatchThreads + kNumNonEpilogueThreads + kNumEpilogueThreads, 1) void
+    kNumDispatchThreads + kNumNonEpilogueThreads + kNumEpilogueThreads,
+    kMXFP4Weights ? 2 : 1) void
 sm90_fp8_mega_moe_l2_impl(DG_SM90_FP8_MOE_KERNEL_ARGS_DECL) {
     using Phase = MegaMoEPhasePolicy<
         MegaMoEPhaseKind::Linear2, kNMajorScheduleRequested,
