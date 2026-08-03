@@ -1746,3 +1746,140 @@ multi-rank tail rather than host submission. The next iteration should target
 the persistent 66-68% no-eligible-warp fraction by reducing decode/promotion
 dependencies or overlapping scale delivery without increasing per-CTA shared
 memory.
+
+## Accepted experiment: compile-time processed-scale promotion overlap
+
+### Rejected runtime gate and final specialization
+
+Iteration 19 overlaps the processed-MXFP4 scale path with the outstanding
+WGMMA group. The math warpgroup issues the same phase-specific WGMMA group as
+Iteration 18, performs the independent shared-memory activation-scale loads and
+combined-scale preparation, and delays `warpgroup_wait<0>()` until immediately
+before the first accumulator access. When the phase can release the stage
+early, the empty-barrier arrival is also moved before the register-only BF16
+accumulator promotion so the producer can refill the stage in parallel.
+
+The first implementation selected overlap with a runtime token-count branch.
+Although it improved Pro M128 by 7.8%, it regressed Flash M8192 by 2.4-2.7% in
+an A/B/A run. Cubin inspection showed why: ptxas split the WGMMA groups around
+the runtime branch. Iteration 18's Flash L1/L2 specializations contain
+QGMMA/ARRIVE/DEPBAR counts of 4/1/1 and 4/2/2; the runtime-gated candidate
+became 4/4/4 in both phases, adding about 256 warpgroup fence/wait operations
+per CTA. That candidate was rejected.
+
+The accepted implementation makes overlap a compile-time template parameter.
+The host generates one canonical boolean specialization: processed scales
+overlap when `hidden > 4096` or `num_tokens <= 4096`; raw MXFP4 and FP8 always
+instantiate `false`. Because the generated source contains the boolean template
+argument, the existing source-content JIT key separates the M4096 and M4097
+specializations. The final Flash cubins restore the Iteration 18 group shape:
+L1 is 4/1/1 and L2 is 4/2/2 for both `true` and `false`. There are no stack or
+local-memory accesses in Flash; the known Pro L2 specialization remains at
+eight bytes of stack with two local loads and two local stores.
+
+The stage-release source policy is also compile-time. Direct weight-scale
+consumers expose the empty-barrier arrival after the final scale load.
+Producer-staged weight scales take that source-order early-release path only
+when the phase has at most 16 K blocks. For longer loops ptxas may legally move
+the loop-bottom arrival ahead of register-only HFMA2 once the final shared read
+and WGMMA wait have completed; the SASS audit verifies that no stage access
+remains after the arrival. A static assert prevents overlap from being
+instantiated without processed MXFP4 scales.
+
+### Correctness and paired acceptance test
+
+Final-source validation covers 57 scenarios. The one-rank layered plan passes
+17 processed strict, 17 raw-scale, and 17 FP8 cases. Eight-rank processed Flash
+and Pro production shapes add one case each. A two-rank boundary plan adds
+M4096/M4097 with both fast-math modes, explicitly covering processed-scale
+`overlap=true` and `overlap=false`; all four report `calc_diff=0.0006`. Every
+scenario passes tolerance `0.01`; the maximum observed `calc_diff` is `0.0010`
+for raw scales and `0.0007` for processed scales. The test runner now accepts
+an explicit `--fast-math 0|1` override, prints the effective fast-math and
+overlap selections, and includes the four boundary scenarios in Layer 4.
+
+The acceptance decision uses a same-node A/B/A comparison with independent JIT
+caches. At M128, Iteration 19 is stable across both A runs and improves Flash by
+2.1-2.7% and Pro by 7.7-8.0% relative to the exact Iteration 18 checkout. The
+first paired M8192 run is effectively flat; the second Iteration 18 result
+shows cross-run drift, so the no-regression conclusion uses the first pair and
+the stable Iteration 19 A runs.
+
+| Run | Flash M128 (us) | Pro M128 (us) | Flash M8192 (us) |
+|---|---:|---:|---:|
+| Iteration 19 A1 | 663.913 | 2,070.420 | 13,938.000 |
+| Iteration 18 B1 | 681.971 | 2,243.853 | 13,943.000 |
+| Iteration 18 B2 | 678.706 | 2,241.005 | 14,257.500 |
+| Iteration 19 A2 | 664.182 | 2,061.028 | 13,940.000 |
+
+### Full H20 matrix
+
+The final eight-rank PR383 contract completes all 44 co-measured cases: FP8 and
+MXFP4, Flash and Pro, 11 token counts, 50 observations for M at most 128,
+three for larger M, and 20 internal tests per observation. Relative to the
+Iteration 18 formal matrix, Iteration 19's geometric-mean throughput speedup is
+1.021x for Flash and 1.090x for Pro. The co-measured geometric-mean MXFP4/FP8
+latency ratio is 1.509x/1.518x. At M128 the ratio is 1.429x/1.712x.
+
+| M | Flash FP8 (us) | Flash Iter. 19 (us) | vs Iter. 18 | Pro FP8 (us) | Pro Iter. 19 (us) | vs Iter. 18 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 303.537 | 553.069 | -1.45% | 685.433 | 1,334.833 | -6.48% |
+| 16 | 311.284 | 615.731 | -2.45% | 966.683 | 1,878.476 | -7.24% |
+| 32 | 344.678 | 634.116 | -2.66% | 1,043.513 | 2,018.209 | -7.79% |
+| 64 | 391.370 | 637.545 | -3.90% | 1,103.558 | 2,077.725 | -6.51% |
+| 128 | 456.854 | 652.708 | -2.82% | 1,198.220 | 2,050.812 | -8.47% |
+| 256 | 508.758 | 656.250 | -1.32% | 1,640.615 | 2,058.137 | -9.09% |
+| 512 | 934.412 | 1,218.168 | -3.59% | 2,482.159 | 3,148.000 | -6.17% |
+| 1,024 | 1,533.234 | 2,079.205 | -1.52% | 4,048.000 | 5,188.000 | -8.16% |
+| 2,048 | 2,812.330 | 3,746.000 | -1.91% | 7,033.000 | 9,005.000 | -9.49% |
+| 4,096 | 5,120.000 | 7,157.000 | -0.67% | 12,949.000 | 16,448.000 | -9.74% |
+| 8,192 | 9,896.000 | 13,952.000 | +0.22% | 25,092.000 | 31,608.000 | -11.47% |
+
+The isolated Flash M8192 +0.22% comparison is within paired-run drift. The
+geometric mean improves across the full matrix, both M128 production shapes
+improve back-to-back, and Pro gains grow with M, so the compile-time overlap is
+accepted. MXFP4 remains slower than co-measured FP8 at every point; this is not
+FP8 parity or a SOTA claim.
+
+### NCU and NSYS attribution
+
+Full-set one-rank Flash M128/E32 NCU confirms that the compile-time gate avoids
+the rejected candidate's WGMMA-group split. L1 replay duration is nearly flat,
+while L2 falls by 9.06%. Both phases retain zero spills and two-CTA residency.
+The no-eligible-warp fraction improves by 1.28 percentage points in L1 and 1.93
+points in L2, but 64-67% of cycles still have no eligible warp. Compute and
+DRAM-throughput utilization remain low enough that latency and dependency
+chains, not peak bandwidth, are the primary limit.
+
+| NCU metric | Iteration 18 L1 | Iteration 19 L1 | Iteration 18 L2 | Iteration 19 L2 |
+|---|---:|---:|---:|---:|
+| Duration | 448.67 us | 446.91 us | 248.99 us | 226.43 us |
+| Executed instructions | 68,882,553 | 69,932,960 | 40,083,650 | 40,503,037 |
+| Registers per thread | 128 | 125 | 127 | 128 |
+| Dynamic shared memory | 93.31 KiB | 93.31 KiB | 94.34 KiB | 94.34 KiB |
+| Achieved occupancy | 18.06% | 18.07% | 23.88% | 23.90% |
+| No eligible warp | 68.05% | 66.77% | 66.35% | 64.42% |
+| Compute throughput | - | 58.18% | - | 57.13% |
+| DRAM throughput | - | 16.93% | - | 17.29% |
+| Memory throughput | 678.00 GB/s | 680.83 GB/s | 632.04 GB/s | 695.29 GB/s |
+| Local spill requests | 0 | 0 | 0 | 0 |
+
+Steady-state NSYS profiles the same one-rank Flash M128/E32 workload for both
+exact source trees, with 124 L1/L2 pairs traced. Excluding the first lazy/JIT
+pair leaves 123 pairs. Median L1 falls by 0.79%, L2 by 5.47%, and the complete
+L1-gap-L2 path by 2.47%; the median gap increases only 0.128 us.
+
+| NSYS steady median | Iteration 18 | Iteration 19 | Change |
+|---|---:|---:|---:|
+| L1 | 403.778 us | 400.577 us | -0.79% |
+| Inter-kernel gap | 1.152 us | 1.280 us | +0.128 us |
+| L2 | 218.881 us | 206.913 us | -5.47% |
+| Hot path | 623.970 us | 608.578 us | -2.47% |
+
+Iteration 19 is accepted as the new baseline because its compile-time
+specialization preserves the original WGMMA group shape, passes every tested
+numeric path, improves the paired production shapes, and reproduces the L2
+gain in both NCU and NSYS. The remaining gap is still dominated by the
+64-67% no-eligible-warp fraction, so the next iteration should shorten the
+decode/promotion dependency chain or expose more independent work without
+increasing register or shared-memory residency costs.

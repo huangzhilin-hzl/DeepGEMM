@@ -52,7 +52,8 @@ public:
         KernelPhase kernel_phase;
         MegaMoESM90Config config;
 
-        // Runtime arguments
+        // Runtime arguments. num_tokens also selects the canonical compile-time
+        // processed-scale overlap bucket during generated-source construction.
         void* y;
         int* cumulative_local_expert_recv_stats;
         int num_tokens;
@@ -80,6 +81,11 @@ public:
     static std::string generate_impl(const Args& args) {
         const char* kernel_symbol = args.kernel_phase == KernelPhase::Linear1 ? "sm90_fp8_mega_moe_l1_impl" :
             "sm90_fp8_mega_moe_l2_impl";
+        constexpr int kMaxLatencyOverlapTokens = 4096;
+        const bool overlap_processed_scale_path =
+            args.processed_mxfp4_scales and
+            (args.hidden > 4096 or
+             args.num_tokens <= kMaxLatencyOverlapTokens);
         const auto phase_template_args = args.kernel_phase == KernelPhase::Linear1 ?
             fmt::format(",\n        {}", args.config.nmajor_schedule ? "true" : "false") :
             fmt::format(",\n        {}, {}, {}",
@@ -108,6 +114,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}{}
     >);
 }};
@@ -130,6 +137,7 @@ static void __instantiate_kernel() {{
     args.bf16_scaled_accum ? "true" : "false",
     args.mxfp4_weights ? "true" : "false",
     args.processed_mxfp4_scales ? "true" : "false",
+    overlap_processed_scale_path ? "true" : "false",
     phase_template_args);
     }
 

@@ -12,7 +12,8 @@ Layers
   L3  Shape coverage  : covers divisible-by-128 ``hidden``,
                         ``intermediate_hidden`` and ``num_topk`` values.
   L4  Edge cases      : masking ratio, activation clamp (finite vs inf),
-                        ``fast_math`` 0/1, ``num_tokens`` boundaries.
+                        ``fast_math`` 0/1, ``num_tokens`` boundaries, and the
+                        processed-MXFP4 overlap cutoff.
   L5  Stress          : ``--num-correctness-tests`` repeated random configs.
 
 Notes
@@ -740,7 +741,16 @@ def _run_scenario(
     any_rank_failed = bool(failed.item())
     format_label = f'{weight_format}/{mxfp4_scale_mode}' \
         if weight_format == 'mxfp4' else weight_format
-    dist_print(f'  [{name:<32}] format={format_label:<16} diff={diff:.4f} '
+    overlap_processed_scale_path = (
+        weight_format == 'mxfp4' and
+        mxfp4_scale_mode == 'processed' and
+        (hidden > 4096 or num_tokens <= 4096)
+    )
+    overlap_label = str(int(overlap_processed_scale_path)) \
+        if weight_format == 'mxfp4' and mxfp4_scale_mode == 'processed' \
+        else '-'
+    dist_print(f'  [{name:<32}] format={format_label:<16} '
+               f'fm={int(fast_math)} overlap={overlap_label} diff={diff:.4f} '
                f'(tol={diff_tol:.2f}) {"OK" if not any_rank_failed else "FAIL"}',
                once_in_node=True)
 
@@ -862,6 +872,21 @@ def _layer4_edges(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
     return out
 
 
+def _layer4_processed_overlap_boundary(
+    num_ranks: int,
+) -> List[Tuple[str, Dict[str, Any]]]:
+    """Cover both sides of the processed-scale compile-time overlap gate."""
+    base = dict(num_max_tokens_per_rank=4097,
+                hidden=512, intermediate_hidden=512,
+                num_experts=8 * num_ranks, num_topk=2)
+    out = []
+    for tokens in (4096, 4097):
+        for fast_math in (True, False):
+            cfg = dict(base, num_tokens=tokens, fast_math=fast_math)
+            out.append((f'L4.overlap.t{tokens}.fm{int(fast_math)}', cfg))
+    return out
+
+
 def _layer5_stress(num_ranks: int, num_tests: int) -> List[Tuple[str, Dict[str, Any]]]:
     """Random configs under simple constraints."""
     rng = random.Random(0xC0FFEE)
@@ -913,14 +938,23 @@ def _test_worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace
         layers += _layer3_shape_cases(num_ranks)
     if 4 in args.layers:
         layers += _layer4_edges(num_ranks)
+        if (args.weight_format == 'mxfp4' and
+                args.mxfp4_scale_mode == 'processed'):
+            layers += _layer4_processed_overlap_boundary(num_ranks)
     if 5 in args.layers:
         layers += _layer5_stress(num_ranks, args.num_correctness_tests or 8)
 
     if args.filter:
         layers = [(n, c) for n, c in layers if args.filter in n]
-    for _, cfg in layers:
+    configured_layers: List[Tuple[str, Dict[str, Any]]] = []
+    for name, cfg in layers:
         cfg['weight_format'] = args.weight_format
         cfg['mxfp4_scale_mode'] = args.mxfp4_scale_mode
+        if args.fast_math is not None:
+            cfg['fast_math'] = bool(args.fast_math)
+            name = f'{name}.override_fm{args.fast_math}'
+        configured_layers.append((name, cfg))
+    layers = configured_layers
 
     dist_print(f'SM90 MegaMoE test plan: {len(layers)} scenarios across '
                f'layers {sorted(args.layers)} on {num_ranks} ranks',
@@ -967,6 +1001,8 @@ if __name__ == '__main__':
     parser.add_argument('--mxfp4-scale-mode', choices=('processed', 'raw'),
                         default='processed',
                         help='MXFP4 scale representation (default: processed)')
+    parser.add_argument('--fast-math', type=int, choices=(0, 1), default=None,
+                        help='Override fast_math for every selected scenario')
     parser.add_argument('--fail-fast', action='store_true',
                         help='Stop on first failing scenario')
     args = parser.parse_args()

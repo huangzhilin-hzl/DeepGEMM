@@ -232,7 +232,8 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     bool kFP8SwapAB = false, \
     bool kBF16ScaledAccumRequested = false, \
     bool kMXFP4Weights = false, \
-    bool kProcessedMXFP4Scales = false
+    bool kProcessedMXFP4Scales = false, \
+    bool kOverlapProcessedScalePath = false
 
 #define DG_SM90_FP8_MOE_KERNEL_ARGS_DECL \
     void* y, \
@@ -281,7 +282,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     kNumPaddedSFPoolTokens, kSFPoolStrideTokens, kNumStages, kNumDispatchThreads, \
     kNumNonEpilogueThreads, kNumEpilogueThreads, kNumSMs, kNumRanks, \
     kActivationClamp, kFastMath, kFP8SwapAB, kBF16ScaledAccumRequested, \
-    kMXFP4Weights, kProcessedMXFP4Scales
+    kMXFP4Weights, kProcessedMXFP4Scales, kOverlapProcessedScalePath
 
 template <typename MegaMoEPhase, DG_SM90_FP8_MOE_TEMPLATE_PARAMS>
 CUTLASS_DEVICE void
@@ -329,6 +330,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                      "MXFP4 K32 promotion requires FP32 scaled accumulation");
     DG_STATIC_ASSERT(not kProcessedMXFP4Scales or kMXFP4Weights,
                      "Processed MXFP4 scales require packed MXFP4 weights");
+    DG_STATIC_ASSERT(not kOverlapProcessedScalePath or kProcessedMXFP4Scales,
+                     "Scale-path overlap requires processed MXFP4 scales");
 
     // =====================================================================
     // Thread / warp identification
@@ -1460,6 +1463,18 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         }
                     };
 
+                    // Direct-SF consumers can expose the next packed-B refill
+                    // before register-only promotion. Producer-staged SF uses
+                    // that source-order release only for short phase-K loops.
+                    // For longer loops ptxas may still advance the loop-bottom
+                    // arrival once the final stage read and WGMMA wait finish;
+                    // no machine-level order relative to register-only HFMA2
+                    // is required for correctness.
+                    constexpr uint32_t kPhaseKBlocks = is_linear1_phase ?
+                        kHidden / BLOCK_K : kIntermediateHidden / BLOCK_K;
+                    constexpr bool kEarlyReleaseProcessedStage =
+                        kProcessedMXFP4Scales and
+                        (not kPrefetchMXFP4WeightSF or kPhaseKBlocks <= 16);
                     const auto issue_processed_wgmma = [&]<uint32_t kStartK32,
                                                            uint32_t kNumWGMMAs>() {
                         #pragma unroll
@@ -1481,10 +1496,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         #pragma unroll
                         for (uint32_t i = 0; i < kAccumPerThread; ++ i)
                             ptx::warpgroup_fence_operand(accum[i]);
-                        ptx::warpgroup_wait<0>();
+                        if constexpr (not kOverlapProcessedScalePath)
+                            ptx::warpgroup_wait<0>();
                     };
 
-                    const auto promote_processed = [&](const uint32_t& activation_sf_group,
+                    const auto promote_processed = [&]<bool kReleaseStage>(
+                                                       const uint32_t& activation_sf_group,
                                                        const float& secondary) {
                         const float scale_a_0 = ptx::ld_shared(
                             smem_sfa[stage_idx] +
@@ -1512,11 +1529,25 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             compensated_scale_a_0 * compensated_secondary;
                         const float combined_scale_1 =
                             compensated_scale_a_1 * compensated_secondary;
+                        // The scale path is independent of the WGMMA result.
+                        // Keep the group in flight while loading SFA and
+                        // preparing the two promotion multipliers, then wait
+                        // immediately before the first accumulator access.
                         if constexpr (kMXFP4PackedBF16Accum and kFastMath) {
                             const nv_bfloat162 combined_scale_bf16_0 =
                                 __float2bfloat162_rn(combined_scale_0);
                             const nv_bfloat162 combined_scale_bf16_1 =
                                 __float2bfloat162_rn(combined_scale_1);
+                            if constexpr (kOverlapProcessedScalePath)
+                                ptx::warpgroup_wait<0>();
+                            // The final wait ends every shared-memory access
+                            // to this stage. Release it before register-only
+                            // accumulator promotion so the producer can start
+                            // refilling the stage in parallel.
+                            if constexpr (kReleaseStage) {
+                                if constexpr (kOverlapProcessedScalePath)
+                                    arrive_empty_barrier(stage_idx);
+                            }
                             #pragma unroll
                             for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
                                 mxfp4_final_bf16[i * 2] = __hfma2(
@@ -1531,6 +1562,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                     mxfp4_final_bf16[i * 2 + 1]);
                             }
                         } else {
+                            if constexpr (kOverlapProcessedScalePath)
+                                ptx::warpgroup_wait<0>();
+                            if constexpr (kReleaseStage) {
+                                if constexpr (kOverlapProcessedScalePath)
+                                    arrive_empty_barrier(stage_idx);
+                            }
                             #pragma unroll
                             for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
                                 if constexpr (kMXFP4PackedBF16Accum) {
@@ -1575,12 +1612,17 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         if constexpr (kProcessedMXFP4Scales) {
                             if constexpr (is_linear1_phase) {
                                 issue_processed_wgmma.template operator()<0, 4>();
-                                promote_processed(0, processed_secondary);
+                                promote_processed.template operator()<
+                                    kEarlyReleaseProcessedStage>(
+                                    0, processed_secondary);
                             } else {
                                 issue_processed_wgmma.template operator()<0, 2>();
-                                promote_processed(0, processed_secondary);
+                                promote_processed.template operator()<false>(
+                                    0, processed_secondary);
                                 issue_processed_wgmma.template operator()<2, 2>();
-                                promote_processed(1, processed_secondary);
+                                promote_processed.template operator()<
+                                    kEarlyReleaseProcessedStage>(
+                                    1, processed_secondary);
                             }
                         } else {
                             #pragma unroll
@@ -1605,7 +1647,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 promote_k32(k_block_idx, k32_idx);
                             }
                         }
-                        arrive_empty_barrier(stage_idx);
+                        if constexpr (kEarlyReleaseProcessedStage) {
+                            if constexpr (not kOverlapProcessedScalePath)
+                                arrive_empty_barrier(stage_idx);
+                        } else {
+                            arrive_empty_barrier(stage_idx);
+                        }
                     }
                     if constexpr (kMXFP4PackedBF16Accum) {
                         #pragma unroll
