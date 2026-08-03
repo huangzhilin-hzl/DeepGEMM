@@ -122,108 +122,119 @@ def _deinterleave_weights(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
 
 
 def _check_mxfp4_processed_decode_mapping() -> None:
-    """Prove the processed decoder covers every B128 tile word exactly once.
+    """Prove each N128 math-WG slice covers its B tile exactly once.
 
     Keep this coordinate oracle in lockstep with the half-warp mapping in
     ``sm90_fp8_mega_moe.cuh``.  The end-to-end tolerance check can hide a
-    sparse lane error; this contract cannot.
+    sparse lane error; this contract checks both BN128/1WG and BN256/2WG.
     """
-    block_n = 128
-    block_k = 128
-    packed_words_per_row = 128 // 8
-    rows_per_decode_group = 8
-    visits = []
-    expanded_visits = []
-    scale_word_owners = []
-    scale_uses = []
-    source_bytes = []
-    destination_bytes = []
-    per_frontend_warp = Counter()
-
     def swizzle(byte_offset: int, bits: int,
                 base: int = 4, shift: int = 3) -> int:
         mask = (1 << bits) - 1
         return byte_offset ^ (
             ((byte_offset >> (base + shift)) & mask) << base)
 
-    for frontend_warp_idx in range(4):
-        decoder_row_base = frontend_warp_idx * 32
-        for lane_idx in range(32):
-            lane_in_half_warp = lane_idx % 16
-            row_in_decode_group = lane_in_half_warp // 2
-            packed_k_in_k32 = (
-                (lane_idx // 16) * 2 + lane_in_half_warp % 2)
-            scale_owner_n = decoder_row_base + lane_idx
-            scale_word_owners.append(scale_owner_n)
-            for row_group in range(32 // rows_per_decode_group):
-                row_in_warp = (
-                    row_group * rows_per_decode_group +
-                    row_in_decode_group)
-                decoded_local_n = decoder_row_base + row_in_warp
-                scale_source_lane = row_in_warp
-                assert (
-                    scale_owner_n - lane_idx + scale_source_lane ==
-                    decoded_local_n)
-                for k32_idx in range(128 // 32):
-                    packed_k = k32_idx * 4 + packed_k_in_k32
-                    assert packed_k // 4 == k32_idx
-                    visits.append((decoded_local_n, packed_k))
-                    scale_uses.append((decoded_local_n, k32_idx))
-                    per_frontend_warp[frontend_warp_idx] += 1
+    def check(block_n: int, num_math_wgs: int) -> None:
+        block_k = 128
+        wg_block_n = 128
+        packed_words_per_row = block_k // 8
+        rows_per_decode_group = 8
+        assert block_n == num_math_wgs * wg_block_n
 
-                    source_row_base = decoded_local_n * (block_k // 2)
-                    logical_source = source_row_base + packed_k * 4
-                    physical_source = swizzle(logical_source, bits=2)
-                    source_row_xor = (
-                        swizzle(source_row_base, bits=2) ^ source_row_base)
-                    device_physical_source = (
-                        source_row_base +
-                        ((packed_k * 4) ^ source_row_xor))
-                    assert device_physical_source == physical_source
-                    source_bytes.extend(
-                        range(physical_source, physical_source + 4))
+        visits = []
+        expanded_visits = []
+        scale_word_owners = []
+        scale_uses = []
+        source_bytes = []
+        destination_bytes = []
+        per_math_warp = Counter()
 
-                    logical_destination = (
-                        decoded_local_n * block_k + packed_k * 8)
-                    physical_destination = swizzle(
-                        logical_destination, bits=3)
-                    destination_bytes.extend(range(
-                        physical_destination,
-                        physical_destination + 8))
-                    expanded_visits.extend(
-                        (decoded_local_n, packed_k * 8 + element)
-                        for element in range(8))
+        for math_wg_idx in range(num_math_wgs):
+            wg_n_idx = math_wg_idx * wg_block_n
+            for warp_idx_in_wg in range(4):
+                decoder_row_base = warp_idx_in_wg * 32
+                for lane_idx in range(32):
+                    lane_in_half_warp = lane_idx % 16
+                    row_in_decode_group = lane_in_half_warp // 2
+                    packed_k_in_k32 = (
+                        (lane_idx // 16) * 2 + lane_in_half_warp % 2)
+                    local_scale_owner_n = decoder_row_base + lane_idx
+                    scale_word_owners.append(
+                        wg_n_idx + local_scale_owner_n)
+                    for row_group in range(32 // rows_per_decode_group):
+                        row_in_warp = (
+                            row_group * rows_per_decode_group +
+                            row_in_decode_group)
+                        decoded_local_n = decoder_row_base + row_in_warp
+                        decoded_n = wg_n_idx + decoded_local_n
+                        assert (
+                            local_scale_owner_n - lane_idx + row_in_warp ==
+                            decoded_local_n)
+                        for k32_idx in range(block_k // 32):
+                            packed_k = k32_idx * 4 + packed_k_in_k32
+                            assert packed_k // 4 == k32_idx
+                            visits.append((decoded_n, packed_k))
+                            scale_uses.append((decoded_n, k32_idx))
+                            per_math_warp[(math_wg_idx, warp_idx_in_wg)] += 1
 
-    expected = [
-        (row, packed_k)
-        for row in range(block_n)
-        for packed_k in range(packed_words_per_row)
-    ]
-    assert len(visits) == block_n * packed_words_per_row
-    assert len(set(visits)) == len(visits)
-    assert sorted(visits) == expected
-    assert len(expanded_visits) == block_n * block_k
-    assert len(set(expanded_visits)) == len(expanded_visits)
-    assert set(expanded_visits) == {
-        (row, k) for row in range(block_n) for k in range(block_k)
-    }
-    assert Counter(scale_word_owners) == {
-        row: 1 for row in range(block_n)
-    }
-    assert Counter(scale_uses) == {
-        (row, k32_idx): 4
-        for row in range(block_n)
-        for k32_idx in range(block_k // 32)
-    }
-    assert per_frontend_warp == {0: 512, 1: 512, 2: 512, 3: 512}
-    assert len(source_bytes) == block_n * block_k // 2
-    assert len(set(source_bytes)) == len(source_bytes)
-    assert min(source_bytes) == 0
-    assert max(source_bytes) == block_n * block_k // 2 - 1
-    assert len(destination_bytes) == block_n * block_k
-    assert len(set(destination_bytes)) == len(destination_bytes)
-    assert min(destination_bytes) == 0
-    assert max(destination_bytes) == block_n * block_k - 1
+                            source_row_base = decoded_n * (block_k // 2)
+                            logical_source = source_row_base + packed_k * 4
+                            physical_source = swizzle(logical_source, bits=2)
+                            source_row_xor = (
+                                swizzle(source_row_base, bits=2) ^
+                                source_row_base)
+                            device_physical_source = (
+                                source_row_base +
+                                ((packed_k * 4) ^ source_row_xor))
+                            assert device_physical_source == physical_source
+                            source_bytes.extend(range(
+                                physical_source, physical_source + 4))
+
+                            logical_destination = (
+                                decoded_n * block_k + packed_k * 8)
+                            physical_destination = swizzle(
+                                logical_destination, bits=3)
+                            destination_bytes.extend(range(
+                                physical_destination,
+                                physical_destination + 8))
+                            expanded_visits.extend(
+                                (decoded_n, packed_k * 8 + element)
+                                for element in range(8))
+
+        expected = [
+            (row, packed_k)
+            for row in range(block_n)
+            for packed_k in range(packed_words_per_row)
+        ]
+        assert len(visits) == block_n * packed_words_per_row
+        assert len(set(visits)) == len(visits)
+        assert sorted(visits) == expected
+        assert len(expanded_visits) == block_n * block_k
+        assert len(set(expanded_visits)) == len(expanded_visits)
+        assert set(expanded_visits) == {
+            (row, k) for row in range(block_n) for k in range(block_k)
+        }
+        assert Counter(scale_word_owners) == {
+            row: 1 for row in range(block_n)
+        }
+        assert Counter(scale_uses) == {
+            (row, k32_idx): 4
+            for row in range(block_n)
+            for k32_idx in range(block_k // 32)
+        }
+        assert set(per_math_warp.values()) == {512}
+        assert len(per_math_warp) == num_math_wgs * 4
+        assert len(source_bytes) == block_n * block_k // 2
+        assert len(set(source_bytes)) == len(source_bytes)
+        assert min(source_bytes) == 0
+        assert max(source_bytes) == block_n * block_k // 2 - 1
+        assert len(destination_bytes) == block_n * block_k
+        assert len(set(destination_bytes)) == len(destination_bytes)
+        assert min(destination_bytes) == 0
+        assert max(destination_bytes) == block_n * block_k - 1
+
+    check(block_n=128, num_math_wgs=1)
+    check(block_n=256, num_math_wgs=2)
 
 
 def _check_mxfp4_format_contract(device: torch.device) -> None:

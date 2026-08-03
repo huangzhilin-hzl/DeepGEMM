@@ -953,3 +953,107 @@ current reg168 stage pipeline, but making the TMA producers decode every stage
 prevents useful runahead. The next iteration returns to the accepted Iteration
 7 scheduling boundary and targets a structural reduction in scheduler tiles
 and A-TMA traffic rather than adding another decoded-ready dependency.
+
+## Rejected experiment: L2-only BN256 split-N
+
+### Hypothesis and implementation
+
+Iteration 12 returns processed decoding to the math warpgroup and changes only
+L2 from BM64/BN128/BK128 with one math warpgroup to BM64/BN256/BK128 with two
+math warpgroups. L1 retains accepted Iteration 7's BN128 schedule. Each L2 work
+item now reuses one A stage across two independent M64N128 WGMMA consumers and
+halves the number of scheduler N tiles and A TMA loads.
+
+The compact L2 frontend uses two dispatch warps, two TMA warps, and eight math
+warps, preserving the 384-thread CTA size. Its dispatch and TMA warps share a
+warpgroup and execute one warpgroup-uniform register-deallocation instruction.
+The two math warpgroups own disjoint N ranges `[0, 128)` and `[128, 256)` in
+packed B, expanded B, scale rows, WGMMA descriptors, and the L2 epilogue.
+Generic shared stores from the decoder are published to WGMMA's async proxy by
+an all-warpgroup barrier, proxy fence, and second barrier.
+
+The host selector enables L2 BN256 only when `hidden % 256 == 0`; shapes that
+are merely N128-aligned preserve the BN128 public fallback. The generated
+production JIT instances confirm L1 BN128/one math warpgroup/five stages and
+L2 BN256/two math warpgroups/three stages. The BN256 stage contains twice the
+expanded and packed B data, so the pipeline depth falls from five to three.
+
+The CPU mapping oracle covers both BN128/one-WG and BN256/two-WG layouts. For
+BN256 it proves exact-once ownership of 4,096 packed words, 32,768 expanded
+bytes, 256 scale rows, and both complete swizzled physical byte ranges.
+
+### Correctness gate
+
+| Scenario | Scale representation | `calc_diff` | Tolerance | Result |
+|---|---|---:|---:|---|
+| BN128/BN256 mapping and physical-byte oracle | processed triple | exact | exact | PASS |
+| L1 smoke, one rank | processed triple | 0.0006 | 0.01 | PASS |
+| L1 forced requant, one rank | processed triple | 0.0005 | 0.01 | PASS |
+| L1 smoke, one rank | raw pair fallback | 0.0006 | 0.01 | PASS |
+| Flash M128 L3, one rank | processed triple | 0.0006 | 0.01 | PASS |
+| Pro M128 L3, one rank | processed triple | 0.0006 | 0.01 | PASS |
+| Flash M128 L3, eight ranks | processed triple | 0.0006 | 0.01 | PASS |
+| Pro M128 L3, eight ranks | processed triple | 0.0006 | 0.01 | PASS |
+
+### Eight-rank quick gate
+
+The standard three observations and 20 Kineto tests were run at M128. Both
+production shapes regress by about 30%, and rank-zero phase timing localizes
+the loss to L2. The remaining M points were therefore gated.
+
+| Model | Iteration 7 (us) | L2 BN256 candidate (us) | Candidate range (us) | Candidate / Iter. 7 | Change |
+|---|---:|---:|---:|---:|---:|
+| Flash M128 | 1,338.252 | 1,727.848 | 1,721.129-1,785.658 | 1.291x | +29.11% |
+| Pro M128 | 4,601.000 | 6,065.000 | 6,049-6,091 | 1.318x | +31.82% |
+
+Flash rank-zero L1 is 888.388-962.580 us while L2 is 816.556-820.983 us.
+Pro rank-zero L1 is 3,068-3,108 us while L2 is 2,977-2,983 us. The BN128 L1
+stays close to its accepted behavior; the new BN256 L2 dominates the regression.
+
+### NCU and NSYS attribution
+
+Detailed NCU uses the standard one-rank Flash M128/E32 boundary. The L1
+schedule is unchanged except for the formally required async-proxy fence; its
+duration remains within 1.8% of Iteration 7 and has no local spill. L2 executes
+fewer scheduler work items but compiles at the 384-thread launch-bound ceiling
+of 168 registers per thread and spills heavily.
+
+| NCU metric | Iteration 7 L1 | Candidate L1 | Change | Iteration 7 L2 | Candidate L2 | Change |
+|---|---:|---:|---:|---:|---:|---:|
+| Duration | 911.104 us | 927.104 us | +1.76% | 473.216 us | 867.200 us | +83.26% |
+| Executed instructions | 128,956,122 | 129,332,753 | +0.29% | 69,289,384 | 101,091,768 | +45.90% |
+| Local-memory spill requests | 0 | 0 | 0 | 0 | 21,939,536 | new |
+| Launch registers per thread | 168 | 168 | 0 | 168 | 168 | 0 |
+| Achieved occupancy | 9.45% | 9.45% | ~0 pp | 15.27% | 18.36% | +3.09 pp |
+| Excessive global sectors | 3,692,178 | 3,692,174 | ~0% | 1,835,136 | 1,835,136 | 0% |
+| Excessive shared wavefronts | 71,218 | 71,218 | 0% | 336,384 | 336,384 | 0% |
+
+SourceCounters contains no L1 local-memory instruction but finds 435 distinct
+L2 `LDL`/`STL` SASS instructions whose aggregate executions exactly equal the
+21,939,536 spill requests. The traffic and the resulting 45.9% instruction
+increase explain why more active warps do not improve duration. Global-sector
+and shared-conflict counts are unchanged, ruling out the original scale-load
+sector issue and the decoder swizzle as the new regression source.
+
+| PC-sampling share | Candidate L1 | Candidate L2 |
+|---|---:|---:|
+| Long scoreboard | 27.95% | 25.09% |
+| Barrier | 21.09% | 28.29% |
+| Wait | 16.02% | 8.81% |
+
+| NSYS selected hot path | Iteration 7 | L2 BN256 candidate | Change |
+|---|---:|---:|---:|
+| L1 kernel | 825,700 ns | 857,444 ns | +3.84% |
+| L1-to-L2 gap | 126,881 ns | 125,664 ns | -0.96% |
+| L2 kernel | 428,737 ns | 801,027 ns | +86.83% |
+| L1 + gap + L2 | 1,381,318 ns | 1,784,135 ns | +29.16% |
+
+The L2-only BN256 candidate is rejected in its FP32 persistent-accumulator
+form. It validates the split-N ownership and compact frontend. The L2-only
+spill, its 435 local-memory instructions, and the longer-lived two-WG state are
+consistent with FP32 persistent-accumulator register pressure at the
+168-register compile ceiling; SourceCounters does not attribute every local
+instruction to a C++ source variable. The next controlled sub-experiment keeps
+the same BN256 schedule and stores the persistent scaled accumulation in packed
+BF16, halving its register footprint while converting back to FP32 only for
+the existing BF16 output epilogue.
