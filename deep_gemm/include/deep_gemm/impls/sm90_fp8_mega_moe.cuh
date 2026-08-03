@@ -73,6 +73,29 @@ CUTLASS_DEVICE uint8_t sm90_mxfp4_e2m1_to_e4m3_bits(const uint8_t code) {
     return magnitude == 0 ? 0 : static_cast<uint8_t>(magnitude | (code & 0x8u ? 0x80u : 0u));
 }
 
+// Decode eight packed E2M1 values into eight byte-addressable E4M3 values.
+// Each SIMD lane below is one byte.  The magnitude identity for E2M1 codes
+// 2..7 is `0x30 + code * 4`; codes 0 and 1 need the two masks.  PRMT then
+// interleaves the low/high nibbles back into logical K order.
+CUTLASS_DEVICE uint2 sm90_mxfp4_e2m1x8_to_e4m3x8_bits(const uint32_t packed) {
+    const auto decode_x4 = [](const uint32_t& codes) {
+        const uint32_t values = codes & 0x07070707u;
+        const uint32_t is_zero = __vcmpeq4(values, 0u);
+        const uint32_t is_one = __vcmpeq4(values, 0x01010101u);
+        uint32_t result = (values << 2u) + 0x30303030u;
+        result -= is_one & 0x04040404u;
+        result |= (codes & 0x08080808u) << 4u;
+        return result & ~is_zero;
+    };
+
+    const uint32_t even_k = decode_x4(packed);
+    const uint32_t odd_k = decode_x4(packed >> 4u);
+    return {
+        __byte_perm(even_k, odd_k, 0x5140u),
+        __byte_perm(even_k, odd_k, 0x7362u),
+    };
+}
+
 CUTLASS_HOST_DEVICE constexpr uint32_t sm90_mxfp4_ue8m0_to_float_bits(
     const uint8_t scale) {
     // UE8M0 code 0 is 2^-127, represented as an FP32 subnormal. Code 255 is
@@ -1123,8 +1146,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 if constexpr (kMXFP4Weights) {
                     constexpr uint32_t kWeightGranK = 32;
                     constexpr uint32_t kWGThreads = 128;
-                    constexpr uint32_t kPackedBytesPerWG =
-                        WG_BLOCK_N * BLOCK_K / 2;
+                    constexpr uint32_t kPackedWordsPerWG =
+                        WG_BLOCK_N * BLOCK_K / 8;
                     constexpr uint32_t kL1WeightSFK = kHidden / kWeightGranK;
                     constexpr uint32_t kL2WeightSFK =
                         kIntermediateHidden / kWeightGranK;
@@ -1161,23 +1184,25 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 (wg_n_idx + local_n),
                             scale_word);
 
+                        const auto* packed_words =
+                            reinterpret_cast<const uint32_t*>(packed);
                         #pragma unroll
-                        for (uint32_t packed_idx = wg_thread_idx;
-                             packed_idx < kPackedBytesPerWG;
-                             packed_idx += kWGThreads) {
-                            const uint8_t pair = packed[packed_idx];
-                            const uint32_t local_n = packed_idx / (BLOCK_K / 2);
-                            const uint32_t packed_k = packed_idx % (BLOCK_K / 2);
+                        for (uint32_t packed_word_idx = wg_thread_idx;
+                             packed_word_idx < kPackedWordsPerWG;
+                             packed_word_idx += kWGThreads) {
+                            const uint2 decoded =
+                                sm90_mxfp4_e2m1x8_to_e4m3x8_bits(
+                                    packed_words[packed_word_idx]);
+                            const uint32_t local_n =
+                                packed_word_idx / (BLOCK_K / 8);
+                            const uint32_t packed_k =
+                                packed_word_idx % (BLOCK_K / 8);
                             const uint32_t logical_n = wg_n_idx + local_n;
-                            const uint32_t logical_k0 = packed_k * 2;
+                            const uint32_t logical_k0 = packed_k * 8;
                             const uint32_t flat0 = logical_n * BLOCK_K + logical_k0;
-                            const uint32_t flat1 = flat0 + 1;
                             const uint32_t swizzled0 = cute::Swizzle<3, 4, 3>::apply(flat0);
-                            const uint32_t swizzled1 = cute::Swizzle<3, 4, 3>::apply(flat1);
-                            expanded[swizzled0] =
-                                sm90_mxfp4_e2m1_to_e4m3_bits(pair & 0x0fu);
-                            expanded[swizzled1] =
-                                sm90_mxfp4_e2m1_to_e4m3_bits(pair >> 4u);
+                            ptx::st_shared(
+                                expanded + swizzled0, decoded.x, decoded.y);
                         }
                         ptx::sync_aligned(
                             kWGThreads, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);

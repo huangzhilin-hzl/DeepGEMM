@@ -105,3 +105,76 @@ to vectorize packed E2M1 decoding and then adopt Humming-style bounded exponent
 offsets so that the UE8M0 scale can be folded into the FP8 operand before
 WGMMA, eliminating four K32 waits and per-accumulator scale promotion where
 the numerical contract permits it.
+
+## Iteration 2: vectorize packed E2M1 expansion
+
+### Hypothesis and implementation
+
+Iteration 1 left the packed-weight expansion scalar: every thread repeatedly
+loaded one packed byte, decoded its two nibbles independently, calculated two
+swizzled addresses, and issued two byte stores.  Iteration 2 processes four
+packed bytes at a time:
+
+- one aligned 32-bit packed-weight load produces eight E2M1 values;
+- byte-wise SIMD comparisons/arithmetic decode four nibbles in parallel;
+- two PRMT operations restore even/odd nibbles to logical K order; and
+- one pair of 32-bit shared-memory stores writes the eight E4M3 bytes.
+
+The eight-byte output begins at a K-aligned offset.  `Swizzle<3,4,3>` preserves
+the low three address bits, so the vector store does not cross a B128 swizzle
+segment.
+
+### Correctness
+
+The same clean-cache gates used by Iteration 1 passed:
+
+| Scenario | Weight format | `calc_diff` | Tolerance | Result |
+|---|---|---:|---:|---|
+| L1 smoke, one rank | MXFP4 | 0.0006 | 0.01 | PASS |
+| Flash M128, eight ranks | MXFP4 | 0.0006 | 0.01 | PASS |
+| Pro M128, eight ranks | MXFP4 | 0.0006 | 0.01 | PASS |
+
+### NCU and NSYS attribution
+
+| Metric (Flash M128, single rank, E32) | Iteration 1 L1 | Iteration 2 L1 | Change | Iteration 1 L2 | Iteration 2 L2 | Change |
+|---|---:|---:|---:|---:|---:|---:|
+| NCU duration | 2.23 ms | 1.37 ms | -38.6% | 1.14 ms | 698.40 us | -38.7% |
+| Executed instructions | 471,669,591 | 271,825,794 | -42.4% | 236,612,859 | 137,326,082 | -42.0% |
+| Achieved occupancy | 9.38% | 9.41% | +0.03 pp | 15.23% | 15.25% | +0.02 pp |
+
+| NSYS selected hot path | Iteration 1 | Iteration 2 | Change |
+|---|---:|---:|---:|
+| L1 kernel | 2,018,824 ns | 1,241,382 ns | -38.5% |
+| L1-to-L2 gap | 136,928 ns | 143,424 ns | +4.7% |
+| L2 kernel | 1,038,820 ns | 638,307 ns | -38.6% |
+
+The inter-kernel gap changed by only 6.5 us, while both kernels became about
+39% faster.  NCU and NSYS therefore agree that the improvement comes from the
+vectorized expansion inside the kernel.
+
+### Eight-rank performance
+
+The measurement contract is unchanged from Iteration 1.  FP8 is the value
+measured alongside Iteration 1; Iteration 2 changes only the compile-time
+MXFP4 branch.
+
+| Model | M | FP8 (us) | MXFP4 iter. 1 (us) | MXFP4 iter. 2 (us) | Iteration gain | Iter. 2 / FP8 |
+|---|---:|---:|---:|---:|---:|---:|
+| Flash | 8 | 297.5 | 2,732.5 | 1,761.0 | 35.6% | 5.92x |
+| Flash | 128 | 456.2 | 3,171.0 | 1,943.1 | 38.7% | 4.26x |
+| Flash | 512 | 939.6 | 6,128.0 | 3,707.0 | 39.5% | 3.95x |
+| Flash | 8192 | 9,871.0 | 71,744.0 | 44,219.0 | 38.4% | 4.48x |
+| Pro | 8 | 698.6 | 7,396.0 | 4,448.0 | 39.9% | 6.37x |
+| Pro | 128 | 1,245.5 | 11,712.0 | 7,074.0 | 39.6% | 5.68x |
+| Pro | 512 | 2,447.8 | 17,866.0 | 10,744.0 | 39.9% | 4.39x |
+| Pro | 8192 | 25,130.0 | 189,567.0 | 114,895.0 | 39.4% | 4.57x |
+
+### Remaining bottleneck and next direction
+
+The vectorized decoder removed roughly 42% of the executed instructions, but
+the FP32 promotion counts are unchanged.  L1 still executes 33,554,432 fused
+and 34,173,952 non-fused FP32 instructions for the representative profile.
+The remaining 4-6x end-to-end gap cannot be closed by further decoder cleanup
+alone.  The next iteration must fold bounded UE8M0 exponent offsets into the
+FP8 B operand and reduce or remove the four K32 `warpgroup_wait<0>` plus
+per-accumulator promotion sequences.
