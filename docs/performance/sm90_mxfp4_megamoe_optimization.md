@@ -1165,3 +1165,104 @@ carrying the persistent accumulator in thread-local arrays, for example by
 staging partial scaled sums in the existing CTA scratch between K-block
 chunks, or return to the accepted BN128 schedule and target scheduler/decoder
 work without adding a second live math warpgroup.
+
+## Accepted experiment: Humming-style PRMT/LOP3 MXFP4 decode
+
+### Hypothesis and implementation
+
+Iteration 13 returns both phases to the accepted Iteration 7 BN128 schedule and
+changes only the eight-value E2M1-to-E4M3 decoder. The former CUDA intrinsic
+sequence decoded the even and odd nibbles separately and then interleaved them.
+The replacement adapts Humming's integer lookup to DeepGEMM's
+consecutive-nibble byte layout: two `mad.lo.u32` instructions construct the
+offset-dependent E4M3 lookup table, `prmt.b32` gathers sign and magnitude bytes,
+and `lop3.b32` merges them. PTX-local temporaries avoid extending the already
+tight C++ register lifetime. A `fence.proxy.async.shared::cta` publishes the
+resulting generic shared stores to WGMMA's async proxy before the existing
+128-thread math-warpgroup barrier.
+
+A direct copy of Humming's selector was not correct for DeepGEMM's byte layout:
+two early fresh-JIT checks reported `calc_diff=0.9681`. Rebuilding the sign
+gather with selectors `0x5140` and `0x7362` restored logical K order. The final
+helper also preserves E2M1 negative zero, matching Humming's requantizer.
+
+### Correctness, review, and generated-code contract
+
+Fresh-JIT processed Flash M128 passed on one rank, processed Flash and Pro M128
+passed on eight ranks, and the independent raw L1 smoke passed on one rank.
+Every kernel result reported `calc_diff=0.0006` against the existing `0.01`
+tolerance. The host oracle exhausts all 16 E2M1 codes, all eight nibble
+positions, and exponent offsets 1 through 12, including the raw offset-6
+negative-zero case.
+
+Independent review found no decoder correctness blocker. A non-portable
+early-output GNU inline-assembly constraint was replaced with PTX-local output
+registers and ordinary `=r` outputs. Review also found that a named barrier
+alone does not establish generic-to-async proxy ordering. The final candidate
+therefore adds the explicit proxy fence and reruns correctness, the formal
+matrix, NCU, and NSYS. Its L1 and L2 SASS each contain the expected
+`FENCE.VIEW.ASYNC.S`; both cubins use 168 registers per thread with zero stack
+frame and zero local memory.
+
+### Formal H20 performance
+
+The full eight-rank benchmark uses the PR383 contract: 50 observations for
+small-M shapes, three for large-M shapes, 20 internal tests per observation,
+and the median of the maximum rank. All 44 FP8/MXFP4 model-shape cases
+completed. Iteration 13 is about 22% faster than Iteration 7 at both representative
+M128 shapes, but it remains materially behind FP8.
+
+| Model, M128 | FP8 (us) | Iteration 7 MXFP4 (us) | Iteration 13 MXFP4 (us) | Change vs Iter. 7 | MXFP4 / FP8 |
+|---|---:|---:|---:|---:|---:|
+| Flash | 430.344 | 1,338.252 | 1,041.838 | -22.15% | 2.42x |
+| Pro | 1,222.618 | 4,601.000 | 3,601.000 | -21.73% | 2.95x |
+
+The complete formal MXFP4 series is shown below; the paired FP8 series and raw
+per-rank observations are retained in the benchmark artifact.
+
+| M | Flash MXFP4 (us) | Pro MXFP4 (us) |
+|---:|---:|---:|
+| 8 | 886.188 | 2,262.402 |
+| 16 | 948.550 | 3,248.500 |
+| 32 | 1,016.747 | 3,536.500 |
+| 64 | 1,037.341 | 3,575.000 |
+| 128 | 1,041.838 | 3,601.000 |
+| 256 | 1,038.029 | 3,641.000 |
+| 512 | 1,945.773 | 5,469.000 |
+| 1,024 | 3,392.000 | 9,062.000 |
+| 2,048 | 6,089.000 | 15,970.000 |
+| 4,096 | 11,602.000 | 29,439.000 |
+| 8,192 | 22,521.000 | 57,240.000 |
+
+### NCU and NSYS attribution
+
+Detailed one-rank Flash M128/E32 profiling attributes the gain directly to the
+decoder. Compared with Iteration 7, executed instructions fall by 38.6% in L1
+and 36.0% in L2, without introducing spills. NCU duration falls by 21.5% and
+22.5% respectively.
+
+| NCU metric | Iteration 7 L1 | Iteration 13 L1 | Change | Iteration 7 L2 | Iteration 13 L2 | Change |
+|---|---:|---:|---:|---:|---:|---:|
+| Duration | 911.100 us | 714.980 us | -21.53% | 473.220 us | 366.880 us | -22.47% |
+| Executed instructions | 128,956,122 | 79,133,688 | -38.64% | 69,289,384 | 44,354,612 | -35.99% |
+| Local-memory spill requests | 0 | 0 | 0 | 0 | 0 | 0 |
+| Launch registers per thread | 168 | 168 | 0 | 168 | 168 | 0 |
+| Achieved occupancy | 9.49% | 9.48% | -0.01 pp | 15.26% | 15.27% | +0.01 pp |
+
+NSYS independently records L1 at 656,739 ns, the inter-kernel gap at 124,864
+ns, and L2 at 337,666 ns, for 1,119,269 ns across the selected hot path. The
+corresponding Iteration 7 kernels were 825,700 ns and 428,737 ns.
+
+The required proxy fence costs 1.90% on formal Flash M128 and 1.42% on formal
+Pro M128 relative to the otherwise identical pre-fence source. In the isolated
+NSYS hot path the total increases by only 0.46%. Those pre-fence measurements
+are retained as attribution evidence, but they are not used as the accepted
+headline result.
+
+Iteration 13 is accepted as the new MXFP4 baseline because the gain reproduces
+in the formal matrix, NCU instruction/duration metrics, and NSYS kernel timing,
+with both raw and processed format paths covered. It is not yet the target
+state: M128 is still 2.42-2.95x slower than the matching FP8 MegaMoE. The next
+controlled directions are to reduce the number of staged expanded-weight tiles
+so two CTAs can reside on an H20 SM, and to evaluate a register-source WGMMA
+path that avoids materializing expanded E4M3 weights in shared memory.

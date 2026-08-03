@@ -838,69 +838,62 @@ static bool try_apply_sm90_moe_tuning(
            try_materialize_sm90_moe_phase_tuning(input, config.l2, tuning.l2);
 }
 
-// Hopper MXFP4 schedule. L1 retains the accepted BN128/one-math-WG path. L2
-// uses a compact BN256/two-math-WG frontend when the output width permits it,
-// halving scheduler tiles and reusing each A stage across two N128 consumers.
-// Shapes that are only N128-aligned retain the accepted fallback.
+// Correctness-first Hopper MXFP4 schedule.  One math warpgroup owns the whole
+// BN128 packed-weight tile and expands it without a CTA-wide synchronization.
+// Specialized FP8 swap-AB/BK256/BF16 accumulation schedules are intentionally
+// excluded until separately tuned.
 static Sm90MoeLaunchConfig select_mxfp4_mega_moe_sm90(
     const Sm90MoeHeuristicInput& input) {
     constexpr int block_m = 64;
+    constexpr int block_n = 128;
     constexpr int block_k = 128;
+    constexpr int num_dispatch_threads = 128;
+    constexpr int num_non_epilogue_threads = 128;
+    constexpr int num_epilogue_threads = 128;
     constexpr bool direct_l2_scatter = false;
     constexpr bool nmajor_schedule = false;
     constexpr bool one_warp_cleanup = false;
     constexpr bool swap_ab = false;
 
-    DG_HOST_ASSERT((2 * input.intermediate_hidden) % 128 == 0 and
-                   input.hidden % 128 == 0);
+    DG_HOST_ASSERT((2 * input.intermediate_hidden) % block_n == 0 and
+                   input.hidden % block_n == 0);
     DG_HOST_ASSERT(input.hidden % block_k == 0 and
                    input.intermediate_hidden % block_k == 0);
 
     const int num_max_pool_tokens = layout::get_num_max_pool_tokens(
         input.num_ranks, input.num_max_tokens_per_rank,
         input.num_topk, input.num_experts_per_rank);
+    const int requested_epw = get_generic_num_experts_per_wave_for_mega_moe_sm90(
+        input.num_experts_per_rank, input.num_tokens, input.num_topk,
+        input.intermediate_hidden, block_m, block_n, input.launch_num_sms);
+    const int num_experts_per_wave =
+        normalize_num_experts_per_wave_for_mega_moe_sm90(
+            input.num_experts_per_rank, requested_epw);
+    const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90(
+        SM90ArchSpec::smem_capacity,
+        input.num_experts, input.hidden,
+        block_m, block_n, block_k,
+        num_dispatch_threads / 32, num_epilogue_threads / 32,
+        direct_l2_scatter,
+        0,
+        swap_ab,
+        false,
+        true);
+    DG_HOST_ASSERT(num_stages >= 2 and smem_size > 0);
     const int sf_pool_stride_tokens =
         layout::get_num_padded_sf_pool_tokens(num_max_pool_tokens, block_m);
-
-    const auto make_phase = [&](const int block_n,
-                                const int num_dispatch_threads,
-                                const int num_non_epilogue_threads,
-                                const int num_epilogue_threads) {
-        const int requested_epw =
-            get_generic_num_experts_per_wave_for_mega_moe_sm90(
-                input.num_experts_per_rank, input.num_tokens, input.num_topk,
-                input.intermediate_hidden, block_m, block_n,
-                input.launch_num_sms);
-        const int num_experts_per_wave =
-            normalize_num_experts_per_wave_for_mega_moe_sm90(
-                input.num_experts_per_rank, requested_epw);
-        const auto [num_stages, smem_size] =
-            get_pipeline_config_for_mega_moe_sm90(
-                SM90ArchSpec::smem_capacity,
-                input.num_experts, input.hidden,
-                block_m, block_n, block_k,
-                num_dispatch_threads / 32, num_epilogue_threads / 32,
-                direct_l2_scatter, 0, swap_ab, false, true);
-        DG_HOST_ASSERT(num_stages >= 2 and smem_size > 0);
-        return MegaMoESM90Config {
-            block_m, block_n, block_k,
-            num_max_pool_tokens, input.num_padded_sf_pool_tokens,
-            sf_pool_stride_tokens,
-            num_experts_per_wave,
-            input.launch_num_sms,
-            num_stages, smem_size,
-            num_dispatch_threads, num_non_epilogue_threads,
-            num_epilogue_threads,
-            direct_l2_scatter, nmajor_schedule, one_warp_cleanup, swap_ab,
-        };
+    MegaMoESM90Config phase {
+        block_m, block_n, block_k,
+        num_max_pool_tokens, input.num_padded_sf_pool_tokens,
+        sf_pool_stride_tokens,
+        num_experts_per_wave,
+        input.launch_num_sms,
+        num_stages, smem_size,
+        num_dispatch_threads, num_non_epilogue_threads,
+        num_epilogue_threads,
+        direct_l2_scatter, nmajor_schedule, one_warp_cleanup, swap_ab,
     };
-
-    const auto l1 = make_phase(128, 128, 128, 128);
-    const bool use_l2_bn256 = input.hidden % 256 == 0;
-    const auto l2 = use_l2_bn256 ?
-        make_phase(256, 64, 64, 256) :
-        make_phase(128, 128, 128, 128);
-    return {l1, l2, {false}};
+    return {phase, phase, {false}};
 }
 
 static Sm90MoeLaunchConfig select_mega_moe_sm90(

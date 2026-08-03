@@ -237,11 +237,79 @@ def _check_mxfp4_processed_decode_mapping() -> None:
     check(block_n=256, num_math_wgs=2)
 
 
+def _check_mxfp4_prmt_decode_contract() -> None:
+    """Exhaust the PRMT/LOP3 decoder's code, offset, and nibble positions."""
+    def byte_perm(a: int, b: int, selector: int) -> int:
+        source = a.to_bytes(4, 'little') + b.to_bytes(4, 'little')
+        return sum(
+            source[(selector >> (4 * byte_idx)) & 0x7] << (8 * byte_idx)
+            for byte_idx in range(4)
+        )
+
+    def decode_prmt(codes: List[int], exponent_offset: int) -> List[int]:
+        assert len(codes) == 8
+        packed = sum(
+            (codes[2 * byte_idx] | (codes[2 * byte_idx + 1] << 4)) <<
+            (8 * byte_idx)
+            for byte_idx in range(4)
+        )
+        lookup_lo = (
+            exponent_offset * 0x08080800 + 0x0c080000) & 0xffffffff
+        lookup_hi = (
+            exponent_offset * 0x08080808 + 0x1c181410) & 0xffffffff
+
+        sign_even = ((packed & 0x08080808) << 4) & 0xffffffff
+        sign_odd = packed & 0x80808080
+        out_lo = byte_perm(sign_even, sign_odd, 0x5140)
+        magnitude_lo = byte_perm(
+            lookup_lo, lookup_hi, packed & 0x77777777)
+        out_lo = (out_lo & 0x80808080) | magnitude_lo
+
+        out_hi = byte_perm(sign_even, sign_odd, 0x7362)
+        magnitude_hi = byte_perm(
+            lookup_lo, lookup_hi, (packed >> 16) & 0x77777777)
+        out_hi = (out_hi & 0x80808080) | magnitude_hi
+        decoded = out_lo.to_bytes(4, 'little') + out_hi.to_bytes(4, 'little')
+        return list(decoded)
+
+    def decode_reference(code: int, exponent_offset: int) -> int:
+        magnitude = code & 0x7
+        if magnitude == 0:
+            value = 0
+        elif magnitude == 1:
+            value = exponent_offset * 8
+        else:
+            value = exponent_offset * 8 + magnitude * 4
+        return value | (0x80 if code & 0x8 else 0)
+
+    for exponent_offset in range(1, 13):
+        for code in range(16):
+            repeated = [code] * 8
+            assert decode_prmt(repeated, exponent_offset) == [
+                decode_reference(value, exponent_offset)
+                for value in repeated
+            ]
+            for target_position in range(8):
+                mixed = [
+                    (code + 3 * position + 1) & 0xf
+                    for position in range(8)
+                ]
+                mixed[target_position] = code
+                assert decode_prmt(mixed, exponent_offset) == [
+                    decode_reference(value, exponent_offset)
+                    for value in mixed
+                ]
+
+    # Raw fallback uses the decoder's default offset and must preserve -0.
+    assert decode_prmt([0x8] * 8, 6) == [0x80] * 8
+
+
 def _check_mxfp4_format_contract(device: torch.device) -> None:
     """Check raw Humming bytes, nibble order, and UE8M0 endpoint semantics."""
     from deep_gemm.mega import _normalize_mxfp4_ue8m0, _process_mxfp4_fused_e8m0
 
     _check_mxfp4_processed_decode_mapping()
+    _check_mxfp4_prmt_decode_contract()
 
     # Low nibble is the even-K value and high nibble is the odd-K value.
     golden_bytes = torch.tensor(
