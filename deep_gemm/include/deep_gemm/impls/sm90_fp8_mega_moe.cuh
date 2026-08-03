@@ -415,6 +415,13 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr bool kDirectL2Scatter =
         (!kSwapABActive) && MegaMoEPhase::direct_l2_scatter && WG_BLOCK_N == 128;
     constexpr bool kBF16ScaledAccum = kBF16ScaledAccumRequested;
+    // The L2 BN256 split-N experiment has two math warpgroups in one CTA, so
+    // its launch bound caps each thread at 168 registers. Keep only the
+    // persistent scaled sum in packed BF16; WGMMA's transient accumulation
+    // remains FP32 and the existing epilogue still consumes FP32 values.
+    constexpr bool kMXFP4PackedBF16Accum =
+        kProcessedMXFP4Scales and MegaMoEPhase::runs_linear2 and
+        kSplitNWarpgroups and WG_BLOCK_N == 128;
     using L1WGMMA = typename mma::sm90::FP8MMASelector<WG_BLOCK_N>::type;
     static_assert(L1WGMMA::M == 64 and L1WGMMA::N == WG_BLOCK_N and L1WGMMA::K == 32,
                   "Unexpected WGMMA shape");
@@ -1163,7 +1170,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             using WGMMA = L1WGMMA;
             constexpr uint32_t kAccumPerThread = WGMMA::kNumAccum;  // 64 for M=64,N=128
             float final_accum[kAccumPerThread];
-            if constexpr (not kBF16ScaledAccum) {
+            if constexpr (not kBF16ScaledAccum and
+                          not kMXFP4PackedBF16Accum) {
                 #pragma unroll
                 for (uint32_t i = 0; i < kAccumPerThread; ++ i)
                     final_accum[i] = 0.0f;
@@ -1184,6 +1192,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     constexpr uint32_t kL2WeightSFPerExpert =
                         kHidden * kL2WeightSFK;
                     const uint32_t wg_thread_idx = warp_idx_in_wg * 32 + lane_idx;
+                    nv_bfloat162 mxfp4_final_bf16[kAccumPerThread / 2];
+                    if constexpr (kMXFP4PackedBF16Accum) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread / 2; ++ i)
+                            mxfp4_final_bf16[i] = __float2bfloat162_rn(0.0f);
+                    }
 
                     const auto prepare_stage_weights = [&](const uint32_t& k_block_idx) {
                         const auto* packed = smem_b_packed[stage_idx];
@@ -1404,14 +1418,27 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             compensated_scale_a_1 * compensated_secondary;
                         #pragma unroll
                         for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
-                            final_accum[i * 4 + 0] +=
-                                combined_scale_0 * accum[i * 4 + 0];
-                            final_accum[i * 4 + 1] +=
-                                combined_scale_0 * accum[i * 4 + 1];
-                            final_accum[i * 4 + 2] +=
-                                combined_scale_1 * accum[i * 4 + 2];
-                            final_accum[i * 4 + 3] +=
-                                combined_scale_1 * accum[i * 4 + 3];
+                            if constexpr (kMXFP4PackedBF16Accum) {
+                                mxfp4_final_bf16[i * 2] = __hfma2(
+                                    __floats2bfloat162_rn(
+                                        accum[i * 4], accum[i * 4 + 1]),
+                                    __float2bfloat162_rn(combined_scale_0),
+                                    mxfp4_final_bf16[i * 2]);
+                                mxfp4_final_bf16[i * 2 + 1] = __hfma2(
+                                    __floats2bfloat162_rn(
+                                        accum[i * 4 + 2], accum[i * 4 + 3]),
+                                    __float2bfloat162_rn(combined_scale_1),
+                                    mxfp4_final_bf16[i * 2 + 1]);
+                            } else {
+                                final_accum[i * 4 + 0] +=
+                                    combined_scale_0 * accum[i * 4 + 0];
+                                final_accum[i * 4 + 1] +=
+                                    combined_scale_0 * accum[i * 4 + 1];
+                                final_accum[i * 4 + 2] +=
+                                    combined_scale_1 * accum[i * 4 + 2];
+                                final_accum[i * 4 + 3] +=
+                                    combined_scale_1 * accum[i * 4 + 3];
+                            }
                         }
                     };
 
@@ -1456,6 +1483,15 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             }
                         }
                         arrive_empty_barrier(stage_idx);
+                    }
+                    if constexpr (kMXFP4PackedBF16Accum) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread / 2; ++ i) {
+                            const float2 pair =
+                                __bfloat1622float2(mxfp4_final_bf16[i]);
+                            final_accum[i * 2] = pair.x;
+                            final_accum[i * 2 + 1] = pair.y;
+                        }
                     }
                 }
             };

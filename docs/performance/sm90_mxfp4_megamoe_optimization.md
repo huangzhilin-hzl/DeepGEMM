@@ -1057,3 +1057,67 @@ instruction to a C++ source variable. The next controlled sub-experiment keeps
 the same BN256 schedule and stores the persistent scaled accumulation in packed
 BF16, halving its register footprint while converting back to FP32 only for
 the existing BF16 output epilogue.
+
+## Rejected experiment: packed-BF16 persistent accumulation
+
+### Hypothesis and implementation
+
+Iteration 12b keeps the L2 BN256/two-math-WG schedule unchanged and modifies
+only the processed MXFP4 L2 promotion. WGMMA still produces FP32 fragments,
+but each K32/K64 promotion uses packed `__hfma2` to retain the cross-K-block
+sum as 32 `nv_bfloat162` values instead of 64 FP32 values. The candidate
+converts that packed sum back to FP32 after the K loop so the existing L2
+epilogue remains unchanged. L1, raw scales, the decoder, TMA, scheduler,
+barriers, descriptors, and scatter are identical to Iteration 12a.
+
+The intended register-lifetime reduction did not materialize in generated
+code. The compiler retained enough of the packed accumulator and the later
+FP32 epilogue array simultaneously that local-memory traffic increased rather
+than disappeared.
+
+### Correctness and eight-rank quick gate
+
+Fresh-JIT processed correctness passed for Flash M128 on one rank and for both
+Flash and Pro M128 on eight ranks. Every case reported `calc_diff=0.0006`
+against the existing `0.01` tolerance, so the packed-BF16 promotion did not
+change the observed BF16-output error boundary.
+
+| Model | Iteration 7 (us) | Iteration 12a FP32 (us) | Packed-BF16 (us) | Candidate range (us) | Change vs Iter. 12a |
+|---|---:|---:|---:|---:|---:|
+| Flash M128 | 1,338.252 | 1,727.848 | 1,944.157 | 1,905.511-1,947.803 | +12.52% |
+| Pro M128 | 4,601.000 | 6,065.000 | 6,844.000 | 6,841-6,983 | +12.84% |
+
+Flash rank-zero L1 is 864.572-927.803 us while L2 is 1,020-1,022 us. Pro
+rank-zero L1 is 3,088-3,152 us while L2 is 3,748-3,752 us. The unchanged L1
+stays near Iteration 12a; the packed-BF16 L2 is the regression.
+
+### NCU and NSYS attribution
+
+Detailed NCU again uses one-rank Flash M128/E32 and a fresh candidate cache.
+The candidate still compiles at 168 registers per thread. L2 spill requests
+increase by 23.40%, while executed instructions remain nearly flat; the BF16
+conversion and packed FMA sequence therefore add pressure and latency without
+removing the original local-memory path.
+
+| NCU metric | Iteration 12a L1 | Packed-BF16 L1 | Change | Iteration 12a L2 | Packed-BF16 L2 | Change |
+|---|---:|---:|---:|---:|---:|---:|
+| Duration | 927.104 us | 934.688 us | +0.82% | 867.200 us | 1,067.232 us | +23.07% |
+| Executed instructions | 129,332,753 | 129,334,049 | ~0% | 101,091,768 | 100,887,046 | -0.20% |
+| Local-memory spill requests | 0 | 0 | 0 | 21,939,536 | 27,073,344 | +23.40% |
+| Launch registers per thread | 168 | 168 | 0 | 168 | 168 | 0 |
+| Achieved occupancy | 9.45% | 9.45% | ~0 pp | 18.36% | 18.35% | ~0 pp |
+
+NSYS independently records the same phase-local regression. The one-shot
+profile contains a large host-side interval between L1 and L2, so only kernel
+durations are compared here.
+
+| NSYS kernel | Iteration 12a | Packed-BF16 | Change |
+|---|---:|---:|---:|
+| L1 | 857,444 ns | 843,235 ns | -1.66% |
+| L2 | 801,027 ns | 994,467 ns | +24.15% |
+
+Iteration 12b is rejected. Packed BF16 is numerically acceptable but does not
+reduce generated-code spill when it is converted into a separate FP32 array
+before the epilogue. The next controlled variant must let the L2 epilogue
+consume the packed accumulator directly, eliminating the overlapping FP32
+array rather than relying on compiler lifetime reuse.
