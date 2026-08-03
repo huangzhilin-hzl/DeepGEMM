@@ -437,3 +437,70 @@ contiguous packed words. With B64 input and B128 output swizzles, this should
 cover all 32 banks per load and reach the two-wavefront minimum for 64-bit
 stores. Each row's already-loaded exponent word can be shared from its owner
 lane with a warp shuffle, preserving one global scale load per output row.
+
+## Rejected experiment: 8-row by 4-word warp decode mapping
+
+### Hypothesis and implementation
+
+The processed decoder was temporarily remapped so `lane / 4` selected one of
+eight rows and `lane % 4` selected four contiguous packed words. Four row
+groups and four K32 groups still covered every one of the `128 x 16` packed
+words exactly once. Each target row obtained its original exponent word with
+`__shfl_sync` from that row's owner lane. Two independent index/address reviews
+and an exhaustive host-side coordinate enumeration found no overlap or gap.
+
+Processed smoke, forced requantization, raw fallback, and eight-rank Flash/Pro
+M128 correctness all passed with the same `0.0005-0.0006` differences as
+Iteration 5.
+
+### NCU and NSYS attribution
+
+The remap eliminated packed-load bank conflicts, but not the expanded 64-bit
+stores. NVIDIA services `STS.64` as two half-warp transactions. Within each
+half warp, this lane order touched only 16 banks twice, so the stores still
+used four wavefronts instead of the two-wavefront ideal. The additional row
+address arithmetic and four shuffles per thread increased executed
+instructions enough to cancel most of the load-side gain.
+
+| Metric (Flash M128, single rank, E32) | Iteration 5 L1 | Warp-tiled L1 | Change | Iteration 5 L2 | Warp-tiled L2 | Change |
+|---|---:|---:|---:|---:|---:|---:|
+| NCU duration | 940.74 us | 940.48 us | -0.03% | 503.78 us | 488.86 us | -3.0% |
+| Executed instructions | 121,869,919 | 129,596,259 | +6.3% | 66,499,004 | 69,741,293 | +4.9% |
+| Excessive shared wavefronts | 10,556,978 | 4,265,522 | -59.6% | 5,579,264 | 2,433,536 | -56.4% |
+| Total shared wavefronts | 23,430,736 | 17,139,280 | -26.9% | 12,296,270 | 9,150,542 | -25.6% |
+
+| NSYS selected hot path | Iteration 5 | Warp tiled | Change |
+|---|---:|---:|---:|
+| L1 kernel | 866,499 ns | 859,972 ns | -0.8% |
+| L1-to-L2 gap | 126,241 ns | 125,344 ns | -0.7% |
+| L2 kernel | 451,361 ns | 444,194 ns | -1.6% |
+
+### Eight-rank performance and decision
+
+The full paired campaign used the standard three observations and 20 tests.
+Changes are relative to accepted Iteration 5.
+
+| Model | M | Co-measured FP8 (us) | MXFP4 iter. 5 (us) | Warp tiled (us) | Change |
+|---|---:|---:|---:|---:|---:|
+| Flash | 8 | 305.8 | 1,153.9 | 1,155.7 | +0.2% |
+| Flash | 128 | 462.3 | 1,397.5 | 1,371.9 | -1.8% |
+| Flash | 512 | 967.8 | 2,587.5 | 2,561.2 | -1.0% |
+| Flash | 8192 | 9,880.0 | 29,828.0 | 29,591.0 | -0.8% |
+| Pro | 8 | 704.0 | 2,997.6 | 2,977.0 | -0.7% |
+| Pro | 128 | 1,247.1 | 4,744.0 | 4,739.0 | -0.1% |
+| Pro | 512 | 2,408.5 | 7,175.0 | 7,225.0 | +0.7% |
+| Pro | 8192 | 25,218.0 | 75,629.0 | 75,481.0 | -0.2% |
+
+The mixed `-1.8%` to `+0.7%` result is too small and inconsistent for the
+extra mapping complexity. The device change was reverted and only this
+profiler record is retained.
+
+The SASS counters identify a corrected follow-up: arrange each half warp as
+eight rows by two packed words, with the high half selecting the other two
+words. In coordinates,
+`row = (lane % 16) / 2` and
+`word = (lane / 16) * 2 + lane % 2`.
+For B64 loads the full warp then touches all 32 banks once; for B128 `STS.64`,
+each half warp also touches all 32 banks once. This preserves the exact same
+logical coverage and shuffle ownership while targeting both remaining replay
+sources rather than only the loads.
