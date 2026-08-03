@@ -404,6 +404,10 @@ def fp8_mxfp4_mega_moe(y: torch.Tensor,
     triples from the raw or fused variants of
     ``transform_weights_for_fp8_mxfp4_*_mega_moe_sm90``. Raw Humming
     checkpoint tensors must pass through one of those transforms first.
+
+    For processed triples, ``fast_math=True`` additionally updates scaled
+    WGMMA fragments with packed BF16 FMA. Set ``fast_math=False`` to retain
+    FP32 multiply-accumulate before the persistent sum is stored as BF16.
     """
     assert len(l1_weights) == len(l2_weights)
     assert len(l1_weights) in (2, 3)

@@ -1547,3 +1547,93 @@ stress plan, eight-rank production shapes, and raw-scale smoke preserve the
 tested numeric contract. The next optimization must address the remaining
 decode and promotion instruction overhead or the inter-phase launch gap;
 M128 MXFP4 remains 1.66-2.06x slower than matching FP8 MegaMoE.
+
+## Accepted experiment: explicit fast-math BF16 pair promotion
+
+### Numeric contract and implementation
+
+Iteration 17 revisits the rejected unconditional HFMA2 prototype behind the
+existing `fast_math` contract. Processed MXFP4 with `fast_math=true` converts
+each combined FP32 scale to a broadcast BF16 pair, packs each two-value FP32
+WGMMA fragment to BF16, and updates the packed persistent sum with
+`__hfma2`. This rounds the scale, current fragment, and fused result to BF16.
+Processed MXFP4 with `fast_math=false` retains Iteration 16b's FP32 `fmaf`
+before the persistent sum is stored as BF16. Raw MXFP4 and FP8 do not compile
+the new promotion branch.
+
+The Python entry-point documentation now states this precision/performance
+choice explicitly. The final source scopes both BF16 scale conversions inside
+`if constexpr (kProcessedMXFP4Scales && kFastMath)`, so strict code generation
+cannot retain unused fast-path conversions. Final cubin inspection finds 32
+`HFMA2.BF16_V2` instructions in the fast production L1 specialization and
+zero in the strict specialization; both report `STACK=0` and `LOCAL=0`.
+
+The complete one-rank layered plan plus 100 seeded random tests passes all 139
+scenarios, including both fast-math modes, with maximum `calc_diff=0.0007`.
+Eight-rank production Flash and Pro M128 pass at `0.0007`. Fresh-cache final
+source smokes also pass processed fast/strict at `0.0007/0.0006`, raw
+fast/strict at `0.0007/0.0009`, and FP8 fast/strict at `0.0006/0.0006`, all
+against tolerance `0.01`.
+
+### Formal H20 performance
+
+The full eight-rank PR383 contract completes all 22 cases: 50 observations
+for M at most 128, three for larger M, 20 internal tests per observation, and
+the median of the maximum rank. Every point improves on Iteration 16b. The
+geometric-mean throughput speedup is 1.065x for Flash and 1.098x for Pro.
+M128 improves by 6.28%/9.17% in latency terms and narrows the matching FP8 gap
+to 1.56x/1.87x.
+
+| Model, M128 | FP8 (us) | Iteration 16b MXFP4 (us) | Iteration 17 MXFP4 (us) | Change vs Iter. 16b | MXFP4 / FP8 |
+|---|---:|---:|---:|---:|---:|
+| Flash | 430.344 | 715.655 | 670.699 | -6.28% | 1.56x |
+| Pro | 1,222.618 | 2,517.176 | 2,286.453 | -9.17% | 1.87x |
+
+| M | Flash Iter. 17 (us) | Change vs Iter. 16b | Pro Iter. 17 (us) | Change vs Iter. 16b |
+|---:|---:|---:|---:|---:|
+| 8 | 587.520 | -5.26% | 1,460.602 | -8.45% |
+| 16 | 643.773 | -5.84% | 2,055.066 | -8.73% |
+| 32 | 656.055 | -6.45% | 2,239.773 | -8.82% |
+| 64 | 666.669 | -6.45% | 2,265.955 | -8.51% |
+| 128 | 670.699 | -6.28% | 2,286.453 | -9.17% |
+| 256 | 698.543 | -2.88% | 2,317.656 | -8.97% |
+| 512 | 1,274.015 | -5.63% | 3,449.000 | -8.78% |
+| 1,024 | 2,133.665 | -7.02% | 5,716.000 | -9.20% |
+| 2,048 | 3,842.000 | -7.40% | 9,941.000 | -9.12% |
+| 4,096 | 7,269.000 | -7.22% | 18,307.000 | -9.06% |
+| 8,192 | 14,092.000 | -7.06% | 35,574.000 | -9.31% |
+
+The full-matrix geometric-mean FP8 gap is now 1.616x for Flash and 1.676x for
+Pro. This is another accepted improvement, but it remains short of FP8 parity
+and therefore does not satisfy the overall SOTA target yet.
+
+### NCU and NSYS attribution
+
+Full-set NCU on the final source confirms that pairwise BF16 FMA removes most
+of Iteration 16b's promotion instruction overhead without reintroducing local
+memory. L1/L2 executed instructions fall by 19.48%/29.96% and duration falls
+by 7.89%/5.31%. Both kernels report zero local-memory spill requests and 128
+launch registers per thread.
+
+| NCU metric | Iteration 16b L1 | Iteration 17 L1 | Iteration 16b L2 | Iteration 17 L2 |
+|---|---:|---:|---:|---:|
+| Duration | 475.970 us | 438.400 us | 261.340 us | 247.460 us |
+| Executed instructions | 85,538,512 | 68,878,813 | 56,390,056 | 39,493,555 |
+| Local-memory spill requests | 0 | 0 | 0 | 0 |
+| Launch registers per thread | 127 | 128 | 127 | 128 |
+| Achieved occupancy | 18.05% | 18.08% | 23.91% | 23.84% |
+| Achieved active warps/SM | 11.55 | 11.57 | 15.30 | 15.26 |
+
+Final-source NSYS records L1 at 410,945 ns, the inter-kernel gap at 104,353
+ns, and L2 at 225,729 ns, for 741,027 ns across the selected hot path. The
+total is 6.96% below Iteration 16b; L1, gap, and L2 are 5.54%, 14.66%, and
+5.61% shorter.
+
+Iteration 17 is accepted as the new default fast-math MXFP4 baseline. Strict
+mode remains available for FP32 promotion arithmetic, and the approximation
+is now visible at the public Python entry point. A warm FP8 NSYS comparison
+shows a 108 us phase gap versus roughly 104-122 us for recent MXFP4 samples,
+so the remaining 1.56-1.87x M128 gap is dominated by the kernels, especially
+L1 decode/promotion, rather than by host submission. The next structural
+candidate should stage processed weight scales with packed-B TMA or reduce
+decode work while preserving two-CTA residency.

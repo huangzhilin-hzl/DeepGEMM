@@ -421,8 +421,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     // 64-value WGMMA fragment and a 64-value FP32 persistent sum live creates
     // a short local-memory frame. Retain the cross-promotion sum as 32 packed
     // BF16 pairs and expand it only after the mainloop has released the WGMMA
-    // fragment. Each promotion still multiplies and accumulates in FP32; only
-    // the persistent storage is rounded to BF16 before the next promotion.
+    // fragment. Strict mode multiplies and accumulates in FP32 and rounds only
+    // the persistent storage. Fast math also rounds each promotion's scale and
+    // WGMMA fragment to BF16 so the packed pairs can be updated with HFMA2.
     constexpr bool kMXFP4PackedBF16Accum = kProcessedMXFP4Scales;
     using L1WGMMA = typename mma::sm90::FP8MMASelector<WG_BLOCK_N>::type;
     static_assert(L1WGMMA::M == 64 and L1WGMMA::N == WG_BLOCK_N and L1WGMMA::K == 32,
@@ -1450,34 +1451,54 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             compensated_scale_a_0 * compensated_secondary;
                         const float combined_scale_1 =
                             compensated_scale_a_1 * compensated_secondary;
-                        #pragma unroll
-                        for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
-                            if constexpr (kMXFP4PackedBF16Accum) {
-                                const float2 persistent_0 =
-                                    __bfloat1622float2(mxfp4_final_bf16[i * 2]);
-                                const float2 persistent_1 =
-                                    __bfloat1622float2(mxfp4_final_bf16[i * 2 + 1]);
-                                mxfp4_final_bf16[i * 2] =
+                        if constexpr (kMXFP4PackedBF16Accum and kFastMath) {
+                            const nv_bfloat162 combined_scale_bf16_0 =
+                                __float2bfloat162_rn(combined_scale_0);
+                            const nv_bfloat162 combined_scale_bf16_1 =
+                                __float2bfloat162_rn(combined_scale_1);
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
+                                mxfp4_final_bf16[i * 2] = __hfma2(
+                                    combined_scale_bf16_0,
                                     __floats2bfloat162_rn(
-                                        fmaf(combined_scale_0,
-                                             accum[i * 4], persistent_0.x),
-                                        fmaf(combined_scale_0,
-                                             accum[i * 4 + 1], persistent_0.y));
-                                mxfp4_final_bf16[i * 2 + 1] =
+                                        accum[i * 4], accum[i * 4 + 1]),
+                                    mxfp4_final_bf16[i * 2]);
+                                mxfp4_final_bf16[i * 2 + 1] = __hfma2(
+                                    combined_scale_bf16_1,
                                     __floats2bfloat162_rn(
-                                        fmaf(combined_scale_1,
-                                             accum[i * 4 + 2], persistent_1.x),
-                                        fmaf(combined_scale_1,
-                                             accum[i * 4 + 3], persistent_1.y));
-                            } else {
-                                final_accum[i * 4 + 0] +=
-                                    combined_scale_0 * accum[i * 4 + 0];
-                                final_accum[i * 4 + 1] +=
-                                    combined_scale_0 * accum[i * 4 + 1];
-                                final_accum[i * 4 + 2] +=
-                                    combined_scale_1 * accum[i * 4 + 2];
-                                final_accum[i * 4 + 3] +=
-                                    combined_scale_1 * accum[i * 4 + 3];
+                                        accum[i * 4 + 2], accum[i * 4 + 3]),
+                                    mxfp4_final_bf16[i * 2 + 1]);
+                            }
+                        } else {
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
+                                if constexpr (kMXFP4PackedBF16Accum) {
+                                    const float2 persistent_0 =
+                                        __bfloat1622float2(mxfp4_final_bf16[i * 2]);
+                                    const float2 persistent_1 =
+                                        __bfloat1622float2(mxfp4_final_bf16[i * 2 + 1]);
+                                    mxfp4_final_bf16[i * 2] =
+                                        __floats2bfloat162_rn(
+                                            fmaf(combined_scale_0,
+                                                 accum[i * 4], persistent_0.x),
+                                            fmaf(combined_scale_0,
+                                                 accum[i * 4 + 1], persistent_0.y));
+                                    mxfp4_final_bf16[i * 2 + 1] =
+                                        __floats2bfloat162_rn(
+                                            fmaf(combined_scale_1,
+                                                 accum[i * 4 + 2], persistent_1.x),
+                                            fmaf(combined_scale_1,
+                                                 accum[i * 4 + 3], persistent_1.y));
+                                } else {
+                                    final_accum[i * 4 + 0] +=
+                                        combined_scale_0 * accum[i * 4 + 0];
+                                    final_accum[i * 4 + 1] +=
+                                        combined_scale_0 * accum[i * 4 + 1];
+                                    final_accum[i * 4 + 2] +=
+                                        combined_scale_1 * accum[i * 4 + 2];
+                                    final_accum[i * 4 + 3] +=
+                                        combined_scale_1 * accum[i * 4 + 3];
+                                }
                             }
                         }
                     };
