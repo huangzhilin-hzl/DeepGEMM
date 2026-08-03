@@ -1363,30 +1363,89 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                     cute::Swizzle<2, 4, 3>::apply(packed_row_base) ^
                                     packed_row_base;
 
-                                #pragma unroll
-                                for (uint32_t k32_idx = 0;
-                                     k32_idx < kNumMXFP4SFBKGroups; ++ k32_idx) {
-                                    const uint32_t packed_k =
-                                        k32_idx * kPackedWordsPerK32 + packed_k_in_k32;
-                                    const uint32_t exponent_offset =
-                                        (decoded_scale_word >> (k32_idx * 8u)) & 0xffu;
-                                    const uint32_t packed_byte_offset =
+                                if constexpr (is_linear1_phase and
+                                              kOverlapProcessedScalePath) {
+                                    const uint32_t first_packed_byte_offset =
                                         packed_row_base +
-                                        ((packed_k * sizeof(uint32_t)) ^ packed_row_xor);
-                                    const uint2 decoded =
-                                        sm90_mxfp4_e2m1x8_to_e4m3x8_bits(
-                                            ptx::ld_shared(reinterpret_cast<const uint32_t*>(
-                                                packed + packed_byte_offset)),
-                                            exponent_offset);
-                                    const uint32_t logical_n =
-                                        wg_n_idx + decoded_local_n;
-                                    const uint32_t logical_k0 = packed_k * 8;
-                                    const uint32_t flat0 =
-                                        logical_n * BLOCK_K + logical_k0;
-                                    const uint32_t swizzled0 =
-                                        cute::Swizzle<3, 4, 3>::apply(flat0);
-                                    ptx::st_shared(
-                                        expanded + swizzled0, decoded.x, decoded.y);
+                                        ((packed_k_in_k32 * sizeof(uint32_t)) ^
+                                         packed_row_xor);
+                                    uint32_t packed_current = ptx::ld_shared(
+                                        reinterpret_cast<const uint32_t*>(
+                                            packed + first_packed_byte_offset));
+                                    #pragma unroll
+                                    for (uint32_t k32_idx = 0;
+                                         k32_idx < kNumMXFP4SFBKGroups;
+                                         ++ k32_idx) {
+                                        const uint32_t packed_k =
+                                            k32_idx * kPackedWordsPerK32 +
+                                            packed_k_in_k32;
+                                        uint32_t packed_next = 0;
+                                        if (k32_idx + 1 <
+                                            kNumMXFP4SFBKGroups) {
+                                            const uint32_t next_packed_k =
+                                                packed_k + kPackedWordsPerK32;
+                                            const uint32_t next_packed_byte_offset =
+                                                packed_row_base +
+                                                ((next_packed_k * sizeof(uint32_t)) ^
+                                                 packed_row_xor);
+                                            packed_next = ptx::ld_shared(
+                                                reinterpret_cast<const uint32_t*>(
+                                                    packed +
+                                                    next_packed_byte_offset));
+                                        }
+                                        const uint32_t exponent_offset =
+                                            (decoded_scale_word >>
+                                             (k32_idx * 8u)) & 0xffu;
+                                        const uint2 decoded =
+                                            sm90_mxfp4_e2m1x8_to_e4m3x8_bits(
+                                                packed_current,
+                                                exponent_offset);
+                                        const uint32_t logical_n =
+                                            wg_n_idx + decoded_local_n;
+                                        const uint32_t logical_k0 =
+                                            packed_k * 8;
+                                        const uint32_t flat0 =
+                                            logical_n * BLOCK_K + logical_k0;
+                                        const uint32_t swizzled0 =
+                                            cute::Swizzle<3, 4, 3>::apply(flat0);
+                                        ptx::st_shared(
+                                            expanded + swizzled0,
+                                            decoded.x, decoded.y);
+                                        packed_current = packed_next;
+                                    }
+                                } else {
+                                    #pragma unroll
+                                    for (uint32_t k32_idx = 0;
+                                         k32_idx < kNumMXFP4SFBKGroups;
+                                         ++ k32_idx) {
+                                        const uint32_t packed_k =
+                                            k32_idx * kPackedWordsPerK32 +
+                                            packed_k_in_k32;
+                                        const uint32_t exponent_offset =
+                                            (decoded_scale_word >>
+                                             (k32_idx * 8u)) & 0xffu;
+                                        const uint32_t packed_byte_offset =
+                                            packed_row_base +
+                                            ((packed_k * sizeof(uint32_t)) ^
+                                             packed_row_xor);
+                                        const uint2 decoded =
+                                            sm90_mxfp4_e2m1x8_to_e4m3x8_bits(
+                                                ptx::ld_shared(
+                                                    reinterpret_cast<const uint32_t*>(
+                                                        packed +
+                                                        packed_byte_offset)),
+                                                exponent_offset);
+                                        const uint32_t logical_n =
+                                            wg_n_idx + decoded_local_n;
+                                        const uint32_t logical_k0 = packed_k * 8;
+                                        const uint32_t flat0 =
+                                            logical_n * BLOCK_K + logical_k0;
+                                        const uint32_t swizzled0 =
+                                            cute::Swizzle<3, 4, 3>::apply(flat0);
+                                        ptx::st_shared(
+                                            expanded + swizzled0,
+                                            decoded.x, decoded.y);
+                                    }
                                 }
                             }
                         } else {

@@ -1883,3 +1883,163 @@ gain in both NCU and NSYS. The remaining gap is still dominated by the
 64-67% no-eligible-warp fraction, so the next iteration should shorten the
 decode/promotion dependency chain or expose more independent work without
 increasing register or shared-memory residency costs.
+
+## Rejected experiments after Iteration 19
+
+Two dependency-hiding prototypes were measured and completely reverted before
+the next accepted change:
+
+- Iteration 20 broadcast top-k metadata inside the CTA. Flash M128 measured
+  708.715 us, a clear regression from the current baseline range.
+- Iteration 21 split the four K32 decodes into two N64 flights. Its first L2
+  build created a 40-byte stack frame with local loads and stores, so the final
+  candidate was restricted to L1. The exact-source comparison still measured
+  709.222/2,277.770 us for Flash/Pro against 658.332/2,072.763 us for
+  Iteration 19, regressions of 7.73%/9.89%. The generated wait shape was
+  correct, but the shorter flights exposed less useful work and increased
+  synchronization overhead.
+
+Neither rejected experiment is present in the source below.
+
+## Accepted experiment: pipeline packed LDS through the L1 decoder
+
+### Design and generated-code contract
+
+Iteration 22 targets the remaining packed-weight decoder dependency chain. In
+the processed-scale, overlap-enabled L1 specialization, each lane now loads the
+next packed 32-bit MXFP4 word before decoding and storing the current word. A
+two-register ping-pong carries `packed_current` and `packed_next` across the
+fully unrolled four-K32 loop. The original decoder remains a complete
+compile-time `else` branch.
+
+The gate is deliberately narrow:
+
+```text
+kProcessedMXFP4Scales &&
+kOverlapProcessedScalePath &&
+MegaMoEPhase::runs_linear1
+```
+
+Processed L2, processed overlap-false L1, raw MXFP4, and FP8 therefore compile
+the previous path. This adds no JIT template dimension or cache-cardinality
+dimension; the normal include hash invalidates old cubins once after the header
+changes.
+
+Fresh cubin inspection confirms the compiler emitted the intended two-word
+pipeline rather than hoisting all four loads. Each row group has the abstract
+memory sequence `L L S L S L S S`, where `L` is a packed `LDS.U32` and `S` is
+an expanded `STS.64`. The three audited L1 specializations each contain 16
+packed loads and 16 expanded stores, never exceed two outstanding packed
+words, have no seventeenth load or runtime K32 branch, and preserve the final
+`STS -> MEMBAR -> FENCE.VIEW.ASYNC -> BAR -> WARPGROUP.ARRIVE -> QGMMA`
+publication sequence. The 4,096-coordinate old/new address oracle is identical;
+2,048 unique packed addresses cover byte offsets 0 through 8,188 at four-byte
+alignment, while the stores cover the complete 16-KiB expanded tile.
+
+Resource usage rises by two registers in active L1 shapes: Flash production
+uses 127 registers and Pro uses 128. Both remain spill-free and retain the
+two-CTA residency gate. Pro is now at the register hard limit, so subsequent
+changes must recheck local-memory traffic before acceptance.
+
+### Correctness
+
+The forced-requant device input now spans UE8M0 codes 104 through 120 with base
+109. It therefore exercises every device-consumed delta from zero through five;
+delta five also covers complete finite-magnitude underflow to zero.
+
+| Scenario | Result | Maximum `calc_diff` |
+|---|---:|---:|
+| One-rank processed Layers 1-4, including M4096/M4097 | 43 / 43 PASS | 0.0007 |
+| One-rank raw MXFP4 L1 smoke | PASS | 0.0006 |
+| One-rank FP8 L1 smoke | PASS | 0.0006 |
+| Eight-rank H200 Layer 3, Flash/Pro and load 24/32 | 5 / 5 PASS | 0.0007 |
+
+These end-to-end checks are paired with the SASS address audit above so that
+the numerical tolerance is not the sole evidence for shared-memory mapping.
+
+### Paired acceptance test
+
+The acceptance run alternates the candidate and an exact detached Iteration 19
+source tree on the same node with independent JIT caches. Each point uses 50
+observations, 20 internal tests per observation, and median maximum-rank
+latency. Both candidate runs reproduce the improvement.
+
+| Run | Flash M128 (us) | Change vs B | Pro M128 (us) | Change vs B |
+|---|---:|---:|---:|---:|
+| Iteration 22 A1 | 634.467 | -3.95% | 1,946.391 | -5.66% |
+| Iteration 19 B | 660.564 | baseline | 2,063.085 | baseline |
+| Iteration 22 A2 | 640.893 | -2.98% | 1,932.840 | -6.31% |
+
+### Full H20 matrix
+
+The eight-rank PR383 contract completes all 44 co-measured FP8/MXFP4 cases:
+Flash and Pro, 11 token counts, 50 observations for M at most 128, three for
+larger M, and 20 internal tests per observation. The historical Iteration 19
+column is used only to quantify cross-campaign improvement; the MXFP4/FP8 ratio
+uses the current co-measured values.
+
+| M | Flash FP8 (us) | Flash Iter. 22 (us) | vs Iter. 19 | Pro FP8 (us) | Pro Iter. 22 (us) | vs Iter. 19 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 291.639 | 527.931 | -4.55% | 683.607 | 1,242.019 | -6.95% |
+| 16 | 306.674 | 572.198 | -7.07% | 949.778 | 1,732.852 | -7.75% |
+| 32 | 331.707 | 603.755 | -4.79% | 1,042.876 | 1,863.561 | -7.66% |
+| 64 | 365.740 | 610.010 | -4.32% | 1,092.301 | 1,906.096 | -8.26% |
+| 128 | 438.210 | 620.907 | -4.87% | 1,204.232 | 1,926.372 | -6.07% |
+| 256 | 525.912 | 656.101 | -0.02% | 1,648.425 | 1,957.290 | -4.90% |
+| 512 | 935.944 | 1,136.640 | -6.69% | 2,413.715 | 2,954.000 | -6.16% |
+| 1,024 | 1,536.863 | 1,933.194 | -7.02% | 4,016.000 | 4,889.000 | -5.76% |
+| 2,048 | 2,750.780 | 3,444.000 | -8.06% | 6,982.000 | 8,497.000 | -5.64% |
+| 4,096 | 5,095.000 | 6,504.000 | -9.12% | 12,938.000 | 15,548.000 | -5.47% |
+| 8,192 | 9,879.000 | 13,917.000 | -0.25% | 25,099.000 | 30,374.000 | -3.90% |
+
+The geometric-mean throughput speedup over Iteration 19 is 1.055x for Flash
+and 1.067x for Pro. The co-measured geometric-mean MXFP4/FP8 latency ratio is
+1.456x/1.432x; at M128 it is 1.417x/1.600x. MXFP4 remains slower than FP8 at
+every formal point, so this is an accepted milestone, not FP8 parity or a SOTA
+claim. Historical same-node DeepEP HT M128 references are 643.312/1,829.120 us:
+Iteration 22 is 3.48% faster for Flash and 5.32% slower for Pro, but those values
+were not co-measured in this campaign and do not participate in acceptance.
+
+### NCU and NSYS attribution
+
+Full-set NCU uses the same one-rank Flash M128/E32 contract as Iteration 19.
+L1 replay duration falls 14.79%, while L2 is effectively flat. Executed
+instructions fall only 0.57% in L1, but the no-eligible fraction falls 3.77
+percentage points and memory throughput rises 17.35%. This is the expected
+signature of overlapping LDS latency instead of removing a large instruction
+class. The excluded L2 path remaining flat is an additional compile-time-gate
+control.
+
+| NCU metric | Iteration 19 L1 | Iteration 22 L1 | Iteration 19 L2 | Iteration 22 L2 |
+|---|---:|---:|---:|---:|
+| Duration | 446.91 us | 380.80 us | 226.43 us | 226.66 us |
+| Executed instructions | 69,932,960 | 69,534,509 | 40,503,037 | 40,487,663 |
+| Registers per thread | 125 | 127 | 128 | 128 |
+| Dynamic shared memory | 93.31 KiB | 93.31 KiB | 94.34 KiB | 94.34 KiB |
+| Achieved occupancy | 18.07% | 18.13% | 23.90% | 23.78% |
+| No eligible warp | 66.77% | 63.00% | 64.42% | 64.67% |
+| Compute throughput | 58.18% | 67.16% | 57.13% | 57.43% |
+| DRAM throughput | 16.93% | 19.86% | 17.29% | 17.23% |
+| Memory throughput | 680.83 GB/s | 798.92 GB/s | 695.29 GB/s | 693.28 GB/s |
+| Local spill requests | 0 | 0 | 0 | 0 |
+
+NSYS traces 124 L1/L2 pairs for each exact source. Excluding the first lazy/JIT
+pair leaves 123 steady pairs. L1 falls 9.11%, L2 falls only 0.65%, and the full
+L1-gap-L2 hot path falls 6.12%. The hot-path value is the median of each pair's
+end-to-end duration; it is not the arithmetic sum of the three independently
+computed component medians.
+
+| NSYS steady median | Iteration 19 | Iteration 22 | Change |
+|---|---:|---:|---:|
+| L1 | 400.577 us | 364.097 us | -9.11% |
+| Inter-kernel gap | 1.280 us | 1.184 us | -0.096 us |
+| L2 | 206.913 us | 205.569 us | -0.65% |
+| Hot path | 608.578 us | 571.363 us | -6.12% |
+
+Iteration 22 is accepted because the exact-source paired runs, full matrix,
+NCU, and NSYS agree with the generated-code scope, while exhaustive mapping,
+requant deltas zero through five, production correctness, zero spills, and
+unchanged shared-memory residency close the safety gates. The primary remaining
+gap is still the L1 decoder/promotion chain: even after the lookahead, 63% of
+L1 scheduler cycles have no eligible warp. The next experiment should expose
+independent decode work without increasing Pro beyond its 128-register ceiling.

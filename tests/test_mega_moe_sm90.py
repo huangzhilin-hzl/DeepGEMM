@@ -647,14 +647,15 @@ def _run_scenario(
         l2_w_fp8, l2_w_sf = _quantize_grouped_mxfp4(l2_bf)
         if force_mxfp4_requant:
             assert mxfp4_scale_mode == 'processed'
-            # Force exponent spread 12 so code 115 is clamped to base 116
-            # and its packed payload is actually requantized (delta=1).
+            # Force exponent spread 16 so codes 104..108 are clamped to base
+            # 109. This exercises every device-consumed requant delta 0..5;
+            # delta 5 also covers complete finite-magnitude underflow to zero.
             l1_codes = torch.arange(
                 l1_w_sf.numel(), dtype=torch.int64, device='cuda').reshape_as(l1_w_sf)
             l2_codes = torch.arange(
                 l2_w_sf.numel(), dtype=torch.int64, device='cuda').reshape_as(l2_w_sf)
-            l1_w_sf = torch.exp2((l1_codes % 13 + 115).float() - 127.0)
-            l2_w_sf = torch.exp2((l2_codes % 13 + 115).float() - 127.0)
+            l1_w_sf = torch.exp2((l1_codes % 17 + 104).float() - 127.0)
+            l2_w_sf = torch.exp2((l2_codes % 17 + 104).float() - 127.0)
     else:
         # Block (128, 128), matching DeepSeekV4FlashFp8 / DeepEP.
         l1_w_fp8, l1_w_sf = _quantize_grouped_fp8_block_128_128(l1_bf)
