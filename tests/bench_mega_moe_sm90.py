@@ -1,4 +1,4 @@
-"""Benchmark the SM90 FP8 MegaMoE kernel on Flash and Pro model shapes."""
+"""Benchmark SM90 FP8 and FP8 x MXFP4 MegaMoE on Flash/Pro shapes."""
 
 import argparse
 import json
@@ -17,7 +17,7 @@ if REPO_ROOT not in sys.path:
 
 import deep_gemm
 from deep_gemm.testing import bench_kineto, get_arch_major
-from deep_gemm.utils import per_token_cast_to_fp8
+from deep_gemm.utils import per_token_cast_to_fp4, per_token_cast_to_fp8
 from deep_gemm.utils.dist import dist_print, init_dist
 
 
@@ -37,10 +37,18 @@ MODEL_CONFIGS: Dict[str, Dict[str, int]] = {
 }
 
 DEFAULT_BATCHES = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
-PHASE_KERNEL_NAMES = (
-    'sm90_fp8_mega_moe_l1_impl',
-    'sm90_fp8_mega_moe_l2_impl',
-)
+PHASE_KERNEL_NAMES = {
+    'fp8': (
+        'sm90_fp8_mega_moe_l1_impl',
+        'sm90_fp8_mega_moe_l2_impl',
+    ),
+    # The JIT module/cache key carries ``mxfp4``, while both specializations
+    # deliberately retain the same exported CUDA kernel symbols.
+    'mxfp4': (
+        'sm90_fp8_mega_moe_l1_impl',
+        'sm90_fp8_mega_moe_l2_impl',
+    ),
+}
 
 
 def _stable_seed(name: str) -> int:
@@ -74,8 +82,29 @@ def _quantize_grouped_fp8_block_128_128(
     return weights_fp8, scales.contiguous()
 
 
+def _quantize_grouped_mxfp4(
+    weights: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize to Humming-compatible packed E2M1 plus K32 UE8M0 scales."""
+    num_groups, n, k = weights.shape
+    assert k % 32 == 0
+
+    packed = torch.empty(
+        (num_groups, n, k // 2), dtype=torch.int8, device=weights.device,
+    )
+    scales = torch.empty(
+        (num_groups, n, k // 32), dtype=torch.float, device=weights.device,
+    )
+    for group_idx in range(num_groups):
+        packed[group_idx], scales[group_idx] = per_token_cast_to_fp4(
+            weights[group_idx], use_ue8m0=True, gran_k=32,
+        )
+    return packed, scales
+
+
 def _benchmark_case(
     args: argparse.Namespace,
+    implementation: str,
     model_name: str,
     num_tokens: int,
     rank_idx: int,
@@ -135,11 +164,24 @@ def _benchmark_case(
     x_fp8, x_sf = per_token_cast_to_fp8(
         x_bf16, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False,
     )
-    l1_fp8, l1_sf = _quantize_grouped_fp8_block_128_128(l1_bf16)
-    l2_fp8, l2_sf = _quantize_grouped_fp8_block_128_128(l2_bf16)
-    transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe_sm90(
-        (l1_fp8, l1_sf), (l2_fp8, l2_sf),
-    )
+    if implementation == 'mxfp4':
+        l1_quantized, l1_sf = _quantize_grouped_mxfp4(l1_bf16)
+        l2_quantized, l2_sf = _quantize_grouped_mxfp4(l2_bf16)
+        transformed_l1, transformed_l2 = (
+            deep_gemm.transform_weights_for_fp8_mxfp4_mega_moe_sm90(
+                (l1_quantized, l1_sf), (l2_quantized, l2_sf),
+            )
+        )
+        mega_moe = deep_gemm.fp8_mxfp4_mega_moe
+        recipe = (1, 1, 32)
+    else:
+        l1_quantized, l1_sf = _quantize_grouped_fp8_block_128_128(l1_bf16)
+        l2_quantized, l2_sf = _quantize_grouped_fp8_block_128_128(l2_bf16)
+        transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe_sm90(
+            (l1_quantized, l1_sf), (l2_quantized, l2_sf),
+        )
+        mega_moe = deep_gemm.fp8_mega_moe
+        recipe = (128, 128, 128)
     del x_bf16, l1_bf16, l2_bf16, scores
     cumulative_recv_stats = torch.zeros(
         num_experts_per_rank, dtype=torch.int, device='cuda',
@@ -153,13 +195,13 @@ def _benchmark_case(
         buffer.x_sf[:num_tokens].copy_(x_sf)
         buffer.topk_idx[:num_tokens].copy_(topk_idx)
         buffer.topk_weights[:num_tokens].copy_(topk_weights)
-        deep_gemm.fp8_mega_moe(
+        mega_moe(
             y,
             transformed_l1,
             transformed_l2,
             buffer,
             cumulative_local_expert_recv_stats=cumulative_recv_stats,
-            recipe=(128, 128, 128),
+            recipe=recipe,
             activation='swiglu',
             activation_clamp=args.activation_clamp,
             fast_math=bool(args.fast_math),
@@ -168,7 +210,8 @@ def _benchmark_case(
 
     if args.ncu_profile_only:
         dist_print(
-            f'[NCU] model={model_name} M={num_tokens}', once_in_node=True,
+            f'[NCU] implementation={implementation} model={model_name} '
+            f'M={num_tokens}', once_in_node=True,
         )
         run_sm90()
         torch.cuda.synchronize()
@@ -189,7 +232,7 @@ def _benchmark_case(
     for repeat in range(repeats):
         phase_times = bench_kineto(
             run_sm90,
-            PHASE_KERNEL_NAMES,
+            PHASE_KERNEL_NAMES[implementation],
             barrier=lambda: dist.barrier(group=group),
             num_tests=args.num_tests,
             suppress_kineto_output=True,
@@ -202,6 +245,7 @@ def _benchmark_case(
         max_rank_observations.append(max_rank_time.item())
         if rank_idx == 0:
             print('BENCH_OBS_JSON ' + json.dumps({
+                'implementation': implementation,
                 'model': model_name,
                 'm': num_tokens,
                 'repeat': repeat,
@@ -217,13 +261,15 @@ def _benchmark_case(
     if rank_idx == 0:
         median_time = statistics.median(max_rank_observations)
         print(
-            f'[{model_name:5s}] M={num_tokens:4d} obs={repeats:2d} '
+            f'[{implementation:5s}/{model_name:5s}] M={num_tokens:4d} '
+            f'obs={repeats:2d} '
             f'max-rank median={median_time * 1e6:8.1f} us '
             f'range={min(max_rank_observations) * 1e6:.1f}-'
             f'{max(max_rank_observations) * 1e6:.1f} us',
             flush=True,
         )
         print('BENCH_SUMMARY_JSON ' + json.dumps({
+            'implementation': implementation,
             'model': model_name,
             'm': num_tokens,
             'observations': repeats,
@@ -253,22 +299,27 @@ def _benchmark_worker(
         dist.destroy_process_group()
         return
 
+    implementations = args.implementation[:1] if args.ncu_profile_only \
+        else args.implementation
     models = args.model_config[:1] if args.ncu_profile_only else args.model_config
     batches = args.batches[:1] if args.ncu_profile_only else args.batches
-    for model_name in models:
-        model = MODEL_CONFIGS[model_name]
-        dist_print(
-            f'SM90 MegaMoE benchmark: model={model_name} ranks={num_ranks} '
-            f'H={model["hidden"]} IH={model["intermediate_hidden"]} '
-            f'E={model["num_experts"]} topk={model["num_topk"]}',
-            once_in_node=True,
-        )
-        for num_tokens in batches:
-            _benchmark_case(
-                args, model_name, num_tokens, rank_idx, num_ranks, group,
+    for implementation in implementations:
+        for model_name in models:
+            model = MODEL_CONFIGS[model_name]
+            dist_print(
+                f'SM90 MegaMoE benchmark: implementation={implementation} '
+                f'model={model_name} ranks={num_ranks} H={model["hidden"]} '
+                f'IH={model["intermediate_hidden"]} E={model["num_experts"]} '
+                f'topk={model["num_topk"]}',
+                once_in_node=True,
             )
-        torch.cuda.empty_cache()
-        dist.barrier(group=group)
+            for num_tokens in batches:
+                _benchmark_case(
+                    args, implementation, model_name, num_tokens,
+                    rank_idx, num_ranks, group,
+                )
+            torch.cuda.empty_cache()
+            dist.barrier(group=group)
 
     dist.destroy_process_group()
 
@@ -277,6 +328,10 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--num-processes', type=int, default=8)
     parser.add_argument('--local-rank-idx', type=int, default=None)
+    parser.add_argument(
+        '--implementation', nargs='+', choices=sorted(PHASE_KERNEL_NAMES),
+        default=['fp8'],
+    )
     parser.add_argument(
         '--model-config', nargs='+', choices=sorted(MODEL_CONFIGS),
         default=['flash', 'pro'],
