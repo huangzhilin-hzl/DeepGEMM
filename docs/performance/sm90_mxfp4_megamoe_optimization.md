@@ -799,3 +799,59 @@ discarded because the register cap is a controlled confounder: raising it to
 limit, and should remove or sharply reduce spills. The next sub-experiment
 therefore changes only that cap and reruns the same correctness, M128 quick
 gate, and NCU spill checks before considering a full eight-point campaign.
+
+### Follow-up: 168-register frontend
+
+Changing only the processed frontend cap from 64 to 168 registers preserves
+the 54,272-register CTA role budget. Processed L1 smoke and forced requant pass
+at `calc_diff=0.0006` and `0.0005`; Flash and Pro eight-rank M128 L3 both pass
+at `0.0006`. The higher cap removes every local spill reported by NCU and
+recovers most of the reg64 regression, but it remains more than 20% slower than
+accepted Iteration 7.
+
+| Model | Iteration 7 (us) | reg64 (us) | reg168 (us) | reg168 range (us) | reg168 / Iter. 7 | reg168 / reg64 |
+|---|---:|---:|---:|---:|---:|---:|
+| Flash M128 | 1,338.252 | 2,712.259 | 1,628.709 | 1,628.128-1,628.727 | 1.217x | 0.600x |
+| Pro M128 | 4,601.000 | 10,181.000 | 5,646.000 | 5,640-5,688 | 1.227x | 0.555x |
+
+The candidate improves 39.95% and 44.54% over reg64, proving that spilling
+caused most of that variant's regression. It still regresses 21.70% and
+22.71% against Iteration 7, so the full eight-point campaign remains gated.
+
+| NCU metric (Flash M128, one rank, E32) | Iteration 7 L1 | reg168 L1 | Change | Iteration 7 L2 | reg168 L2 | Change |
+|---|---:|---:|---:|---:|---:|---:|
+| Duration | 911.104 us | 1,115.904 us | +22.48% | 473.216 us | 566.784 us | +19.77% |
+| Executed instructions | 128,956,122 | 129,363,240 | +0.32% | 69,289,384 | 69,516,313 | +0.33% |
+| Local-memory spill requests | 0 | 0 | 0 | 0 | 0 | 0 |
+| Achieved occupancy | 9.45% | 12.55% | +3.10 pp | 15.27% | 18.07% | +2.80 pp |
+| Excessive global sectors | 3,692,178 | 3,692,180 | ~0% | 1,835,136 | 1,835,136 | 0% |
+| Excessive shared wavefronts | 71,218 | 71,218 | 0% | 336,384 | 336,384 | 0% |
+
+Instruction volume, cache-access path, and conflict counts are effectively the
+same as Iteration 7, while spill is zero. PC sampling instead identifies the
+new readiness dependency as the critical path. The hottest L1 and L2 PCs are
+the branches immediately following the math warpgroup's
+`SYNCS.PHASECHK.TRANS64.TRYWAIT` on the decoded-ready barrier; they collect
+21,090 and 6,500 long-scoreboard samples respectively.
+
+| PC-sampling share | Iteration 7 L1 | reg168 L1 | Iteration 7 L2 | reg168 L2 |
+|---|---:|---:|---:|---:|
+| Long scoreboard | 27.42% | 58.81% | 16.55% | 34.82% |
+| Barrier | 21.06% | 10.69% | 55.30% | 44.03% |
+| Wait | 16.18% | 10.03% | 8.53% | 6.13% |
+
+| NSYS selected hot path | Iteration 7 | reg168 overlap | Change |
+|---|---:|---:|---:|
+| L1 kernel | 825,700 ns | 1,032,900 ns | +25.09% |
+| L1-to-L2 gap | 126,881 ns | 143,809 ns | +13.34% |
+| L2 kernel | 428,737 ns | 511,073 ns | +19.20% |
+| L1 + gap + L2 | 1,381,318 ns | 1,687,782 ns | +22.19% |
+
+The 168-register two-warp variant is therefore rejected as well. With spills
+removed, two decoder warps still do the work that four math warps performed in
+Iteration 7, and the attempted overlap cannot hide that halved decode
+parallelism. The next controlled implementation keeps the stage pipeline but
+has both TMA producer warps join the two idle warps after issuing A and B,
+giving all four frontend warps one 32-row quadrant. The decoded-ready barrier
+then expects four arrivals. This restores the accepted decoder width while
+retaining the possibility of overlapping the next stage with current WGMMA.

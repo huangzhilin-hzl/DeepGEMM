@@ -640,7 +640,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr uint32_t kNumDispatchRegisters    = kNumEpilogueThreads == 512 ? 32 : 48;
     constexpr bool kCompactFrontendWarpgroup = (kNumDispatchWarps == 2 and kNumMMANonEpilogueWarps == 2);
     constexpr uint32_t kNumNonEpilogueRegisters = kNumEpilogueThreads == 512 ? 24 :
-        (kProcessedMXFP4Scales ? 64 :
+        (kProcessedMXFP4Scales ? 168 :
             (kCompactFrontendWarpgroup ? kNumDispatchRegisters : 40));
     constexpr uint32_t kNumEpilogueRegisters    =
         kNumEpilogueThreads == 512 ? 112 : 208;
