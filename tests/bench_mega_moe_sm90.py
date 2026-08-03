@@ -114,7 +114,7 @@ def _benchmark_case(
     model = MODEL_CONFIGS[model_name]
     hidden = model['hidden']
     intermediate_hidden = model['intermediate_hidden']
-    num_experts = model['num_experts']
+    num_experts = args.num_experts_override or model['num_experts']
     num_topk = model['num_topk']
     num_experts_per_rank = num_experts // num_ranks
     assert num_experts % num_ranks == 0
@@ -168,7 +168,7 @@ def _benchmark_case(
         l1_quantized, l1_sf = _quantize_grouped_mxfp4(l1_bf16)
         l2_quantized, l2_sf = _quantize_grouped_mxfp4(l2_bf16)
         transformed_l1, transformed_l2 = (
-            deep_gemm.transform_weights_for_fp8_mxfp4_mega_moe_sm90(
+            deep_gemm.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
                 (l1_quantized, l1_sf), (l2_quantized, l2_sf),
             )
         )
@@ -306,10 +306,11 @@ def _benchmark_worker(
     for implementation in implementations:
         for model_name in models:
             model = MODEL_CONFIGS[model_name]
+            num_experts = args.num_experts_override or model['num_experts']
             dist_print(
                 f'SM90 MegaMoE benchmark: implementation={implementation} '
                 f'model={model_name} ranks={num_ranks} H={model["hidden"]} '
-                f'IH={model["intermediate_hidden"]} E={model["num_experts"]} '
+                f'IH={model["intermediate_hidden"]} E={num_experts} '
                 f'topk={model["num_topk"]}',
                 once_in_node=True,
             )
@@ -338,6 +339,10 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument('--batches', type=int, nargs='+', default=DEFAULT_BATCHES)
     parser.add_argument('--num-max-tokens-per-rank', type=int, default=8192)
+    parser.add_argument(
+        '--num-experts-override', type=int, default=None,
+        help='Override the model expert count for isolated profiler runs.',
+    )
     parser.add_argument('--small-repeats', type=int, default=50)
     parser.add_argument('--large-repeats', type=int, default=3)
     parser.add_argument(
@@ -353,6 +358,7 @@ def _parse_args() -> argparse.Namespace:
     args = parser.parse_args()
 
     assert args.num_processes > 0
+    assert args.num_experts_override is None or args.num_experts_override > 0
     assert args.batches and min(args.batches) >= 0
     assert args.num_max_tokens_per_rank >= max(args.batches)
     assert args.small_repeats > 0 and args.large_repeats > 0

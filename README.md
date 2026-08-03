@@ -178,9 +178,9 @@ powers of two. Packed weights are moved as ordinary bytes, so this path keeps
 the same CUDA 12.3 baseline as the existing SM90 implementation. Activations
 and the symmetric buffer use the same FP8/FP32-scale contract as the SM90 FP8
 path above. Only pre-transform checkpoint tensors in natural K-packed layout
-are accepted. No output of Humming's `transform_humming_tensors` is accepted:
-both its regular repacked layout and fused exponent-offset representation are
-different kernel contracts.
+are accepted. DeepGEMM can either retain the raw UE8M0 representation or apply
+a compatible Humming fused-E8M0 preprocessing step before steady-state
+inference.
 
 ```python
 transformed_l1, transformed_l2 = \
@@ -202,6 +202,24 @@ packed `int8` type. UE8M0 scale tensors are contiguous `uint8` with shapes
 the L1 packed rows and their per-channel scale rows for the fused SwiGLU
 epilogue. Run the MXFP4 distributed correctness plan with
 `python tests/test_mega_moe_sm90.py --weight-format mxfp4`.
+
+For the optimized Humming fused-E8M0 contract, use the explicit transform:
+
+```python
+transformed_l1, transformed_l2 = \
+    deep_gemm.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
+        (l1_weight_packed_e2m1, l1_weight_ue8m0),
+        (l2_weight_packed_e2m1, l2_weight_ue8m0),
+    )
+```
+
+It returns `(rewritten_weight, exponent_offset, secondary_scale)` triples.
+Offsets are bounded to `[1, 12]`, and the FP32 secondary scale has shape `[E]`.
+Optional per-expert Humming `weight_scale_2` tensors can be passed through
+`l1_global_scale` and `l2_global_scale`. Per-channel secondary scales,
+exponent deltas of 128 or larger, and already-repacked Humming kernel layouts
+are not accepted; those inputs must use the raw pair contract. Weight
+transform time is outside the MegaMoE steady-state kernel timing contract.
 
 #### Utilities
 

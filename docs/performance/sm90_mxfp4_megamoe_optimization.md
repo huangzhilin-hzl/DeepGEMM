@@ -178,3 +178,103 @@ The remaining 4-6x end-to-end gap cannot be closed by further decoder cleanup
 alone.  The next iteration must fold bounded UE8M0 exponent offsets into the
 FP8 B operand and reduce or remove the four K32 `warpgroup_wait<0>` plus
 per-accumulator promotion sequences.
+
+## Iteration 3: fuse bounded E8M0 exponents and group WGMMA promotion
+
+### Hypothesis and implementation
+
+Humming's fused-E8M0 preprocessing bounds each expert's residual exponent
+range to 11. The offline transform now rewrites packed E2M1 values below the
+retained exponent window and returns three tensors per layer:
+
+- packed E2M1 weights, with L1 written directly into the gate/up-interleaved
+  layout;
+- K32 exponent offsets in `[1, 12]`; and
+- one FP32 secondary scale per expert.
+
+The SM90 decoder folds each offset into the expanded E4M3 operand. L1 can then
+issue all four K32 WGMMAs in one group and promote once because its activation
+scale is K128. L2 uses two groups of two WGMMAs because its activation scale is
+K64. The raw UE8M0 pair API remains available as a separately JIT-cached
+fallback. The optimized triple API is explicit, so the existing transform's
+pair return contract is unchanged.
+
+The implementation also preserves Humming's negative-zero result, applies the
+fixed E2M1-to-E4M3 factor before it can underflow at UE8M0 codes 0/1, accepts an
+optional per-expert `weight_scale_2`, rejects NaN and exponent deltas at or
+above 128, and removes the full-size `torch.stack` temporary from L1 row
+interleave.
+
+### Correctness
+
+All runs used a rebuilt host extension and a new device JIT cache. The
+processed-weight reference reconstructs effective scales as
+`secondary * 2**offset`; the forced-requant case uses exponent spread 12 so it
+cannot pass without executing the payload rewrite.
+
+| Scenario | Scale representation | `calc_diff` | Tolerance | Result |
+|---|---|---:|---:|---|
+| L1 smoke, one rank | processed triple | 0.0006 | 0.01 | PASS |
+| L1 forced requant, one rank | processed triple | 0.0005 | 0.01 | PASS |
+| L1 smoke, one rank | raw pair fallback | 0.0006 | 0.01 | PASS |
+| Flash M128, eight ranks | processed triple | 0.0006 | 0.01 | PASS |
+| Pro M128, eight ranks | processed triple | 0.0006 | 0.01 | PASS |
+
+The format golden separately covers all 16 E2M1 nibbles for deltas 0 through
+5, negative-zero normalization and regeneration, offsets and secondary scales,
+optional per-expert global scales, raw endpoint handling, and explicit
+rejection of UE8M0 code 255 and delta 128 or larger.
+
+### NCU and NSYS attribution
+
+The profiler contract remains single-rank Flash M128 with 32 experts. The
+Iteration 3 JIT specialization is identified by
+`kMXFP4Weights=true, kProcessedMXFP4Scales=true` in the kernel template.
+
+| Metric | Iteration 2 L1 | Iteration 3 L1 | Change | Iteration 2 L2 | Iteration 3 L2 | Change |
+|---|---:|---:|---:|---:|---:|---:|
+| NCU duration | 1.37 ms | 1.05 ms | -23.4% | 698.40 us | 551.71 us | -21.0% |
+| Executed instructions | 271,825,794 | 119,122,618 | -56.2% | 137,326,082 | 65,200,638 | -52.5% |
+| Memory throughput | 20.47% | 40.09% | +19.62 pp | 19.55% | 38.61% | +19.06 pp |
+| Achieved occupancy | 9.41% | 9.42% | +0.01 pp | 15.25% | 15.26% | +0.01 pp |
+
+| NSYS selected hot path | Iteration 2 | Iteration 3 | Change |
+|---|---:|---:|---:|
+| L1 kernel | 1,241,382 ns | 970,148 ns | -21.8% |
+| L1-to-L2 gap | 143,424 ns | 107,968 ns | -24.7% |
+| L2 kernel | 638,307 ns | 509,282 ns | -20.2% |
+
+Instruction removal is substantially larger than latency reduction because the
+kernel is now latency- and synchronization-limited: only about 24% of scheduler
+cycles have an eligible warp. L1 spends about 34.7% of its issue interval on
+long-scoreboard dependencies; L2 spends about 51.3% waiting at CTA barriers.
+
+### Eight-rank performance
+
+The command contract is unchanged: three observations, 20 Kineto tests per
+observation, maximum rank time, no masked routes, and transform excluded from
+steady-state timing.
+
+| Model | M | FP8 (us) | MXFP4 iter. 2 (us) | MXFP4 iter. 3 (us) | Iteration gain | Iter. 3 / FP8 |
+|---|---:|---:|---:|---:|---:|---:|
+| Flash | 8 | 311.8 | 1,761.0 | 1,297.4 | 26.3% | 4.16x |
+| Flash | 128 | 461.7 | 1,943.1 | 1,550.6 | 20.2% | 3.36x |
+| Flash | 512 | 947.6 | 3,707.0 | 2,902.7 | 21.7% | 3.06x |
+| Flash | 8192 | 9,871.0 | 44,219.0 | 33,580.0 | 24.1% | 3.40x |
+| Pro | 8 | 719.4 | 4,448.0 | 3,364.0 | 24.4% | 4.68x |
+| Pro | 128 | 1,238.7 | 7,074.0 | 5,334.0 | 24.6% | 4.31x |
+| Pro | 512 | 2,433.0 | 10,744.0 | 8,071.0 | 24.9% | 3.32x |
+| Pro | 8192 | 25,138.0 | 114,895.0 | 84,934.0 | 26.1% | 3.38x |
+
+### Remaining bottleneck and next direction
+
+Iteration 3 is consistently faster but does not yet beat FP8. SourceCounters
+identify the next concrete target: the processed offset tensor still uses
+natural `[E,N,K/32]` layout. A warp therefore loads one four-byte offset word
+per N row with a 128-byte L1 stride or 224-byte L2 stride. The dominant L1
+`LDG` produces 3,670,016 excessive L2 sectors; L2 produces 1,835,008.
+
+The next iteration will preprocess offsets into a kernel-specific
+`[E,K_block,N,4]` blocked layout. For each BK128 tile, the same 128 threads can
+then issue one contiguous, coalesced 32-bit load each while retaining the
+one-row-per-thread decoder and avoiding an additional shared-memory barrier.

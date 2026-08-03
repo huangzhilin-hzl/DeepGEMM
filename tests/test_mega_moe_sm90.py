@@ -109,9 +109,20 @@ def _dequant_mxfp4(packed: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
             sf.unsqueeze(-1)).view(*prefix, n, k)
 
 
+def _deinterleave_weights(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
+    """Restore natural ``[gate | up]`` rows from the SM90 SwiGLU layout."""
+    g, n, *rest = t.shape
+    half = n // 2
+    interleaved = t.view(g, half // gran, 2, gran, *rest)
+    out = torch.empty_like(t)
+    out[:, :half].copy_(interleaved[:, :, 0].reshape(g, half, *rest))
+    out[:, half:].copy_(interleaved[:, :, 1].reshape(g, half, *rest))
+    return out
+
+
 def _check_mxfp4_format_contract(device: torch.device) -> None:
     """Check raw Humming bytes, nibble order, and UE8M0 endpoint semantics."""
-    from deep_gemm.mega import _normalize_mxfp4_ue8m0
+    from deep_gemm.mega import _normalize_mxfp4_ue8m0, _process_mxfp4_fused_e8m0
 
     # Low nibble is the even-K value and high nibble is the odd-K value.
     golden_bytes = torch.tensor(
@@ -148,6 +159,69 @@ def _check_mxfp4_format_contract(device: torch.device) -> None:
     assert torch.equal(l1_sf, l1_sf_raw[:, l1_order])
     assert torch.equal(l2_w.view(torch.uint8), l2_raw)
     assert torch.equal(l2_sf, l2_sf_raw)
+
+    # The fused-E8M0 preprocessing follows Humming's exact E2M1 requantizer.
+    # A 16-code row exercises both signs, negative-zero normalization, and all
+    # rounding boundaries for exponent deltas 0..5.
+    packed_codes = torch.tensor(
+        [0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe] * 2,
+        dtype=torch.uint8, device=device)
+    processed_input = packed_codes.repeat(7, 1).reshape(1, 7, 16)
+    processed_sf = torch.tensor(
+        [109, 108, 107, 106, 105, 104, 120],
+        dtype=torch.uint8, device=device).reshape(1, 7, 1)
+    processed_w, processed_offsets, processed_secondary = \
+        _process_mxfp4_fused_e8m0(processed_input, processed_sf)
+    expected_rows = torch.tensor([
+        [0x10, 0x32, 0x54, 0x76, 0x90, 0xba, 0xdc, 0xfe],
+        [0x10, 0x21, 0x32, 0x54, 0x90, 0xa9, 0xba, 0xdc],
+        [0x00, 0x11, 0x21, 0x32, 0x80, 0x99, 0xa9, 0xba],
+        [0x00, 0x00, 0x11, 0x21, 0x80, 0x88, 0x99, 0xa9],
+        [0x00, 0x00, 0x00, 0x11, 0x80, 0x88, 0x88, 0x99],
+        [0x00, 0x00, 0x00, 0x00, 0x80, 0x88, 0x88, 0x88],
+        [0x10, 0x32, 0x54, 0x76, 0x90, 0xba, 0xdc, 0xfe],
+    ], dtype=torch.uint8, device=device).repeat(1, 2)
+    assert torch.equal(processed_w.view(torch.uint8)[0], expected_rows)
+    assert torch.equal(
+        processed_offsets,
+        torch.tensor([1, 1, 1, 1, 1, 1, 12], dtype=torch.uint8,
+                     device=device).reshape(1, 7, 1))
+    assert torch.equal(
+        processed_secondary,
+        torch.tensor([2.0 ** -19], dtype=torch.float32, device=device))
+    try:
+        _process_mxfp4_fused_e8m0(
+            processed_input[:, :1],
+            torch.full((1, 1, 1), 255, dtype=torch.uint8, device=device))
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError('fused E8M0 processing accepted NaN scale code 255')
+    try:
+        _process_mxfp4_fused_e8m0(
+            processed_input[:, :2],
+            torch.tensor([0, 254], dtype=torch.uint8, device=device).reshape(1, 2, 1))
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError('fused E8M0 processing accepted exponent delta >= 128')
+
+    # The explicit fused transform accepts Humming's optional per-expert
+    # weight_scale_2 and applies L1 row interleave without a full-size stack.
+    fused_l1_input = packed_codes.repeat(16, 1).reshape(1, 16, 16)
+    fused_l1_sf = torch.tensor(
+        [109] * 15 + [120], dtype=torch.uint8, device=device).reshape(1, 16, 1)
+    fused_l1, fused_l2 = \
+        deep_gemm.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
+            (fused_l1_input, fused_l1_sf),
+            (processed_input, processed_sf),
+            l1_global_scale=torch.tensor([2.0], device=device),
+            l2_global_scale=torch.tensor([3.0], device=device))
+    assert len(fused_l1) == 3 and len(fused_l2) == 3
+    assert torch.equal(
+        fused_l1[2], torch.tensor([2.0 ** -18], device=device))
+    assert torch.equal(
+        fused_l2[2], torch.tensor([3.0 * 2.0 ** -19], device=device))
 
     # FP32 input supports every finite UE8M0 power of two, including the
     # subnormal 2^-127 endpoint, but rejects zero and infinity.
@@ -347,6 +421,8 @@ def _run_scenario(
     activation_clamp = cfg.get('activation_clamp', 10.0)
     fast_math = cfg.get('fast_math', True)
     weight_format = cfg.get('weight_format', 'fp8')
+    mxfp4_scale_mode = cfg.get('mxfp4_scale_mode', 'processed')
+    force_mxfp4_requant = cfg.get('force_mxfp4_requant', False)
 
     assert num_experts % num_ranks == 0, f'{name}: experts {num_experts} not divisible by ranks {num_ranks}'
     num_experts_per_rank = num_experts // num_ranks
@@ -384,6 +460,16 @@ def _run_scenario(
     if weight_format == 'mxfp4':
         l1_w_fp8, l1_w_sf = _quantize_grouped_mxfp4(l1_bf)
         l2_w_fp8, l2_w_sf = _quantize_grouped_mxfp4(l2_bf)
+        if force_mxfp4_requant:
+            assert mxfp4_scale_mode == 'processed'
+            # Force exponent spread 12 so code 115 is clamped to base 116
+            # and its packed payload is actually requantized (delta=1).
+            l1_codes = torch.arange(
+                l1_w_sf.numel(), dtype=torch.int64, device='cuda').reshape_as(l1_w_sf)
+            l2_codes = torch.arange(
+                l2_w_sf.numel(), dtype=torch.int64, device='cuda').reshape_as(l2_w_sf)
+            l1_w_sf = torch.exp2((l1_codes % 13 + 115).float() - 127.0)
+            l2_w_sf = torch.exp2((l2_codes % 13 + 115).float() - 127.0)
     else:
         # Block (128, 128), matching DeepSeekV4FlashFp8 / DeepEP.
         l1_w_fp8, l1_w_sf = _quantize_grouped_fp8_block_128_128(l1_bf)
@@ -391,12 +477,30 @@ def _run_scenario(
 
     _trace('weight_transform')
     if weight_format == 'mxfp4':
-        transformed_l1, transformed_l2 = \
-            deep_gemm.transform_weights_for_fp8_mxfp4_mega_moe_sm90(
-                (l1_w_fp8, l1_w_sf), (l2_w_fp8, l2_w_sf))
+        transform = deep_gemm.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90 \
+            if mxfp4_scale_mode == 'processed' \
+            else deep_gemm.transform_weights_for_fp8_mxfp4_mega_moe_sm90
+        transformed_l1, transformed_l2 = transform(
+            (l1_w_fp8, l1_w_sf), (l2_w_fp8, l2_w_sf))
     else:
         transformed_l1, transformed_l2 = deep_gemm.transform_weights_for_mega_moe_sm90(
             (l1_w_fp8, l1_w_sf), (l2_w_fp8, l2_w_sf))
+
+    reference_l1_w, reference_l1_sf = l1_w_fp8, l1_w_sf
+    reference_l2_w, reference_l2_sf = l2_w_fp8, l2_w_sf
+    if weight_format == 'mxfp4' and mxfp4_scale_mode == 'processed':
+        l1_processed_w, l1_offsets, l1_secondary = transformed_l1
+        l2_processed_w, l2_offsets, l2_secondary = transformed_l2
+        reference_l1_w = _deinterleave_weights(l1_processed_w)
+        reference_l1_sf = (
+            l1_secondary[:, None, None] *
+            torch.exp2(_deinterleave_weights(l1_offsets).float()))
+        reference_l2_w = l2_processed_w
+        reference_l2_sf = (
+            l2_secondary[:, None, None] * torch.exp2(l2_offsets.float()))
+        if force_mxfp4_requant:
+            assert (reference_l1_w != l1_w_fp8).any()
+            assert (reference_l2_w != l2_w_fp8).any()
 
     # ---- Allocate symm buffer -----------------------------------------------
     _trace('alloc_symm_buffer')
@@ -437,7 +541,7 @@ def _run_scenario(
     _trace('reference')
     y_ref = _reference_fused(
         x_fp8, x_sf, topk_idx, topk_w,
-        l1_w_fp8, l1_w_sf, l2_w_fp8, l2_w_sf,
+        reference_l1_w, reference_l1_sf, reference_l2_w, reference_l2_sf,
         rank_idx, num_ranks, group,
         num_experts, num_topk,
         hidden, intermediate_hidden,
@@ -450,7 +554,9 @@ def _run_scenario(
     failed = torch.tensor([not ok], dtype=torch.int, device='cuda')
     dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=group)
     any_rank_failed = bool(failed.item())
-    dist_print(f'  [{name:<32}] format={weight_format:<6} diff={diff:.4f} '
+    format_label = f'{weight_format}/{mxfp4_scale_mode}' \
+        if weight_format == 'mxfp4' else weight_format
+    dist_print(f'  [{name:<32}] format={format_label:<16} diff={diff:.4f} '
                f'(tol={diff_tol:.2f}) {"OK" if not any_rank_failed else "FAIL"}',
                once_in_node=True)
 
@@ -476,6 +582,12 @@ _SMOKE = dict(
 
 def _layer1_smoke() -> List[Tuple[str, Dict[str, Any]]]:
     return [('L1.smoke', dict(_SMOKE))]
+
+
+def _layer1_mxfp4_requant() -> List[Tuple[str, Dict[str, Any]]]:
+    cfg = dict(_SMOKE)
+    cfg['force_mxfp4_requant'] = True
+    return [('L1.mxfp4_requant', cfg)]
 
 
 def _layer2_heuristic_branches(num_ranks: int) -> List[Tuple[str, Dict[str, Any]]]:
@@ -609,6 +721,8 @@ def _test_worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace
 
     if 1 in args.layers:
         layers += _layer1_smoke()
+        if args.weight_format == 'mxfp4' and args.mxfp4_scale_mode == 'processed':
+            layers += _layer1_mxfp4_requant()
     if 2 in args.layers:
         layers += _layer2_heuristic_branches(num_ranks)
     if 3 in args.layers:
@@ -622,6 +736,7 @@ def _test_worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace
         layers = [(n, c) for n, c in layers if args.filter in n]
     for _, cfg in layers:
         cfg['weight_format'] = args.weight_format
+        cfg['mxfp4_scale_mode'] = args.mxfp4_scale_mode
 
     dist_print(f'SM90 MegaMoE test plan: {len(layers)} scenarios across '
                f'layers {sorted(args.layers)} on {num_ranks} ranks',
@@ -665,6 +780,9 @@ if __name__ == '__main__':
                         help='calc_diff tolerance (default: 0.01)')
     parser.add_argument('--weight-format', choices=('fp8', 'mxfp4'), default='fp8',
                         help='SM90 weight path to test (default: fp8)')
+    parser.add_argument('--mxfp4-scale-mode', choices=('processed', 'raw'),
+                        default='processed',
+                        help='MXFP4 scale representation (default: processed)')
     parser.add_argument('--fail-fast', action='store_true',
                         help='Stop on first failing scenario')
     args = parser.parse_args()

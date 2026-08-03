@@ -77,15 +77,18 @@ CUTLASS_DEVICE uint8_t sm90_mxfp4_e2m1_to_e4m3_bits(const uint8_t code) {
 // Each SIMD lane below is one byte.  The magnitude identity for E2M1 codes
 // 2..7 is `0x30 + code * 4`; codes 0 and 1 need the two masks.  PRMT then
 // interleaves the low/high nibbles back into logical K order.
-CUTLASS_DEVICE uint2 sm90_mxfp4_e2m1x8_to_e4m3x8_bits(const uint32_t packed) {
-    const auto decode_x4 = [](const uint32_t& codes) {
+CUTLASS_DEVICE uint2 sm90_mxfp4_e2m1x8_to_e4m3x8_bits(
+    const uint32_t packed, const uint32_t exponent_offset = 6u) {
+    const auto decode_x4 = [&](const uint32_t& codes) {
         const uint32_t values = codes & 0x07070707u;
         const uint32_t is_zero = __vcmpeq4(values, 0u);
         const uint32_t is_one = __vcmpeq4(values, 0x01010101u);
-        uint32_t result = (values << 2u) + 0x30303030u;
+        uint32_t result = (values << 2u) + exponent_offset * 0x08080808u;
         result -= is_one & 0x04040404u;
         result |= (codes & 0x08080808u) << 4u;
-        return result & ~is_zero;
+        // Preserve a negative-zero sign produced by Humming's requantizer.
+        // Only exponent/mantissa bits are cleared for a zero magnitude.
+        return result & (~is_zero | 0x80808080u);
     };
 
     const uint32_t even_k = decode_x4(packed);
@@ -222,7 +225,8 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     bool kFastMath, \
     bool kFP8SwapAB = false, \
     bool kBF16ScaledAccumRequested = false, \
-    bool kMXFP4Weights = false
+    bool kMXFP4Weights = false, \
+    bool kProcessedMXFP4Scales = false
 
 #define DG_SM90_FP8_MOE_KERNEL_ARGS_DECL \
     void* y, \
@@ -271,7 +275,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     kNumPaddedSFPoolTokens, kSFPoolStrideTokens, kNumStages, kNumDispatchThreads, \
     kNumNonEpilogueThreads, kNumEpilogueThreads, kNumSMs, kNumRanks, \
     kActivationClamp, kFastMath, kFP8SwapAB, kBF16ScaledAccumRequested, \
-    kMXFP4Weights
+    kMXFP4Weights, kProcessedMXFP4Scales
 
 template <typename MegaMoEPhase, DG_SM90_FP8_MOE_TEMPLATE_PARAMS>
 CUTLASS_DEVICE void
@@ -315,6 +319,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                      "MXFP4 does not use the FP8 swap-AB schedule");
     DG_STATIC_ASSERT(not kMXFP4Weights or not kBF16ScaledAccumRequested,
                      "MXFP4 K32 promotion requires FP32 scaled accumulation");
+    DG_STATIC_ASSERT(not kProcessedMXFP4Scales or kMXFP4Weights,
+                     "Processed MXFP4 scales require packed MXFP4 weights");
 
     // =====================================================================
     // Thread / warp identification
@@ -1171,7 +1177,10 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
 
                         // K32 scale groups are contiguous, so each math-WG
                         // thread moves all four scales for one output column
-                        // with a single 32-bit global load/store pair.
+                        // with a single 32-bit global load. Processed weights
+                        // consume those bytes as bounded E4M3 exponent offsets
+                        // while decoding the same row; the raw fallback stages
+                        // them for the per-K32 accumulator promotion below.
                         const uint32_t local_n = wg_thread_idx;
                         const uint32_t global_n = n_idx + local_n;
                         const uint32_t weight_sf_k =
@@ -1179,30 +1188,50 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         const uint32_t scale_word = __ldg(
                             reinterpret_cast<const uint32_t*>(
                                 sf_base + global_n * weight_sf_stride_k + weight_sf_k));
-                        ptx::st_shared(
-                            reinterpret_cast<uint32_t*>(smem_sfb) +
-                                (wg_n_idx + local_n),
-                            scale_word);
-
                         const auto* packed_words =
                             reinterpret_cast<const uint32_t*>(packed);
-                        #pragma unroll
-                        for (uint32_t packed_word_idx = wg_thread_idx;
-                             packed_word_idx < kPackedWordsPerWG;
-                             packed_word_idx += kWGThreads) {
-                            const uint2 decoded =
-                                sm90_mxfp4_e2m1x8_to_e4m3x8_bits(
-                                    packed_words[packed_word_idx]);
-                            const uint32_t local_n =
-                                packed_word_idx / (BLOCK_K / 8);
-                            const uint32_t packed_k =
-                                packed_word_idx % (BLOCK_K / 8);
-                            const uint32_t logical_n = wg_n_idx + local_n;
-                            const uint32_t logical_k0 = packed_k * 8;
-                            const uint32_t flat0 = logical_n * BLOCK_K + logical_k0;
-                            const uint32_t swizzled0 = cute::Swizzle<3, 4, 3>::apply(flat0);
+                        if constexpr (kProcessedMXFP4Scales) {
+                            DG_STATIC_ASSERT(WG_BLOCK_N == kWGThreads,
+                                             "Processed MXFP4 assigns one N row per WG thread");
+                            #pragma unroll
+                            for (uint32_t packed_k = 0;
+                                 packed_k < BLOCK_K / 8; ++ packed_k) {
+                                const uint32_t exponent_offset =
+                                    (scale_word >> ((packed_k / 4u) * 8u)) & 0xffu;
+                                const uint2 decoded =
+                                    sm90_mxfp4_e2m1x8_to_e4m3x8_bits(
+                                        packed_words[local_n * (BLOCK_K / 8) + packed_k],
+                                        exponent_offset);
+                                const uint32_t logical_n = wg_n_idx + local_n;
+                                const uint32_t logical_k0 = packed_k * 8;
+                                const uint32_t flat0 = logical_n * BLOCK_K + logical_k0;
+                                const uint32_t swizzled0 = cute::Swizzle<3, 4, 3>::apply(flat0);
+                                ptx::st_shared(
+                                    expanded + swizzled0, decoded.x, decoded.y);
+                            }
+                        } else {
                             ptx::st_shared(
-                                expanded + swizzled0, decoded.x, decoded.y);
+                                reinterpret_cast<uint32_t*>(smem_sfb) +
+                                    (wg_n_idx + local_n),
+                                scale_word);
+                            #pragma unroll
+                            for (uint32_t packed_word_idx = wg_thread_idx;
+                                 packed_word_idx < kPackedWordsPerWG;
+                                 packed_word_idx += kWGThreads) {
+                                const uint2 decoded =
+                                    sm90_mxfp4_e2m1x8_to_e4m3x8_bits(
+                                        packed_words[packed_word_idx]);
+                                const uint32_t decoded_local_n =
+                                    packed_word_idx / (BLOCK_K / 8);
+                                const uint32_t packed_k =
+                                    packed_word_idx % (BLOCK_K / 8);
+                                const uint32_t logical_n = wg_n_idx + decoded_local_n;
+                                const uint32_t logical_k0 = packed_k * 8;
+                                const uint32_t flat0 = logical_n * BLOCK_K + logical_k0;
+                                const uint32_t swizzled0 = cute::Swizzle<3, 4, 3>::apply(flat0);
+                                ptx::st_shared(
+                                    expanded + swizzled0, decoded.x, decoded.y);
+                            }
                         }
                         ptx::sync_aligned(
                             kWGThreads, kEpilogueWGBarrierStartIdx + epilogue_wg_idx);
@@ -1243,31 +1272,111 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         }
                     };
 
-                    for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks;
-                         advance_pipeline(k_block_idx)) {
-                        full_barriers[stage_idx]->wait(phase);
-                        prepare_stage_weights(k_block_idx);
-
+                    const auto issue_processed_wgmma = [&]<uint32_t kStartK32,
+                                                           uint32_t kNumWGMMAs>() {
                         #pragma unroll
-                        for (uint32_t k32_idx = 0;
-                             k32_idx < BLOCK_K / kWeightGranK; ++ k32_idx) {
-                            #pragma unroll
-                            for (uint32_t i = 0; i < kAccumPerThread; ++ i)
-                                ptx::warpgroup_fence_operand(accum[i]);
-                            ptx::warpgroup_arrive();
+                        for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                            ptx::warpgroup_fence_operand(accum[i]);
+                        ptx::warpgroup_arrive();
+                        #pragma unroll
+                        for (uint32_t k = 0; k < kNumWGMMAs; ++ k) {
+                            const uint32_t k32_idx = kStartK32 + k;
                             auto desc_a = mma::sm90::make_smem_desc(
                                 smem_a[stage_idx] + row_block_offset * BLOCK_K +
                                     k32_idx * kWeightGranK, 1);
                             auto desc_b = mma::sm90::make_smem_desc(
                                 smem_b[stage_idx] + wg_n_idx * BLOCK_K +
                                     k32_idx * kWeightGranK, 1);
-                            WGMMA::wgmma(desc_a, desc_b, accum, false);
-                            ptx::warpgroup_commit_batch();
+                            WGMMA::wgmma(desc_a, desc_b, accum, k != 0);
+                        }
+                        ptx::warpgroup_commit_batch();
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                            ptx::warpgroup_fence_operand(accum[i]);
+                        ptx::warpgroup_wait<0>();
+                    };
+
+                    const auto promote_processed = [&](const uint32_t& activation_sf_group,
+                                                       const float& secondary) {
+                        const float scale_a_0 = ptx::ld_shared(
+                            smem_sfa[stage_idx] +
+                                activation_sf_group * kL2SFAHalfStride +
+                                row_offset_r0);
+                        const float scale_a_1 = ptx::ld_shared(
+                            smem_sfa[stage_idx] +
+                                activation_sf_group * kL2SFAHalfStride +
+                                row_offset_r1);
+                        // Applying the E2M1-to-E4M3 bias correction after
+                        // scale_a * secondary can underflow for valid UE8M0
+                        // codes 0/1. Apply x64 to the secondary first except
+                        // at the high endpoint where that product would
+                        // overflow; the branch is uniform for the expert.
+                        constexpr float kMaxSecondaryBeforeX64 = 0x1p121f;
+                        const bool compensate_secondary =
+                            secondary <= kMaxSecondaryBeforeX64;
+                        const float compensated_secondary =
+                            compensate_secondary ? secondary * 64.0f : secondary;
+                        const float compensated_scale_a_0 =
+                            compensate_secondary ? scale_a_0 : scale_a_0 * 64.0f;
+                        const float compensated_scale_a_1 =
+                            compensate_secondary ? scale_a_1 : scale_a_1 * 64.0f;
+                        const float combined_scale_0 =
+                            compensated_scale_a_0 * compensated_secondary;
+                        const float combined_scale_1 =
+                            compensated_scale_a_1 * compensated_secondary;
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
+                            final_accum[i * 4 + 0] +=
+                                combined_scale_0 * accum[i * 4 + 0];
+                            final_accum[i * 4 + 1] +=
+                                combined_scale_0 * accum[i * 4 + 1];
+                            final_accum[i * 4 + 2] +=
+                                combined_scale_1 * accum[i * 4 + 2];
+                            final_accum[i * 4 + 3] +=
+                                combined_scale_1 * accum[i * 4 + 3];
+                        }
+                    };
+
+                    const float processed_secondary = kProcessedMXFP4Scales ?
+                        __ldg((is_linear1_phase ? l1_weights_sf : l2_weights_sf) +
+                              local_expert_idx) : 0.0f;
+                    for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks;
+                         advance_pipeline(k_block_idx)) {
+                        full_barriers[stage_idx]->wait(phase);
+                        prepare_stage_weights(k_block_idx);
+
+                        if constexpr (kProcessedMXFP4Scales) {
+                            if constexpr (is_linear1_phase) {
+                                issue_processed_wgmma.template operator()<0, 4>();
+                                promote_processed(0, processed_secondary);
+                            } else {
+                                issue_processed_wgmma.template operator()<0, 2>();
+                                promote_processed(0, processed_secondary);
+                                issue_processed_wgmma.template operator()<2, 2>();
+                                promote_processed(1, processed_secondary);
+                            }
+                        } else {
                             #pragma unroll
-                            for (uint32_t i = 0; i < kAccumPerThread; ++ i)
-                                ptx::warpgroup_fence_operand(accum[i]);
-                            ptx::warpgroup_wait<0>();
-                            promote_k32(k_block_idx, k32_idx);
+                            for (uint32_t k32_idx = 0;
+                                 k32_idx < BLOCK_K / kWeightGranK; ++ k32_idx) {
+                                #pragma unroll
+                                for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                                    ptx::warpgroup_fence_operand(accum[i]);
+                                ptx::warpgroup_arrive();
+                                auto desc_a = mma::sm90::make_smem_desc(
+                                    smem_a[stage_idx] + row_block_offset * BLOCK_K +
+                                        k32_idx * kWeightGranK, 1);
+                                auto desc_b = mma::sm90::make_smem_desc(
+                                    smem_b[stage_idx] + wg_n_idx * BLOCK_K +
+                                        k32_idx * kWeightGranK, 1);
+                                WGMMA::wgmma(desc_a, desc_b, accum, false);
+                                ptx::warpgroup_commit_batch();
+                                #pragma unroll
+                                for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                                    ptx::warpgroup_fence_operand(accum[i]);
+                                ptx::warpgroup_wait<0>();
+                                promote_k32(k_block_idx, k32_idx);
+                            }
                         }
                         arrive_empty_barrier(stage_idx);
                     }

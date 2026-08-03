@@ -48,6 +48,7 @@ public:
         bool fast_math;
         bool bf16_scaled_accum;
         bool mxfp4_weights;
+        bool processed_mxfp4_scales;
         KernelPhase kernel_phase;
         MegaMoESM90Config config;
 
@@ -106,6 +107,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}{}
     >);
 }};
@@ -127,6 +129,7 @@ static void __instantiate_kernel() {{
     args.config.swap_ab ? "true" : "false",
     args.bf16_scaled_accum ? "true" : "false",
     args.mxfp4_weights ? "true" : "false",
+    args.processed_mxfp4_scales ? "true" : "false",
     phase_template_args);
     }
 
@@ -165,8 +168,14 @@ static void sm90_fp8_mega_moe(
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
     const bool& fast_math,
-    const bool& mxfp4_weights = false
+    const bool& mxfp4_weights = false,
+    const bool& processed_mxfp4_scales = false,
+    const std::optional<torch::Tensor>& l1_mxfp4_secondary = std::nullopt,
+    const std::optional<torch::Tensor>& l2_mxfp4_secondary = std::nullopt
 ) {
+    DG_HOST_ASSERT(not processed_mxfp4_scales or mxfp4_weights);
+    DG_HOST_ASSERT(processed_mxfp4_scales == l1_mxfp4_secondary.has_value());
+    DG_HOST_ASSERT(processed_mxfp4_scales == l2_mxfp4_secondary.has_value());
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_padded_sf_pool_tokens = static_cast<int>(l1_acts_sf.size(0));
@@ -273,6 +282,7 @@ static void sm90_fp8_mega_moe(
         .fast_math = fast_math,
         .bf16_scaled_accum = bf16_scaled_accum,
         .mxfp4_weights = mxfp4_weights,
+        .processed_mxfp4_scales = processed_mxfp4_scales,
         .kernel_phase = SM90FP8MegaMoERuntime::KernelPhase::Linear1,
         .config = l1_config,
         .y = y.data_ptr(),
@@ -282,14 +292,18 @@ static void sm90_fp8_mega_moe(
         .tensor_map_l1_acts = tensor_map_l1_acts,
         .tensor_map_l1_acts_sf = tensor_map_l1_acts_sf,
         .tensor_map_l1_weights = tensor_map_l1_weights,
-        .l1_weights_sf = mxfp4_weights ? nullptr : l1_weights_sf.data_ptr<float>(),
+        .l1_weights_sf = processed_mxfp4_scales ?
+            l1_mxfp4_secondary->data_ptr<float>() :
+            (mxfp4_weights ? nullptr : l1_weights_sf.data_ptr<float>()),
         .l1_mxfp4_weights_sf = mxfp4_weights ?
             l1_weights_sf.data_ptr<uint8_t>() : nullptr,
         .tensor_map_l1_output = tensor_map_l1_output,
         .tensor_map_l2_acts = tensor_map_l2_acts,
         .tensor_map_l2_acts_sf = tensor_map_l2_acts_sf,
         .tensor_map_l2_weights = tensor_map_l2_weights,
-        .l2_weights_sf = mxfp4_weights ? nullptr : l2_weights_sf.data_ptr<float>(),
+        .l2_weights_sf = processed_mxfp4_scales ?
+            l2_mxfp4_secondary->data_ptr<float>() :
+            (mxfp4_weights ? nullptr : l2_weights_sf.data_ptr<float>()),
         .l2_mxfp4_weights_sf = mxfp4_weights ?
             l2_weights_sf.data_ptr<uint8_t>() : nullptr,
         .launch_args = LaunchArgs(l1_config.num_sms,
@@ -316,12 +330,14 @@ static void sm90_fp8_mega_moe(
 
     launch_with_phase(
         SM90FP8MegaMoERuntime::KernelPhase::Linear1,
-        mxfp4_weights ? "sm90_fp8_mxfp4_mega_moe_l1_impl" :
-                        "sm90_fp8_mega_moe_l1_impl");
+        processed_mxfp4_scales ? "sm90_fp8_mxfp4_fused_mega_moe_l1_impl" :
+        (mxfp4_weights ? "sm90_fp8_mxfp4_mega_moe_l1_impl" :
+                        "sm90_fp8_mega_moe_l1_impl"));
     launch_with_phase(
         SM90FP8MegaMoERuntime::KernelPhase::Linear2,
-        mxfp4_weights ? "sm90_fp8_mxfp4_mega_moe_l2_impl" :
-                        "sm90_fp8_mega_moe_l2_impl");
+        processed_mxfp4_scales ? "sm90_fp8_mxfp4_fused_mega_moe_l2_impl" :
+        (mxfp4_weights ? "sm90_fp8_mxfp4_mega_moe_l2_impl" :
+                        "sm90_fp8_mega_moe_l2_impl"));
 }
 
 } // namespace deep_gemm

@@ -108,7 +108,11 @@ def _interleave_weights(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
     half = n // 2
     gate = t[:, :half].reshape(g, half // gran, gran, *rest)
     up = t[:, half:].reshape(g, half // gran, gran, *rest)
-    return torch.empty_like(t).copy_(torch.stack([gate, up], dim=2).reshape(g, n, *rest))
+    out = torch.empty_like(t)
+    out_view = out.view(g, half // gran, 2, gran, *rest)
+    out_view[:, :, 0].copy_(gate)
+    out_view[:, :, 1].copy_(up)
+    return out
 
 
 def _transpose_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
@@ -185,9 +189,98 @@ def _normalize_mxfp4_packed_weight(weight: torch.Tensor) -> torch.Tensor:
     return weight if weight.dtype == torch.int8 else weight.view(torch.int8)
 
 
+def _process_mxfp4_fused_e8m0(
+    weight: torch.Tensor,
+    sf: torch.Tensor,
+    interleave_rows: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Convert raw Humming MXFP4 scales to bounded exponent offsets.
+
+    The offset range is limited to 11 per expert, matching Humming's FP8
+    fused-E8M0 path. Groups below the retained range have their packed E2M1
+    payload requantized after a power-of-two downscale. The returned secondary
+    scale restores the common expert exponent after WGMMA.
+    """
+    weight = _normalize_mxfp4_packed_weight(weight)
+    raw_sf = _normalize_mxfp4_ue8m0(sf)
+    assert weight.dim() == 3 and raw_sf.dim() == 3
+    assert weight.size(0) == raw_sf.size(0)
+    assert weight.size(1) == raw_sf.size(1)
+    assert weight.size(2) == raw_sf.size(2) * 16
+    assert (raw_sf != 255).all(), 'fused E8M0 processing does not accept NaN scales'
+
+    sf_i16 = raw_sf.to(torch.int16)
+    max_exp = sf_i16.flatten(1).amax(dim=1)
+    min_exp = sf_i16.flatten(1).amin(dim=1)
+    base_exp = max_exp - torch.minimum(max_exp - min_exp, torch.full_like(max_exp, 11))
+
+    base_view = base_exp.view(-1, 1, 1)
+    clamped = torch.maximum(sf_i16, base_view)
+    delta = clamped - sf_i16
+    # Humming's current CUDA requantizer uses an unsigned FP32 exponent
+    # construction that wraps for delta >= 128. Reject that pathological
+    # endpoint instead of silently diverging from its byte representation;
+    # callers can retain the raw pair contract for such experts.
+    assert (delta < 128).all(), 'fused E8M0 exponent delta must be < 128'
+    offsets = (clamped - base_view + 1).to(torch.uint8)
+    secondary = torch.exp2(base_exp.float() - 128.0).contiguous()
+
+    # Exact lookup for Humming's process_mxfp4_w4a8_weight over the accepted
+    # delta range [0, 127]. Delta >= 5 quantizes every finite magnitude to
+    # zero. Input negative zero is normalized before requantization.
+    nibble_lut = torch.tensor([
+        0, 1, 2, 3, 4, 5, 6, 7, 0, 9, 10, 11, 12, 13, 14, 15,
+        0, 1, 1, 2, 2, 3, 4, 5, 0, 9, 9, 10, 10, 11, 12, 13,
+        0, 0, 1, 1, 1, 2, 2, 3, 0, 8, 9, 9, 9, 10, 10, 11,
+        0, 0, 0, 0, 1, 1, 1, 2, 0, 8, 8, 8, 9, 9, 9, 10,
+        0, 0, 0, 0, 0, 0, 1, 1, 0, 8, 8, 8, 8, 8, 9, 9,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8, 8, 8, 8,
+    ], dtype=torch.uint8, device=weight.device)
+    nibble_lut = nibble_lut.view(6, 16)
+    packed_values = torch.arange(256, dtype=torch.long, device=weight.device)
+    packed_lut = (
+        nibble_lut[:, packed_values & 0x0f] |
+        (nibble_lut[:, packed_values >> 4] << 4)
+    ).reshape(-1)
+    packed = weight.view(torch.uint8)
+    rewritten = torch.empty_like(packed)
+    if interleave_rows:
+        assert weight.size(1) % 16 == 0
+        half_rows = weight.size(1) // 2
+        rewritten_view = rewritten.view(
+            weight.size(0), half_rows // 8, 2, 8, weight.size(2))
+    num_k_groups = raw_sf.size(2)
+    num_rows_per_chunk = 1024
+    for expert_idx in range(weight.size(0)):
+        row_regions = ((0, weight.size(1), -1),) if not interleave_rows else (
+            (0, half_rows, 0), (half_rows, weight.size(1), 1))
+        for region_start, region_end, gate_up_idx in row_regions:
+            for row_start in range(region_start, region_end, num_rows_per_chunk):
+                row_end = min(row_start + num_rows_per_chunk, region_end)
+                packed_chunk = packed[expert_idx, row_start:row_end].view(
+                    row_end - row_start, num_k_groups, 16)
+                delta_chunk = delta[
+                    expert_idx, row_start:row_end].clamp_max(5).unsqueeze(-1)
+                lut_idx = delta_chunk.to(torch.long) * 256 + packed_chunk.to(torch.long)
+                rewritten_chunk = packed_lut[lut_idx].reshape(
+                    row_end - row_start, -1)
+                if interleave_rows:
+                    relative_start = row_start - region_start
+                    relative_end = row_end - region_start
+                    rewritten_view[
+                        expert_idx,
+                        relative_start // 8:relative_end // 8,
+                        gate_up_idx,
+                    ].copy_(rewritten_chunk.view(-1, 8, weight.size(2)))
+                else:
+                    rewritten[expert_idx, row_start:row_end].copy_(rewritten_chunk)
+
+    return rewritten.view(torch.int8), offsets.contiguous(), secondary
+
+
 def transform_weights_for_fp8_mxfp4_mega_moe_sm90(
     l1_weights: Tuple[torch.Tensor, torch.Tensor],
-    l2_weights: Tuple[torch.Tensor, torch.Tensor]
+    l2_weights: Tuple[torch.Tensor, torch.Tensor],
 ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
     """Prepare raw Humming-compatible MXFP4 weights for Hopper MegaMoE.
 
@@ -207,6 +300,41 @@ def transform_weights_for_fp8_mxfp4_mega_moe_sm90(
     )
     l2_transformed = (l2_w.contiguous(), _normalize_mxfp4_ue8m0(l2_sf))
     return l1_transformed, l2_transformed
+
+
+def transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
+    l1_weights: Tuple[torch.Tensor, torch.Tensor],
+    l2_weights: Tuple[torch.Tensor, torch.Tensor],
+    l1_global_scale: Optional[torch.Tensor] = None,
+    l2_global_scale: Optional[torch.Tensor] = None,
+):
+    """Prepare Humming fused-E8M0 MXFP4 weights for Hopper MegaMoE.
+
+    The returned triples contain rewritten packed E2M1 weights, bounded
+    exponent offsets in ``[1, 12]``, and one FP32 secondary scale per expert.
+    Optional Humming ``weight_scale_2`` tensors must also be per-expert ``[E]``
+    scales; per-channel secondary scales are not supported by this kernel.
+    """
+    assert (l1_global_scale is None) == (l2_global_scale is None)
+    l1_w, l1_sf, l1_secondary = _process_mxfp4_fused_e8m0(
+        *l1_weights, interleave_rows=True)
+    l2_w, l2_sf, l2_secondary = _process_mxfp4_fused_e8m0(*l2_weights)
+
+    if l1_global_scale is not None:
+        for scale, secondary in (
+            (l1_global_scale, l1_secondary),
+            (l2_global_scale, l2_secondary),
+        ):
+            assert scale.dim() == 1 and scale.numel() == secondary.numel()
+            assert scale.device == secondary.device and torch.isfinite(scale).all()
+        l1_secondary = (l1_secondary * l1_global_scale.float()).contiguous()
+        l2_secondary = (l2_secondary * l2_global_scale.float()).contiguous()
+
+    return (
+        l1_w,
+        _interleave_weights(l1_sf),
+        l1_secondary,
+    ), (l2_w.contiguous(), l2_sf, l2_secondary)
 
 
 def fp8_fp4_mega_moe(y: torch.Tensor,
@@ -262,8 +390,8 @@ def fp8_mega_moe(y: torch.Tensor,
 
 
 def fp8_mxfp4_mega_moe(y: torch.Tensor,
-                       l1_weights: Tuple[torch.Tensor, torch.Tensor],
-                       l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                       l1_weights,
+                       l2_weights,
                        sym_buffer: SM90SymmBuffer,
                        cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                        recipe: Tuple[int, int, int] = (1, 1, 32),
@@ -272,12 +400,16 @@ def fp8_mxfp4_mega_moe(y: torch.Tensor,
                        fast_math: bool = True):
     """SM90 MegaMoE with FP8 activations and packed MXFP4 weights.
 
-    ``l1_weights`` and ``l2_weights`` must be the packed-int8/uint8-scale
-    outputs of ``transform_weights_for_fp8_mxfp4_mega_moe_sm90``. Raw Humming
-    checkpoint tensors must pass through that transform first; tensors already
-    repacked by Humming are not accepted.
+    ``l1_weights`` and ``l2_weights`` must be matching raw pairs or processed
+    triples from the raw or fused variants of
+    ``transform_weights_for_fp8_mxfp4_*_mega_moe_sm90``. Raw Humming
+    checkpoint tensors must pass through one of those transforms first.
     """
-    _C.fp8_mxfp4_mega_moe(
+    assert len(l1_weights) == len(l2_weights)
+    assert len(l1_weights) in (2, 3)
+    op = _C.fp8_mxfp4_mega_moe if len(l1_weights) == 2 \
+        else _C.fp8_mxfp4_processed_mega_moe
+    op(
         y,
         l1_weights, l2_weights,
         cumulative_local_expert_recv_stats,
