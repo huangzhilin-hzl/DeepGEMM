@@ -442,9 +442,10 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         math::constexpr_align(fp8_token_layout.get_num_bytes() * kNumDispatchWarps, kSharedMemoryAlignment);
     constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(a_dtype_t);
     constexpr uint32_t SMEM_B_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t);
-    // Packed MXFP4 is TMA-loaded without swizzle into a temporary half-sized
-    // region.  The math warpgroup expands it into the normal B128-swizzled FP8
-    // B tile before issuing WGMMA.
+    // Packed MXFP4 is TMA-loaded with B64 swizzle into a temporary half-sized
+    // region. The packed row is exactly 64 bytes at BK128, so B64 spreads the
+    // one-word-per-row decoder loads across banks. The math warpgroup expands
+    // it into the normal B128-swizzled FP8 B tile before issuing WGMMA.
     constexpr uint32_t SMEM_B_PACKED_SIZE_PER_STAGE = kMXFP4Weights ?
         LOAD_BLOCK_N * BLOCK_K / 2 : 0u;
     // SFA holds one aligned BLOCK_M-float vector per 64 channels. L1 uses every
@@ -1047,7 +1048,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         // UINT8 descriptor over K/2 bytes preserves the
                         // existing SM90 CUDA baseline and avoids relying on
                         // newer packed-FP4 TMA layout semantics.
-                        tma::copy<BLOCK_K / 2, BLOCK_N, 0, uint8_t>(
+                        tma::copy<BLOCK_K / 2, BLOCK_N, 64, uint8_t>(
                             tensor_map_b_ptr, full_barriers[stage_idx],
                             smem_b_packed[stage_idx], k_idx / 2, n_idx, 1);
                         full_barriers[stage_idx]->arrive_and_expect_tx(
@@ -1164,8 +1165,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     const uint32_t wg_thread_idx = warp_idx_in_wg * 32 + lane_idx;
 
                     const auto prepare_stage_weights = [&](const uint32_t& k_block_idx) {
-                        const auto* packed = smem_b_packed[stage_idx] +
-                            wg_n_idx * BLOCK_K / 2;
+                        const auto* packed = smem_b_packed[stage_idx];
                         auto* expanded = reinterpret_cast<uint8_t*>(smem_b[stage_idx]);
                         const uint32_t weight_sf_stride_k = is_linear1_phase ?
                             kL1WeightSFK : kL2WeightSFK;
@@ -1183,13 +1183,16 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         // them for the per-K32 accumulator promotion below.
                         const uint32_t local_n = wg_thread_idx;
                         const uint32_t global_n = n_idx + local_n;
+                        const uint32_t packed_row_base =
+                            (wg_n_idx + local_n) * (BLOCK_K / 2);
+                        const uint32_t packed_row_xor =
+                            cute::Swizzle<2, 4, 3>::apply(packed_row_base) ^
+                            packed_row_base;
                         const uint32_t weight_sf_k =
                             k_block_idx * kNumMXFP4SFBKGroups;
                         const uint32_t scale_word = __ldg(
                             reinterpret_cast<const uint32_t*>(
                                 sf_base + global_n * weight_sf_stride_k + weight_sf_k));
-                        const auto* packed_words =
-                            reinterpret_cast<const uint32_t*>(packed);
                         if constexpr (kProcessedMXFP4Scales) {
                             DG_STATIC_ASSERT(WG_BLOCK_N == kWGThreads,
                                              "Processed MXFP4 assigns one N row per WG thread");
@@ -1198,9 +1201,13 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                  packed_k < BLOCK_K / 8; ++ packed_k) {
                                 const uint32_t exponent_offset =
                                     (scale_word >> ((packed_k / 4u) * 8u)) & 0xffu;
+                                const uint32_t packed_byte_offset =
+                                    packed_row_base +
+                                    ((packed_k * sizeof(uint32_t)) ^ packed_row_xor);
                                 const uint2 decoded =
                                     sm90_mxfp4_e2m1x8_to_e4m3x8_bits(
-                                        packed_words[local_n * (BLOCK_K / 8) + packed_k],
+                                        ptx::ld_shared(reinterpret_cast<const uint32_t*>(
+                                            packed + packed_byte_offset)),
                                         exponent_offset);
                                 const uint32_t logical_n = wg_n_idx + local_n;
                                 const uint32_t logical_k0 = packed_k * 8;
@@ -1218,13 +1225,18 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             for (uint32_t packed_word_idx = wg_thread_idx;
                                  packed_word_idx < kPackedWordsPerWG;
                                  packed_word_idx += kWGThreads) {
-                                const uint2 decoded =
-                                    sm90_mxfp4_e2m1x8_to_e4m3x8_bits(
-                                        packed_words[packed_word_idx]);
                                 const uint32_t decoded_local_n =
                                     packed_word_idx / (BLOCK_K / 8);
                                 const uint32_t packed_k =
                                     packed_word_idx % (BLOCK_K / 8);
+                                const uint32_t packed_byte_offset =
+                                    (wg_n_idx + decoded_local_n) * (BLOCK_K / 2) +
+                                    packed_k * sizeof(uint32_t);
+                                const uint2 decoded =
+                                    sm90_mxfp4_e2m1x8_to_e4m3x8_bits(
+                                        ptx::ld_shared(reinterpret_cast<const uint32_t*>(
+                                            packed + cute::Swizzle<2, 4, 3>::apply(
+                                                packed_byte_offset))));
                                 const uint32_t logical_n = wg_n_idx + decoded_local_n;
                                 const uint32_t logical_k0 = packed_k * 8;
                                 const uint32_t flat0 = logical_n * BLOCK_K + logical_k0;

@@ -225,7 +225,7 @@ static void sm90_fp8_mega_moe(
         mxfp4_weights ? l1_tma_block_k / 2 : l1_tma_block_k,
         l1_tma_block_n,
         static_cast<int>(l1_weights.stride(-2)),
-        mxfp4_weights ? 0 : 128, 0, false,
+        mxfp4_weights ? 64 : 128, 0, false,
         true, mxfp4_weights);
     // L1 output (post-SwiGLU FP8): N is halved. The SM90 epilogue writes this
     // staging tile to SMEM as plain row-major bytes, so the TMA store descriptor
@@ -263,7 +263,7 @@ static void sm90_fp8_mega_moe(
         mxfp4_weights ? l2_tma_block_k / 2 : l2_tma_block_k,
         l2_tma_block_n,
         static_cast<int>(l2_weights.stride(-2)),
-        mxfp4_weights ? 0 : 128, 0, false,
+        mxfp4_weights ? 64 : 128, 0, false,
         true, mxfp4_weights);
 
     // Stats can be optional

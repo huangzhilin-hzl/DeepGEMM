@@ -278,3 +278,162 @@ The next iteration will preprocess offsets into a kernel-specific
 `[E,K_block,N,4]` blocked layout. For each BK128 tile, the same 128 threads can
 then issue one contiguous, coalesced 32-bit load each while retaining the
 one-row-per-thread decoder and avoiding an additional shared-memory barrier.
+
+## Rejected experiment: block processed exponent offsets by K tile
+
+### Hypothesis and implementation
+
+The processed offsets were temporarily rewritten from natural
+`[E,N,K/32]` order to an opaque contiguous `[E,K/128,N,4]` kernel layout. This
+made the 128 per-row four-byte loads of each BK128 tile contiguous. The host
+API used a distinct four-dimensional contract so an old natural-layout triple
+could not be silently interpreted with the new addressing.
+
+All correctness gates passed with a rebuilt extension and a fresh JIT cache:
+processed smoke `0.0006`, forced requantization `0.0005`, raw-pair fallback
+`0.0006`, and both eight-rank Flash/Pro M128 `0.0006`.
+
+### NCU and NSYS attribution
+
+The SourceCounters hypothesis was locally correct but incomplete. Excessive
+global-memory sectors collapsed, while the cache behavior and latency became
+worse:
+
+| Metric (Flash M128, single rank, E32) | Iteration 3 L1 | Blocked-offset L1 | Change | Iteration 3 L2 | Blocked-offset L2 | Change |
+|---|---:|---:|---:|---:|---:|---:|
+| NCU duration | 1.05 ms | 1.15 ms | +9.5% | 551.71 us | 606.11 us | +9.9% |
+| Executed instructions | 119,122,618 | 119,120,697 | ~0% | 65,200,638 | 65,203,520 | ~0% |
+| L1/TEX hit rate | 83.34% | 3.82% | -79.52 pp | 83.34% | 5.33% | -78.01 pp |
+| Eligible warps/cycle | 23.99% | 21.88% | -2.11 pp | ~24% | 21.44% | about -2.6 pp |
+| Long-scoreboard issue share | 34.74% | 41.17% | +6.43 pp | -- | -- | -- |
+| Excessive global sectors | 3,692,180 | 22,166 | -99.4% | 1,835,136 | 128 | -99.99% |
+
+| NSYS selected hot path | Iteration 3 | Blocked offsets | Change |
+|---|---:|---:|---:|
+| L1 kernel | 970,148 ns | 1,058,916 ns | +9.2% |
+| L1-to-L2 gap | 107,968 ns | 124,800 ns | +15.6% |
+| L2 kernel | 509,282 ns | 557,859 ns | +9.5% |
+
+The natural layout has poor lane-to-lane coalescing, but each lane walks its
+row's offset words sequentially across K and reuses the fetched cache line.
+The blocked layout converts every K step into a new cache-line dependency.
+Actual L2 input traffic therefore did not fall enough to compensate for the
+loss of temporal locality. This is a case where SourceCounters' theoretical
+sector excess alone predicted the wrong optimization.
+
+### Eight-rank performance and decision
+
+FP8 and the experiment were measured together with the same three-by-20
+contract used by Iteration 3.
+
+| Model | M | Co-measured FP8 (us) | MXFP4 iter. 3 (us) | Blocked offsets (us) | Regression |
+|---|---:|---:|---:|---:|---:|
+| Flash | 8 | 309.2 | 1,297.4 | 1,401.0 | +8.0% |
+| Flash | 128 | 438.9 | 1,550.6 | 1,659.8 | +7.0% |
+| Flash | 512 | 922.3 | 2,902.7 | 3,043.0 | +4.8% |
+| Flash | 8192 | 9,863.0 | 33,580.0 | 33,758.0 | +0.5% |
+| Pro | 8 | 693.7 | 3,364.0 | 3,733.0 | +11.0% |
+| Pro | 128 | 1,238.8 | 5,334.0 | 5,928.0 | +11.1% |
+| Pro | 512 | 2,435.2 | 8,071.0 | 8,864.0 | +9.8% |
+| Pro | 8192 | 25,121.0 | 84,934.0 | 91,092.0 | +7.2% |
+
+The code change was rejected and reverted rather than committed. The profiler
+reports are retained under the external Iteration 4 artifact directory.
+
+The same SourceCounters run exposed a larger and more actionable bottleneck:
+shared-memory packed-weight loads produce 35,722,802 excessive wavefronts in
+L1 (74% of all wavefronts) and 18,162,176 in L2 (73%). The repeated 32-bit
+loads use a 64-byte row stride and incur 16-way bank conflicts. The next
+experiment therefore applies a matching B64 TMA descriptor/copy swizzle and
+software address swizzle to the packed MXFP4 tile.
+
+## Iteration 5: B64-swizzle the packed MXFP4 staging tile
+
+### Hypothesis and implementation
+
+The BK128 packed E2M1 row is exactly 64 bytes. Before this iteration, TMA wrote
+the `128 x 64B` temporary tile without swizzle and every math-warp lane loaded
+the same four-byte K position from a different N row. The 64-byte row stride
+mapped a warp onto only two bank pairs, producing 16-way conflicts.
+
+The host tensor maps and device TMA copies now both use B64 swizzle. The
+decoder applies the matching `cute::Swizzle<2,4,3>` byte-address transform;
+the hot processed path precomputes the row XOR mask, while the raw fallback
+uses the full transform. Each packed stage is 8192 bytes and its shared-memory
+base is 1024-byte aligned, so every stage satisfies the B64 base requirement.
+
+### Correctness and review
+
+The host extension was rebuilt after reverting the rejected offset-layout
+experiment. Device code used a new JIT cache. Two independent source reviews
+found no descriptor/copy, address, alignment, processed/raw, or ABI issues.
+
+| Scenario | Scale representation | `calc_diff` | Tolerance | Result |
+|---|---|---:|---:|---|
+| L1 smoke, one rank | processed triple | 0.0006 | 0.01 | PASS |
+| L1 forced requant, one rank | processed triple | 0.0005 | 0.01 | PASS |
+| L1 smoke, one rank | raw pair fallback | 0.0006 | 0.01 | PASS |
+| Flash M128, eight ranks | processed triple | 0.0006 | 0.01 | PASS |
+| Pro M128, eight ranks | processed triple | 0.0006 | 0.01 | PASS |
+
+### NCU and NSYS attribution
+
+SourceCounters confirms that the packed loads moved from 16-way to 4-way
+bank conflicts. The remaining vector stores are also four-way. Global-offset
+accesses stay in the natural Iteration 3 layout, preserving its high L1 hit
+rate.
+
+| Metric (Flash M128, single rank, E32) | Iteration 3 L1 | Iteration 5 L1 | Change | Iteration 3 L2 | Iteration 5 L2 | Change |
+|---|---:|---:|---:|---:|---:|---:|
+| NCU duration | 1.050 ms | 940.74 us | -10.4% | 551.71 us | 503.78 us | -8.7% |
+| Executed instructions | 119,122,618 | 121,869,919 | +2.3% | 65,200,638 | 66,499,004 | +2.0% |
+| L1/TEX hit rate | 83.34% | 83.31% | -0.03 pp | 79.13% | 79.21% | +0.08 pp |
+| Achieved occupancy | 9.42% | 9.45% | +0.03 pp | 15.26% | 15.26% | ~0 pp |
+| Excessive shared wavefronts | 35,722,802 | 10,556,978 | -70.4% | 18,162,176 | 5,579,264 | -69.3% |
+| Total shared wavefronts | 48,596,560 | 23,430,736 | -51.8% | 24,879,182 | 12,296,270 | -50.6% |
+
+The address transform adds about 2% more instructions, but removing roughly
+70% of excessive shared-memory wavefronts makes both kernels 9-10% faster in
+NCU. Memory-throughput utilization falls because fewer bank-conflict replays
+are counted as shared-memory activity; L1/L2 cache hit rates and L2 input
+traffic remain effectively unchanged.
+
+| NSYS selected hot path | Iteration 3 | Iteration 5 | Change |
+|---|---:|---:|---:|
+| L1 kernel | 970,148 ns | 866,499 ns | -10.7% |
+| L1-to-L2 gap | 107,968 ns | 126,241 ns | +16.9% |
+| L2 kernel | 509,282 ns | 451,361 ns | -11.4% |
+
+The kernel gains are larger than the 18.3 us gap increase, so NSYS still
+attributes a net hot-path improvement to the B64 change.
+
+### Eight-rank performance
+
+FP8 and MXFP4 were measured together with three observations and 20 Kineto
+tests per observation. The table compares MXFP4 with the last accepted
+Iteration 3 rather than the rejected blocked-offset experiment.
+
+| Model | M | Co-measured FP8 (us) | MXFP4 iter. 3 (us) | MXFP4 iter. 5 (us) | Iteration gain | Iter. 5 / FP8 |
+|---|---:|---:|---:|---:|---:|---:|
+| Flash | 8 | 329.7 | 1,297.4 | 1,153.9 | 11.1% | 3.50x |
+| Flash | 128 | 460.7 | 1,550.6 | 1,397.5 | 9.9% | 3.03x |
+| Flash | 512 | 939.7 | 2,902.7 | 2,587.5 | 10.9% | 2.75x |
+| Flash | 8192 | 9,879.0 | 33,580.0 | 29,828.0 | 11.2% | 3.02x |
+| Pro | 8 | 705.3 | 3,364.0 | 2,997.6 | 10.9% | 4.25x |
+| Pro | 128 | 1,244.9 | 5,334.0 | 4,744.0 | 11.1% | 3.81x |
+| Pro | 512 | 2,447.8 | 8,071.0 | 7,175.0 | 11.1% | 2.93x |
+| Pro | 8192 | 25,140.0 | 84,934.0 | 75,629.0 | 11.0% | 3.01x |
+
+### Remaining bottleneck and next direction
+
+Iteration 5 is a consistent accepted improvement, but it remains 2.75-4.25x
+slower than FP8. Each repeated packed-word `LDS` now has four wavefronts for
+one ideal wavefront, and each 64-bit expanded-weight store has four wavefronts
+for two ideal wavefronts. A warp still assigns one lane to one N row, so lanes
+access a single K position across 32 row strides.
+
+The next experiment will remap a warp iteration to eight N rows by four
+contiguous packed words. With B64 input and B128 output swizzles, this should
+cover all 32 banks per load and reach the two-wavefront minimum for 64-bit
+stores. Each row's already-loaded exponent word can be shared from its owner
+lane with a warp shuffle, preserving one global scale load per output row.
