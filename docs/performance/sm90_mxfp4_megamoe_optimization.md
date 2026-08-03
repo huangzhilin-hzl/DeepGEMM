@@ -855,3 +855,101 @@ has both TMA producer warps join the two idle warps after issuing A and B,
 giving all four frontend warps one 32-row quadrant. The decoded-ready barrier
 then expects four arrivals. This restores the accepted decoder width while
 retaining the possibility of overlapping the next stage with current WGMMA.
+
+## Rejected experiment: four-warp frontend decoder pipeline
+
+### Hypothesis and implementation
+
+This controlled follow-up keeps the reg168 stage pipeline and restores the
+four-warp decoder width of accepted Iteration 7. The A and B TMA producers
+issue their loads and then join the two previously idle frontend warps. Each
+of the four warps waits for the same packed-B stage and expands one contiguous
+32-row quadrant of the BN128/BK128 tile. The decoded-ready barrier therefore
+expects four arrivals instead of two.
+
+The mapping oracle exhaustively checks 2,048 packed words, 16,384 expanded
+elements, all 128 scale owners, four uses of every `(row, K32)` scale, and
+exact-once coverage of all 8,192 B64 source and 16,384 B128 destination bytes.
+It also proves that the device's row-XOR B64 address expression equals the
+canonical CUTE swizzle for every packed word. A separate review found no
+barrier, TMA-completion, phase-parity, dummy-CTA, or async-proxy ordering
+blocker. The processed frontend executes its register deallocation once as a
+warpgroup-uniform instruction and statically requires the dispatch/frontend
+boundary to be four-warp aligned.
+
+This layout does not provide pure producer/consumer overlap: after issuing a
+stage, both TMA producer warps wait for it and participate in decode, so they
+cannot run ahead to fill the following stage. The experiment tests whether
+restored decode width is nevertheless enough to retain any useful overlap.
+
+### Correctness gate
+
+| Scenario | Scale representation | `calc_diff` | Tolerance | Result |
+|---|---|---:|---:|---|
+| Mapping and physical-byte oracle | processed triple | exact | exact | PASS |
+| L1 smoke, one rank | processed triple | 0.0006 | 0.01 | PASS |
+| L1 forced requant, one rank | processed triple | 0.0005 | 0.01 | PASS |
+| Flash M128 L3, eight ranks | processed triple | 0.0006 | 0.01 | PASS |
+| Pro M128 L3, eight ranks | processed triple | 0.0006 | 0.01 | PASS |
+
+The L3 cases traverse more stages than the five-stage pipeline depth, so they
+also exercise barrier reuse and phase wrap. The raw-scale and FP8 paths retain
+their preceding implementation; no candidate-specific behavior is enabled
+for them.
+
+### Eight-rank quick gate
+
+The standard three observations and 20 Kineto tests were run at M128. Iter11
+lowers the reg168 median by 16.36% for Flash and 16.24% for Pro, but both
+production shapes remain slower than accepted Iteration 7. The remaining six
+M points were therefore gated rather than mixing a rejected candidate into the
+full campaign.
+
+| Model | Iteration 7 (us) | reg168 (us) | Four-warp candidate (us) | Candidate range (us) | Candidate / Iter. 7 | Change vs Iter. 7 | Change vs reg168 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Flash M128 | 1,338.252 | 1,628.709 | 1,362.222 | 1,356.516-1,386.851 | 1.018x | +1.79% | -16.36% |
+| Pro M128 | 4,601.000 | 5,646.000 | 4,729.000 | 4,702-4,756 | 1.028x | +2.78% | -16.24% |
+
+### NCU and NSYS attribution
+
+Detailed NCU again uses one rank, Flash M128, and 32 local experts. The
+instruction values below compare the same `smsp__inst_executed.sum` metric
+exported from each report.
+
+| NCU metric | Iteration 7 L1 | Four-warp L1 | Change | Iteration 7 L2 | Four-warp L2 | Change |
+|---|---:|---:|---:|---:|---:|---:|
+| Duration | 911.104 us | 862.016 us | -5.39% | 473.216 us | 487.616 us | +3.04% |
+| Executed instructions | 128,956,122 | 118,239,609 | -8.31% | 69,289,384 | 64,300,370 | -7.20% |
+| Local-memory spill requests | 0 | 0 | 0 | 0 | 0 | 0 |
+| Achieved occupancy | 9.45% | 12.60% | +3.16 pp | 15.27% | 18.07% | +2.80 pp |
+| Excessive global sectors | 3,692,178 | 3,692,183 | ~0% | 1,835,136 | 1,835,136 | 0% |
+| Excessive shared wavefronts | 71,218 | 71,218 | 0% | 336,384 | 336,384 | 0% |
+
+The four-warp decoder removes the reg168 serialized-decode penalty: relative
+to that two-warp variant, NCU duration improves 22.75% for L1 and 13.97% for
+L2. It also executes 7-8% fewer instructions than Iteration 7. The remaining
+stall distribution is mixed, however. L1 improves overall despite a larger
+decoded-ready long-scoreboard share, while L2 loses enough TMA/decode runahead
+to move in the wrong direction.
+
+| PC-sampling share | Iteration 7 L1 | Four-warp L1 | Iteration 7 L2 | Four-warp L2 |
+|---|---:|---:|---:|---:|
+| Long scoreboard | 27.42% | 44.04% | 16.55% | 26.32% |
+| Barrier | 21.06% | 12.62% | 55.30% | 44.60% |
+| Wait | 16.18% | 12.07% | 8.53% | 6.76% |
+
+| NSYS selected hot path | Iteration 7 | Four-warp frontend | Change |
+|---|---:|---:|---:|
+| L1 kernel | 825,700 ns | 797,219 ns | -3.45% |
+| L1-to-L2 gap | 126,881 ns | 132,992 ns | +4.82% |
+| L2 kernel | 428,737 ns | 451,874 ns | +5.40% |
+| L1 + gap + L2 | 1,381,318 ns | 1,382,085 ns | +0.06% |
+
+The single-rank hot path is therefore effectively flat: its L1 gain is fully
+cancelled by the L2 and inter-kernel tail. At eight ranks, max-rank latency is
+1.79-2.78% worse, so the candidate fails the acceptance gate and is rejected.
+The experiment establishes that four-wide decode is necessary within the
+current reg168 stage pipeline, but making the TMA producers decode every stage
+prevents useful runahead. The next iteration returns to the accepted Iteration
+7 scheduling boundary and targets a structural reduction in scheduler tiles
+and A-TMA traffic rather than adding another decoded-ready dependency.

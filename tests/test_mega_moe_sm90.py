@@ -138,8 +138,7 @@ def _check_mxfp4_processed_decode_mapping() -> None:
     scale_uses = []
     source_bytes = []
     destination_bytes = []
-    per_decoder_warp = Counter()
-    per_decoder_half = Counter()
+    per_frontend_warp = Counter()
 
     def swizzle(byte_offset: int, bits: int,
                 base: int = 4, shift: int = 3) -> int:
@@ -147,50 +146,53 @@ def _check_mxfp4_processed_decode_mapping() -> None:
         return byte_offset ^ (
             ((byte_offset >> (base + shift)) & mask) << base)
 
-    for decoder_warp_idx in range(2):
-        for n_half in range(2):
-            decoder_row_base = decoder_warp_idx * 64 + n_half * 32
-            for lane_idx in range(32):
-                lane_in_half_warp = lane_idx % 16
-                row_in_decode_group = lane_in_half_warp // 2
-                packed_k_in_k32 = (
-                    (lane_idx // 16) * 2 + lane_in_half_warp % 2)
-                scale_owner_n = decoder_row_base + lane_idx
-                scale_word_owners.append(scale_owner_n)
-                for row_group in range(32 // rows_per_decode_group):
-                    row_in_warp = (
-                        row_group * rows_per_decode_group +
-                        row_in_decode_group)
-                    decoded_local_n = decoder_row_base + row_in_warp
-                    scale_source_lane = row_in_warp
-                    assert (
-                        scale_owner_n - lane_idx + scale_source_lane ==
-                        decoded_local_n)
-                    for k32_idx in range(128 // 32):
-                        packed_k = k32_idx * 4 + packed_k_in_k32
-                        assert packed_k // 4 == k32_idx
-                        visits.append((decoded_local_n, packed_k))
-                        scale_uses.append((decoded_local_n, k32_idx))
-                        per_decoder_warp[decoder_warp_idx] += 1
-                        per_decoder_half[(decoder_warp_idx, n_half)] += 1
+    for frontend_warp_idx in range(4):
+        decoder_row_base = frontend_warp_idx * 32
+        for lane_idx in range(32):
+            lane_in_half_warp = lane_idx % 16
+            row_in_decode_group = lane_in_half_warp // 2
+            packed_k_in_k32 = (
+                (lane_idx // 16) * 2 + lane_in_half_warp % 2)
+            scale_owner_n = decoder_row_base + lane_idx
+            scale_word_owners.append(scale_owner_n)
+            for row_group in range(32 // rows_per_decode_group):
+                row_in_warp = (
+                    row_group * rows_per_decode_group +
+                    row_in_decode_group)
+                decoded_local_n = decoder_row_base + row_in_warp
+                scale_source_lane = row_in_warp
+                assert (
+                    scale_owner_n - lane_idx + scale_source_lane ==
+                    decoded_local_n)
+                for k32_idx in range(128 // 32):
+                    packed_k = k32_idx * 4 + packed_k_in_k32
+                    assert packed_k // 4 == k32_idx
+                    visits.append((decoded_local_n, packed_k))
+                    scale_uses.append((decoded_local_n, k32_idx))
+                    per_frontend_warp[frontend_warp_idx] += 1
 
-                        logical_source = (
-                            decoded_local_n * (block_k // 2) +
-                            packed_k * 4)
-                        physical_source = swizzle(logical_source, bits=2)
-                        source_bytes.extend(
-                            range(physical_source, physical_source + 4))
+                    source_row_base = decoded_local_n * (block_k // 2)
+                    logical_source = source_row_base + packed_k * 4
+                    physical_source = swizzle(logical_source, bits=2)
+                    source_row_xor = (
+                        swizzle(source_row_base, bits=2) ^ source_row_base)
+                    device_physical_source = (
+                        source_row_base +
+                        ((packed_k * 4) ^ source_row_xor))
+                    assert device_physical_source == physical_source
+                    source_bytes.extend(
+                        range(physical_source, physical_source + 4))
 
-                        logical_destination = (
-                            decoded_local_n * block_k + packed_k * 8)
-                        physical_destination = swizzle(
-                            logical_destination, bits=3)
-                        destination_bytes.extend(range(
-                            physical_destination,
-                            physical_destination + 8))
-                        expanded_visits.extend(
-                            (decoded_local_n, packed_k * 8 + element)
-                            for element in range(8))
+                    logical_destination = (
+                        decoded_local_n * block_k + packed_k * 8)
+                    physical_destination = swizzle(
+                        logical_destination, bits=3)
+                    destination_bytes.extend(range(
+                        physical_destination,
+                        physical_destination + 8))
+                    expanded_visits.extend(
+                        (decoded_local_n, packed_k * 8 + element)
+                        for element in range(8))
 
     expected = [
         (row, packed_k)
@@ -213,8 +215,7 @@ def _check_mxfp4_processed_decode_mapping() -> None:
         for row in range(block_n)
         for k32_idx in range(block_k // 32)
     }
-    assert per_decoder_warp == {0: 1024, 1: 1024}
-    assert set(per_decoder_half.values()) == {512}
+    assert per_frontend_warp == {0: 512, 1: 512, 2: 512, 3: 512}
     assert len(source_bytes) == block_n * block_k // 2
     assert len(set(source_bytes)) == len(source_bytes)
     assert min(source_bytes) == 0

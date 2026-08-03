@@ -841,8 +841,8 @@ static bool try_apply_sm90_moe_tuning(
 }
 
 // Correctness-first Hopper MXFP4 schedule. One math warpgroup owns the whole
-// BN128 WGMMA tile; processed scales use two frontend warps to expand the next
-// packed-weight stage, while raw scales retain math-warpgroup expansion.
+// BN128 WGMMA tile; processed scales use all four frontend warps to expand the
+// next packed-weight stage, while raw scales retain math-warpgroup expansion.
 // Specialized FP8 swap-AB/BK256/BF16 accumulation schedules are intentionally
 // excluded until separately tuned.
 static Sm90MoeLaunchConfig select_mxfp4_mega_moe_sm90(

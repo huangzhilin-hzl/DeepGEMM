@@ -590,7 +590,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 full_barriers[i]->init(2);
                 empty_barriers[i]->init(kNumEpilogueWarps);
                 if constexpr (kProcessedMXFP4Scales)
-                    decoded_ready_barriers[i]->init(2);
+                    decoded_ready_barriers[i]->init(4);
             }
             if constexpr (MegaMoEPhase::runs_linear2) {
                 #pragma unroll
@@ -707,6 +707,124 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             }
         }
     };
+
+    const auto wait_and_decode_processed_stage = [&](
+            const uint32_t& frontend_warp_idx,
+            const uint32_t& local_expert_idx,
+            const uint32_t& k_block_idx,
+            const uint32_t& n_block_idx) {
+        if constexpr (kProcessedMXFP4Scales) {
+            DG_STATIC_ASSERT(kNumMMANonEpilogueWarps == 4,
+                             "Processed MXFP4 needs four frontend warps");
+            DG_STATIC_ASSERT(BLOCK_N == 128 and BLOCK_K == 128,
+                             "Processed MXFP4 decoder expects a BN128/BK128 tile");
+            constexpr uint32_t kWeightGranK = 32;
+            constexpr uint32_t kPackedWordsPerK32 = kWeightGranK / 8;
+            constexpr uint32_t kRowsPerDecodeGroup = 8;
+            constexpr uint32_t kRowsPerDecoderWarp = BLOCK_N / 4;
+            DG_STATIC_ASSERT(
+                kPackedWordsPerK32 == 4 and kRowsPerDecoderWarp == 32,
+                "Processed MXFP4 decoder needs one 32-row quadrant per warp");
+
+            full_barriers[stage_idx]->wait(phase);
+
+            constexpr bool is_linear1_phase = MegaMoEPhase::runs_linear1;
+            constexpr uint32_t kL1WeightSFK = kHidden / kWeightGranK;
+            constexpr uint32_t kL2WeightSFK =
+                kIntermediateHidden / kWeightGranK;
+            constexpr uint32_t kL1WeightSFPerExpert =
+                (kIntermediateHidden * 2) * kL1WeightSFK;
+            constexpr uint32_t kL2WeightSFPerExpert =
+                kHidden * kL2WeightSFK;
+            const uint32_t weight_sf_stride_k = is_linear1_phase ?
+                kL1WeightSFK : kL2WeightSFK;
+            const uint32_t weight_sf_per_expert = is_linear1_phase ?
+                kL1WeightSFPerExpert : kL2WeightSFPerExpert;
+            const auto* sf_base = (is_linear1_phase ?
+                l1_mxfp4_weights_sf : l2_mxfp4_weights_sf) +
+                local_expert_idx * weight_sf_per_expert;
+            const uint32_t decoder_row_base =
+                frontend_warp_idx * kRowsPerDecoderWarp;
+            const uint32_t scale_owner_n = decoder_row_base + lane_idx;
+            const uint32_t global_n =
+                n_block_idx * BLOCK_N + scale_owner_n;
+            const uint32_t weight_sf_k =
+                k_block_idx * kNumMXFP4SFBKGroups;
+            const uint32_t scale_word = __ldg(
+                reinterpret_cast<const uint32_t*>(
+                    sf_base + global_n * weight_sf_stride_k + weight_sf_k));
+
+            const auto* packed = smem_b_packed[stage_idx];
+            auto* expanded = reinterpret_cast<uint8_t*>(smem_b[stage_idx]);
+            const uint32_t lane_in_half_warp = lane_idx % 16;
+            const uint32_t row_in_decode_group = lane_in_half_warp / 2;
+            const uint32_t packed_k_in_k32 =
+                (lane_idx / 16) * 2 + lane_in_half_warp % 2;
+
+            #pragma unroll
+            for (uint32_t row_group = 0;
+                 row_group < kRowsPerDecoderWarp / kRowsPerDecodeGroup;
+                 ++ row_group) {
+                const uint32_t row_in_warp =
+                    row_group * kRowsPerDecodeGroup + row_in_decode_group;
+                const uint32_t decoded_local_n =
+                    decoder_row_base + row_in_warp;
+                const uint32_t decoded_scale_word = __shfl_sync(
+                    0xffffffffu, scale_word, row_in_warp);
+                const uint32_t packed_row_base =
+                    decoded_local_n * (BLOCK_K / 2);
+                const uint32_t packed_row_xor =
+                    cute::Swizzle<2, 4, 3>::apply(packed_row_base) ^
+                    packed_row_base;
+
+                #pragma unroll
+                for (uint32_t k32_idx = 0;
+                     k32_idx < kNumMXFP4SFBKGroups; ++ k32_idx) {
+                    const uint32_t packed_k =
+                        k32_idx * kPackedWordsPerK32 + packed_k_in_k32;
+                    const uint32_t exponent_offset =
+                        (decoded_scale_word >> (k32_idx * 8u)) & 0xffu;
+                    const uint32_t packed_byte_offset =
+                        packed_row_base +
+                        ((packed_k * sizeof(uint32_t)) ^ packed_row_xor);
+                    const uint2 decoded =
+                        sm90_mxfp4_e2m1x8_to_e4m3x8_bits(
+                            ptx::ld_shared(
+                                reinterpret_cast<const uint32_t*>(
+                                    packed + packed_byte_offset)),
+                            exponent_offset);
+                    const uint32_t logical_k0 = packed_k * 8;
+                    const uint32_t flat0 =
+                        decoded_local_n * BLOCK_K + logical_k0;
+                    const uint32_t swizzled0 =
+                        cute::Swizzle<3, 4, 3>::apply(flat0);
+                    ptx::st_shared(
+                        expanded + swizzled0, decoded.x, decoded.y);
+                }
+            }
+
+            // Publish every lane's generic shared stores to WGMMA's async
+            // proxy before this frontend warp marks its quadrant ready.
+            __syncwarp();
+            cutlass::arch::fence_view_async_shared();
+            __syncwarp();
+            if (lane_idx == 0)
+                decoded_ready_barriers[stage_idx]->arrive();
+        }
+    };
+
+    // `setmaxnreg.dec.sync.aligned` must be warpgroup-uniform. Processed
+    // MXFP4 uses a full four-warp frontend group, so execute one common PTX
+    // instruction before the individual A, B, and idle-warp role branches.
+    if constexpr (kProcessedMXFP4Scales) {
+        DG_STATIC_ASSERT(kNumDispatchWarps % 4 == 0,
+                         "Processed MXFP4 frontend must start on a warpgroup boundary");
+        if (warp_idx >= kNumDispatchWarps and
+            warp_idx < kNumDispatchWarps + kNumMMANonEpilogueWarps) {
+            cutlass::arch::warpgroup_reg_dealloc<
+                kNumNonEpilogueRegisters>();
+        }
+    }
 
     // =====================================================================
     // ROLE 1: DISPATCH WARPS
@@ -944,13 +1062,16 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         return;
 
     // =====================================================================
-    // ROLE 2: GEMM TMA LOAD warps (load A+SFA, B+SFB)
-    //   Default: 4 non-epilogue warps, two active and two idle.
+    // ROLE 2: GEMM frontend warps (load A+SFA/B, then decode processed MXFP4)
+    //   Default: 4 non-epilogue warps. Processed MXFP4 uses all four for
+    //   decode after the first two issue their TMA loads; other paths keep
+    //   two active TMA warps and two idle warps.
     //   Compact frontend mode: 2 dispatch warps + 2 TMA warps share the first
     //   warpgroup, reducing total CTA threads for the M128/2WG path.
     // =====================================================================
     } else if (warp_idx == kNumDispatchWarps) {
-        cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
+        if constexpr (not kProcessedMXFP4Scales)
+            cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
         for_each_selected_block([&](const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
@@ -1031,11 +1152,16 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     }
                 }
                 __syncwarp();
+                if constexpr (kProcessedMXFP4Scales) {
+                    wait_and_decode_processed_stage(
+                        0, local_expert_idx, k_block_idx, n_block_idx);
+                }
             }
         });
 
     } else if (warp_idx == kNumDispatchWarps + 1) {
-        cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
+        if constexpr (not kProcessedMXFP4Scales)
+            cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
         for_each_selected_block([&](const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,
@@ -1086,135 +1212,32 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     }
                 }
                 __syncwarp();
+                if constexpr (kProcessedMXFP4Scales) {
+                    wait_and_decode_processed_stage(
+                        1, local_expert_idx, k_block_idx, n_block_idx);
+                }
             }
         });
 
     } else if (warp_idx < kNumDispatchWarps + kNumMMANonEpilogueWarps) {
-        // The last two non-epilogue warps decode processed MXFP4 weights while
-        // the math warpgroup consumes the preceding stage. Raw MXFP4 and FP8
-        // retain the original idle frontend warps. All four frontend warps must
-        // still participate in the warpgroup-collective register deallocation.
-        cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
+        // Processed MXFP4 uses these two warps for quadrants 2 and 3; the A and
+        // B TMA warps above decode quadrants 0 and 1 after issuing their loads.
+        // Raw MXFP4 and FP8 retain the original idle frontend warps. All four
+        // frontend warps participate in the warpgroup register deallocation.
+        if constexpr (not kProcessedMXFP4Scales)
+            cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
         if constexpr (kProcessedMXFP4Scales) {
-            DG_STATIC_ASSERT(kNumMMANonEpilogueWarps == 4,
-                             "Processed MXFP4 needs two TMA and two decoder warps");
-            DG_STATIC_ASSERT(BLOCK_N == 128 and BLOCK_K == 128,
-                             "Processed MXFP4 decoder expects a BN128/BK128 tile");
-            constexpr uint32_t kWeightGranK = 32;
-            constexpr uint32_t kPackedWordsPerK32 = kWeightGranK / 8;
-            constexpr uint32_t kRowsPerDecodeGroup = 8;
-            constexpr uint32_t kRowsPerDecoderWarp = BLOCK_N / 2;
-            constexpr uint32_t kRowsPerDecodeHalf = 32;
-            DG_STATIC_ASSERT(
-                kPackedWordsPerK32 == 4 and
-                kRowsPerDecoderWarp == 64 and
-                kRowsPerDecoderWarp % kRowsPerDecodeHalf == 0,
-                "Processed MXFP4 decoder requires two 32-row halves per warp");
-
-            const uint32_t decoder_warp_idx =
-                warp_idx - (kNumDispatchWarps + 2);
+            const uint32_t frontend_warp_idx = warp_idx - kNumDispatchWarps;
             for_each_selected_block([&](const uint32_t& local_expert_idx,
                                          const uint32_t& num_k_blocks,
                                          const uint32_t& m_block_idx,
                                          const uint32_t& n_block_idx) {
-                constexpr bool is_linear1_phase = MegaMoEPhase::runs_linear1;
-                constexpr uint32_t kL1WeightSFK = kHidden / kWeightGranK;
-                constexpr uint32_t kL2WeightSFK =
-                    kIntermediateHidden / kWeightGranK;
-                constexpr uint32_t kL1WeightSFPerExpert =
-                    (kIntermediateHidden * 2) * kL1WeightSFK;
-                constexpr uint32_t kL2WeightSFPerExpert =
-                    kHidden * kL2WeightSFK;
-                const uint32_t weight_sf_stride_k = is_linear1_phase ?
-                    kL1WeightSFK : kL2WeightSFK;
-                const uint32_t weight_sf_per_expert = is_linear1_phase ?
-                    kL1WeightSFPerExpert : kL2WeightSFPerExpert;
-                const auto* sf_base = (is_linear1_phase ?
-                    l1_mxfp4_weights_sf : l2_mxfp4_weights_sf) +
-                    local_expert_idx * weight_sf_per_expert;
-                const uint32_t n_block_offset = n_block_idx * BLOCK_N;
-
                 for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks;
                      advance_pipeline(k_block_idx)) {
-                    full_barriers[stage_idx]->wait(phase);
-
-                    const auto* packed = smem_b_packed[stage_idx];
-                    auto* expanded = reinterpret_cast<uint8_t*>(smem_b[stage_idx]);
-                    const uint32_t weight_sf_k =
-                        k_block_idx * kNumMXFP4SFBKGroups;
-                    const uint32_t lane_in_half_warp = lane_idx % 16;
-                    const uint32_t row_in_decode_group = lane_in_half_warp / 2;
-                    const uint32_t packed_k_in_k32 =
-                        (lane_idx / 16) * 2 + lane_in_half_warp % 2;
-
-                    #pragma unroll
-                    for (uint32_t n_half = 0;
-                         n_half < kRowsPerDecoderWarp / kRowsPerDecodeHalf;
-                         ++ n_half) {
-                        const uint32_t decoder_row_base =
-                            decoder_warp_idx * kRowsPerDecoderWarp +
-                            n_half * kRowsPerDecodeHalf;
-                        const uint32_t scale_owner_n = decoder_row_base + lane_idx;
-                        const uint32_t global_n = n_block_offset + scale_owner_n;
-                        const uint32_t scale_word = __ldg(
-                            reinterpret_cast<const uint32_t*>(
-                                sf_base + global_n * weight_sf_stride_k +
-                                weight_sf_k));
-
-                        #pragma unroll
-                        for (uint32_t row_group = 0;
-                             row_group < kRowsPerDecodeHalf / kRowsPerDecodeGroup;
-                             ++ row_group) {
-                            const uint32_t row_in_warp =
-                                row_group * kRowsPerDecodeGroup +
-                                row_in_decode_group;
-                            const uint32_t decoded_local_n =
-                                decoder_row_base + row_in_warp;
-                            const uint32_t decoded_scale_word = __shfl_sync(
-                                0xffffffffu, scale_word, row_in_warp);
-                            const uint32_t packed_row_base =
-                                decoded_local_n * (BLOCK_K / 2);
-                            const uint32_t packed_row_xor =
-                                cute::Swizzle<2, 4, 3>::apply(packed_row_base) ^
-                                packed_row_base;
-
-                            #pragma unroll
-                            for (uint32_t k32_idx = 0;
-                                 k32_idx < kNumMXFP4SFBKGroups; ++ k32_idx) {
-                                const uint32_t packed_k =
-                                    k32_idx * kPackedWordsPerK32 +
-                                    packed_k_in_k32;
-                                const uint32_t exponent_offset =
-                                    (decoded_scale_word >> (k32_idx * 8u)) & 0xffu;
-                                const uint32_t packed_byte_offset =
-                                    packed_row_base +
-                                    ((packed_k * sizeof(uint32_t)) ^ packed_row_xor);
-                                const uint2 decoded =
-                                    sm90_mxfp4_e2m1x8_to_e4m3x8_bits(
-                                        ptx::ld_shared(
-                                            reinterpret_cast<const uint32_t*>(
-                                                packed + packed_byte_offset)),
-                                        exponent_offset);
-                                const uint32_t logical_k0 = packed_k * 8;
-                                const uint32_t flat0 =
-                                    decoded_local_n * BLOCK_K + logical_k0;
-                                const uint32_t swizzled0 =
-                                    cute::Swizzle<3, 4, 3>::apply(flat0);
-                                ptx::st_shared(
-                                    expanded + swizzled0, decoded.x, decoded.y);
-                            }
-                        }
-                    }
-
-                    // Every decoder lane publishes its generic shared stores to
-                    // the WGMMA async proxy. The second warp sync ensures lane 0
-                    // cannot signal readiness before its peers finish the fence.
-                    __syncwarp();
-                    cutlass::arch::fence_view_async_shared();
-                    __syncwarp();
-                    if (lane_idx == 0)
-                        decoded_ready_barriers[stage_idx]->arrive();
+                    wait_and_decode_processed_stage(
+                        frontend_warp_idx, local_expert_idx,
+                        k_block_idx, n_block_idx);
                 }
             });
         }
