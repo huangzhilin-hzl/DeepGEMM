@@ -1343,7 +1343,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 const uint32_t global_n = n_idx + local_n;
                                 const uint32_t weight_sf_k =
                                     k_block_idx * kNumMXFP4SFBKGroups;
-                                scale_word = __ldg(reinterpret_cast<const uint32_t*>(
+                                scale_word = __ldca(reinterpret_cast<const uint32_t*>(
                                     weight_sf_base + global_n * weight_sf_stride_k +
                                     weight_sf_k));
                             }
