@@ -189,6 +189,41 @@ def _normalize_mxfp4_packed_weight(weight: torch.Tensor) -> torch.Tensor:
     return weight if weight.dtype == torch.int8 else weight.view(torch.int8)
 
 
+def _reorder_mxfp4_sign_bits_for_sm90(weight: torch.Tensor) -> torch.Tensor:
+    """Reorder sign bits in each packed word for the fused SM90 decoder.
+
+    Magnitude bits stay in their original consecutive-nibble positions.  The
+    eight sign bits are changed from ``[s0,s1,s2,s3,s4,s5,s6,s7]`` to
+    ``[s0,s4,s1,s5,s2,s6,s3,s7]`` so the decoder can use ``packed << 4`` and
+    ``packed`` directly as the signs for output bytes 0..3 and 4..7.  This is
+    an internal processed-payload layout; raw Humming pairs remain unchanged.
+    """
+    assert weight.dtype in (torch.uint8, torch.int8)
+    assert weight.size(-1) % 4 == 0
+    original_dtype = weight.dtype
+    source = weight.contiguous().view(torch.uint8).reshape(*weight.shape[:-1], -1, 4)
+    reordered = source & 0x77
+    reordered[..., 0] |= (source[..., 0] & 0x08) | ((source[..., 2] & 0x08) << 4)
+    reordered[..., 1] |= ((source[..., 0] & 0x80) >> 4) | (source[..., 2] & 0x80)
+    reordered[..., 2] |= (source[..., 1] & 0x08) | ((source[..., 3] & 0x08) << 4)
+    reordered[..., 3] |= ((source[..., 1] & 0x80) >> 4) | (source[..., 3] & 0x80)
+    return reordered.reshape(weight.shape).view(original_dtype)
+
+
+def _restore_mxfp4_sign_bits_from_sm90(weight: torch.Tensor) -> torch.Tensor:
+    """Restore standard consecutive-nibble signs from the SM90 layout."""
+    assert weight.dtype in (torch.uint8, torch.int8)
+    assert weight.size(-1) % 4 == 0
+    original_dtype = weight.dtype
+    source = weight.contiguous().view(torch.uint8).reshape(*weight.shape[:-1], -1, 4)
+    restored = source & 0x77
+    restored[..., 0] |= (source[..., 0] & 0x08) | ((source[..., 1] & 0x08) << 4)
+    restored[..., 1] |= (source[..., 2] & 0x08) | ((source[..., 3] & 0x08) << 4)
+    restored[..., 2] |= ((source[..., 0] & 0x80) >> 4) | (source[..., 1] & 0x80)
+    restored[..., 3] |= ((source[..., 2] & 0x80) >> 4) | (source[..., 3] & 0x80)
+    return restored.reshape(weight.shape).view(original_dtype)
+
+
 def _process_mxfp4_fused_e8m0(
     weight: torch.Tensor,
     sf: torch.Tensor,
@@ -264,6 +299,8 @@ def _process_mxfp4_fused_e8m0(
                 lut_idx = delta_chunk.to(torch.long) * 256 + packed_chunk.to(torch.long)
                 rewritten_chunk = packed_lut[lut_idx].reshape(
                     row_end - row_start, -1)
+                rewritten_chunk = _reorder_mxfp4_sign_bits_for_sm90(
+                    rewritten_chunk)
                 if interleave_rows:
                     relative_start = row_start - region_start
                     relative_end = row_end - region_start
@@ -310,8 +347,9 @@ def transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
 ):
     """Prepare Humming fused-E8M0 MXFP4 weights for Hopper MegaMoE.
 
-    The returned triples contain rewritten packed E2M1 weights, bounded
-    exponent offsets in ``[1, 12]``, and one FP32 secondary scale per expert.
+    The returned triples contain rewritten packed E2M1 magnitudes with the
+    internal SM90 sign-bit layout, bounded exponent offsets in ``[1, 12]``,
+    and one FP32 secondary scale per expert.
     Optional Humming ``weight_scale_2`` tensors must also be per-expert ``[E]``
     scales; per-channel secondary scales are not supported by this kernel.
     """

@@ -105,6 +105,33 @@ CUTLASS_DEVICE uint2 sm90_mxfp4_e2m1x8_to_e4m3x8_bits(
     return result;
 }
 
+// The fused preprocessing keeps every magnitude nibble in place but moves
+// the eight signs in each packed word to [s0,s4,s1,s5,s2,s6,s3,s7].  The low
+// nibble signs of the four bytes therefore belong to outputs 0..3, and the
+// high nibble signs belong to outputs 4..7.  This removes the two sign-gather
+// PRMTs from every processed-payload decode without changing its byte size.
+CUTLASS_DEVICE uint2 sm90_mxfp4_reordered_signs_e2m1x8_to_e4m3x8_bits(
+    const uint32_t packed, const uint32_t exponent_offset) {
+    uint2 result;
+    asm volatile(
+        "{\n\t"
+        ".reg .b32 lookup_lo, lookup_hi, temp0, temp1, out_lo;\n\t"
+        "mad.lo.u32 lookup_lo, %3, 0x08080800, 0x0c080000;\n\t"
+        "mad.lo.u32 lookup_hi, %3, 0x08080808, 0x1c181410;\n\t"
+        "shl.b32 out_lo, %2, 4;\n\t"
+        "and.b32 temp0, %2, 0x77777777;\n\t"
+        "prmt.b32 temp1, lookup_lo, lookup_hi, temp0;\n\t"
+        "lop3.b32 out_lo, out_lo, 0x80808080, temp1, 0xea;\n\t"
+        "shr.u32 temp0, temp0, 16;\n\t"
+        "prmt.b32 temp1, lookup_lo, lookup_hi, temp0;\n\t"
+        "lop3.b32 %1, %2, 0x80808080, temp1, 0xea;\n\t"
+        "mov.b32 %0, out_lo;\n\t"
+        "}"
+        : "=r"(result.x), "=r"(result.y)
+        : "r"(packed), "r"(exponent_offset));
+    return result;
+}
+
 CUTLASS_HOST_DEVICE constexpr uint32_t sm90_mxfp4_ue8m0_to_float_bits(
     const uint8_t scale) {
     // UE8M0 code 0 is 2^-127, represented as an FP32 subnormal. Code 255 is
@@ -1427,7 +1454,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                             (decoded_scale_word >>
                                              (k32_idx * 8u)) & 0xffu;
                                         const uint2 decoded =
-                                            sm90_mxfp4_e2m1x8_to_e4m3x8_bits(
+                                            sm90_mxfp4_reordered_signs_e2m1x8_to_e4m3x8_bits(
                                                 packed_current,
                                                 exponent_offset);
                                         const uint32_t logical_n =
@@ -1459,7 +1486,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                             ((packed_k * sizeof(uint32_t)) ^
                                              packed_row_xor);
                                         const uint2 decoded =
-                                            sm90_mxfp4_e2m1x8_to_e4m3x8_bits(
+                                            sm90_mxfp4_reordered_signs_e2m1x8_to_e4m3x8_bits(
                                                 ptx::ld_shared(
                                                     reinterpret_cast<const uint32_t*>(
                                                         packed +

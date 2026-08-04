@@ -43,6 +43,10 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 import deep_gemm
+from deep_gemm.mega import (
+    _reorder_mxfp4_sign_bits_for_sm90,
+    _restore_mxfp4_sign_bits_from_sm90,
+)
 from deep_gemm.utils import per_token_cast_to_fp4, per_token_cast_to_fp8
 from deep_gemm.utils.dist import dist_print, init_dist, uneven_all_gather
 from deep_gemm.testing import calc_diff, get_arch_major
@@ -345,6 +349,17 @@ def _check_mxfp4_format_contract(device: torch.device) -> None:
     assert torch.equal(l2_w.view(torch.uint8), l2_raw)
     assert torch.equal(l2_sf, l2_sf_raw)
 
+    # Processed payloads retain magnitude nibbles but arrange the eight sign
+    # bits so two direct packed-word operands replace two runtime PRMTs.
+    sign_probe = torch.tensor(
+        [0x91, 0xa2, 0x3b, 0x4c], dtype=torch.uint8, device=device)
+    reordered_probe = _reorder_mxfp4_sign_bits_for_sm90(sign_probe)
+    assert torch.equal(
+        reordered_probe,
+        torch.tensor([0x91, 0x2a, 0xb3, 0x4c], dtype=torch.uint8, device=device))
+    assert torch.equal(
+        _restore_mxfp4_sign_bits_from_sm90(reordered_probe), sign_probe)
+
     # The fused-E8M0 preprocessing follows Humming's exact E2M1 requantizer.
     # A 16-code row exercises both signs, negative-zero normalization, and all
     # rounding boundaries for exponent deltas 0..5.
@@ -366,7 +381,9 @@ def _check_mxfp4_format_contract(device: torch.device) -> None:
         [0x00, 0x00, 0x00, 0x00, 0x80, 0x88, 0x88, 0x88],
         [0x10, 0x32, 0x54, 0x76, 0x90, 0xba, 0xdc, 0xfe],
     ], dtype=torch.uint8, device=device).repeat(1, 2)
-    assert torch.equal(processed_w.view(torch.uint8)[0], expected_rows)
+    assert torch.equal(
+        _restore_mxfp4_sign_bits_from_sm90(processed_w).view(torch.uint8)[0],
+        expected_rows)
     assert torch.equal(
         processed_offsets,
         torch.tensor([1, 1, 1, 1, 1, 1, 12], dtype=torch.uint8,
@@ -677,11 +694,12 @@ def _run_scenario(
     if weight_format == 'mxfp4' and mxfp4_scale_mode == 'processed':
         l1_processed_w, l1_offsets, l1_secondary = transformed_l1
         l2_processed_w, l2_offsets, l2_secondary = transformed_l2
-        reference_l1_w = _deinterleave_weights(l1_processed_w)
+        reference_l1_w = _restore_mxfp4_sign_bits_from_sm90(
+            _deinterleave_weights(l1_processed_w))
         reference_l1_sf = (
             l1_secondary[:, None, None] *
             torch.exp2(_deinterleave_weights(l1_offsets).float()))
-        reference_l2_w = l2_processed_w
+        reference_l2_w = _restore_mxfp4_sign_bits_from_sm90(l2_processed_w)
         reference_l2_sf = (
             l2_secondary[:, None, None] * torch.exp2(l2_offsets.float()))
         if force_mxfp4_requant:
