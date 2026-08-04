@@ -2229,3 +2229,142 @@ matrix improves every active Flash point; and NCU/NSYS independently attribute
 the reduction to L1. The next optimization should reduce the in-flight decoder
 register peak or apply the same independent-work principle to L2 without
 moving the dependency wait or early-release barrier.
+
+## Iterations 27-30: pipeline packed LDS through the Flash L2 decoder
+
+The next campaign tried to apply the Iteration 26 independent-work principle
+to linear2. Three structurally larger variants were rejected before the final
+minimal schedule was accepted:
+
+| Iteration | Experiment | Exact production resource finding | Decision |
+|---:|---|---|---|
+| 27 | Replace the validated two-word decoder with a direct decoder | Correct, but Flash regressed 3.2-6.1% | REJECT |
+| 28 | Decode the complete next TMA stage through the current L2 WGMMA flight | `REG128/STACK72`; 31 LDL and 31 STL in the hot loop | REJECT |
+| 29 | Split next-stage decode across the two WGMMA groups | Same `REG128/STACK72` register cliff and hot-loop local traffic | REJECT |
+| 30 | Reuse the current-tile two-word packed-LDS lookahead in Flash L2 | `REG128/STACK0`; zero LDL/STL | ACCEPT |
+
+Iteration 30 introduces the `kPipelinePackedLDS` compile-time predicate to
+widen the existing packed-LDS behavior. It reuses the already validated
+`packed_current`/`packed_next` state machine in linear2 when all of the
+following are true:
+
+- the processed-scale overlap specialization was selected by the host;
+- the phase runs linear2;
+- `hidden == 4096` and `intermediate_hidden == 2048`.
+
+The host overlap specialization requires processed MXFP4 and
+`(hidden > 4096 || M <= 4096)`. The new linear2 shape gate then restricts the
+added path to the H4096/IH2048 family, for which the host condition reduces to
+`M <= 4096`. Raw MXFP4, FP8, Pro, and Flash M4097 therefore retain their
+previous generated kernel. There is no new JIT parameter, shared-memory slot,
+barrier, stage, or thread role. Decoder temporaries die before the first
+linear2 QGMMA, avoiding the accumulator-live-range spill seen in Iterations 28
+and 29.
+
+### Correctness and production-resource gates
+
+All final-source checks use tolerance 0.01.
+
+| Scenario | Result | Maximum `calc_diff` |
+|---|---:|---:|
+| Eight-rank processed Flash M128 | PASS | 0.0007 |
+| One-rank Flash M4096, fast-math 0/1 | 2 / 2 PASS, overlap enabled | 0.0007 |
+| One-rank Flash M4097, fast-math 0/1 | 2 / 2 PASS, overlap excluded | 0.0007 |
+| One-rank raw MXFP4 Flash M128 | PASS | 0.0010 |
+| One-rank FP8 Flash M128 | PASS | 0.0006 |
+
+The exact eight-rank production cubin remains `REG128/STACK16` for L1 and is
+`REG128/STACK0` for L2. The L2 SASS contains four QGMMA instructions, two
+`WARPGROUP.ARRIVE` instructions, and no LDL or STL instruction. The change
+therefore preserves the two-CTA-per-SM resource contract and does not repeat
+the Iteration 28/29 local-memory failure.
+
+### Exact-source A/B/A acceptance
+
+The primary test alternates the Iteration 30 source and an exact detached
+Iteration 26 `e996430c` source tree on the same H20 node with independent JIT
+caches. M128 uses 15 observations and M256 uses 20 observations; every
+observation contains 20 internal tests and the metric is median maximum-rank
+latency.
+
+| Point | Iter. 30 A1 | Iter. 26 B | Iter. 30 A2 | A1 vs B | A2 vs B |
+|---|---:|---:|---:|---:|---:|
+| Flash M128 | 587.704 us | 609.458 us | 581.601 us | -3.57% | -4.57% |
+| Pro M128 control | 1,942.709 us | 1,945.956 us | 1,952.289 us | -0.17% | +0.33% |
+| Flash M256 | 592.243 us | 606.380 us | 588.171 us | -2.33% | -3.00% |
+
+The Flash M128 candidate mean is 584.653 us, 4.07% below Iteration 26. Pro is
+not specialized and its candidate-mean change is +0.08%, bounding campaign
+drift. The M256 A/B/A was added after the full matrix showed a noisy cross-run
+outlier; both independent candidate runs reproduce the L2 improvement.
+
+### Full H20 matrix
+
+The final eight-rank PR383 contract completes all 44 co-measured FP8/MXFP4
+cases: Flash and Pro, 11 token counts, 50 observations for M at most 128,
+three for larger M, and 20 internal tests per observation.
+
+| M | Flash FP8 (us) | Flash Iter. 30 (us) | vs Iter. 26 | Pro FP8 (us) | Pro Iter. 30 (us) | vs Iter. 26 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 320.901 | 474.297 | -2.70% | 687.817 | 1,240.478 | +0.19% |
+| 16 | 316.159 | 518.288 | -2.16% | 959.625 | 1,735.975 | -0.05% |
+| 32 | 332.131 | 549.358 | -1.46% | 1,047.981 | 1,870.848 | -0.26% |
+| 64 | 380.770 | 560.631 | -0.80% | 1,109.795 | 1,910.860 | +0.42% |
+| 128 | 448.256 | 563.073 | -2.08% | 1,207.145 | 1,936.244 | +0.48% |
+| 256 | 488.899 | 599.933 | +4.19% | 1,651.306 | 1,950.606 | -0.17% |
+| 512 | 927.396 | 1,045.458 | -2.34% | 2,463.865 | 2,903.000 | -0.45% |
+| 1,024 | 1,533.642 | 1,798.261 | -1.09% | 4,038.000 | 4,865.000 | -0.31% |
+| 2,048 | 2,715.531 | 3,160.000 | -3.48% | 7,030.000 | 8,515.000 | +0.15% |
+| 4,096 | 5,100.000 | 6,008.000 | -2.39% | 12,968.000 | 15,590.000 | -0.11% |
+| 8,192 | 9,865.000 | 13,982.000 | +0.34% | 25,130.000 | 30,405.000 | +0.08% |
+
+Across all 11 Flash points the geometric-mean throughput speedup over
+Iteration 26 is 1.013x; across the ten active `M <= 4096` points it is 1.015x.
+Pro is neutral at 1.000x. The current co-measured geometric-mean MXFP4/FP8
+latency ratio is 1.332x for Flash and 1.421x for Pro. At M128 the ratios are
+1.256x and 1.604x.
+
+The formal M256 row is the only active cross-campaign regression. The same
+matrix also moves FP8 M256 by -2.36% and FP8 M8 by +7.47%, demonstrating node
+noise. The exact-source M256 A/B/A above reverses the outlier and shows a
+2.33-3.00% improvement; the row is retained rather than silently discarded.
+M8192 is outside the new gate and its +0.34% movement is a control.
+
+Historical same-node DeepEP HT M128 references are 643.312/1,829.120 us.
+Iteration 30 is 12.47% faster for Flash and 5.86% slower for Pro. These values
+are not co-measured in this campaign. MXFP4 remains slower than current FP8 at
+every formal point, so Iteration 30 is neither FP8 parity nor an overall SOTA
+claim.
+
+### NCU and NSYS attribution
+
+Full-set one-rank Flash M128/E32 NCU localizes the gain to linear2. NCU replay
+duration varies more than the steady NSYS trace for unchanged L1, so L1 is
+treated as a control and the acceptance claim uses the consistent L2 signal.
+
+| NCU metric | Iter. 26 L1 | Iter. 30 L1 | Iter. 26 L2 | Iter. 30 L2 | L2 change |
+|---|---:|---:|---:|---:|---:|
+| Duration | 355.71 us | 326.30 us | 226.66 us | 192.26 us | -15.18% |
+| Executed instructions | 74,199,009 | 74,198,689 | 40,494,531 | 40,295,109 | -0.49% |
+| Registers per thread | 128 | 128 | 128 | 128 | 0 |
+| Achieved occupancy | 18.46% | 18.46% | 23.85% | 23.76% | -0.09 pp |
+| No eligible warp | 56.46% | 56.77% | 65.30% | 62.12% | -3.18 pp |
+| Memory throughput | 854.25 GB/s | 931.46 GB/s | 694.90 GB/s | 818.56 GB/s | +17.80% |
+| Local spill requests | 0 | 0 | 0 | 0 | 0 |
+
+NSYS traces 124 L1/L2 pairs and excludes the first lazy/JIT pair. The steady
+123-pair median shows unchanged L1 (+0.44%), a 6.11% lower L2, and a 2.00%
+lower complete hot path.
+
+| NSYS steady median | Iter. 26 | Iter. 30 | Change |
+|---|---:|---:|---:|
+| L1 | 326.785 us | 328.225 us | +0.44% |
+| Inter-kernel gap | 1.280 us | 1.248 us | -0.032 us |
+| L2 | 204.705 us | 192.193 us | -6.11% |
+| Hot path | 532.450 us | 521.826 us | -2.00% |
+
+Iteration 30 is accepted because the final source passes target, boundary, and
+excluded-format correctness; production L2 has no stack or local traffic; both
+M128 and M256 A/B/A reproduce the gain; Pro remains neutral; and NCU/NSYS
+independently attribute the reduction to L2. The full matrix and the noisy M256
+outlier remain recorded to keep the performance evidence auditable.

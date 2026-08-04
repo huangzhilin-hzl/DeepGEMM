@@ -1383,8 +1383,18 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                     cute::Swizzle<2, 4, 3>::apply(packed_row_base) ^
                                     packed_row_base;
 
-                                if constexpr (is_linear1_phase and
-                                              kOverlapProcessedScalePath) {
+                                // Reuse the validated two-word LDS lookahead
+                                // for Flash L2. Decoder temporaries die before
+                                // the first QGMMA, unlike rejected next-stage
+                                // overlap, so they do not cross accumulator
+                                // lifetime.
+                                constexpr bool kPipelinePackedLDS =
+                                    kOverlapProcessedScalePath and
+                                    (is_linear1_phase or
+                                     (MegaMoEPhase::runs_linear2 and
+                                      kHidden == 4096 and
+                                      kIntermediateHidden == 2048));
+                                if constexpr (kPipelinePackedLDS) {
                                     const uint32_t first_packed_byte_offset =
                                         packed_row_base +
                                         ((packed_k_in_k32 * sizeof(uint32_t)) ^

@@ -885,6 +885,16 @@ def _layer4_processed_overlap_boundary(
         for fast_math in (True, False):
             cfg = dict(base, num_tokens=tokens, fast_math=fast_math)
             out.append((f'L4.overlap.t{tokens}.fm{int(fast_math)}', cfg))
+    # Exercise both sides of the production Flash L2 packed-LDS lookahead
+    # gate. Keep the expert count small so this remains a practical one-rank
+    # correctness boundary rather than a performance test.
+    flash_base = dict(num_max_tokens_per_rank=4097,
+                      hidden=4096, intermediate_hidden=2048,
+                      num_experts=8 * num_ranks, num_topk=2)
+    for tokens in (4096, 4097):
+        for fast_math in (True, False):
+            cfg = dict(flash_base, num_tokens=tokens, fast_math=fast_math)
+            out.append((f'L4.flash_overlap.t{tokens}.fm{int(fast_math)}', cfg))
     return out
 
 
