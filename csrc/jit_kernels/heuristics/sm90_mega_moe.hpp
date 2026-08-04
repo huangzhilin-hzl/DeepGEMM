@@ -922,7 +922,9 @@ static Sm90MoeLaunchConfig select_mxfp4_mega_moe_sm90(
         true,
         true,
         true,
-        false);
+        input.processed_mxfp4_scales and
+            input.hidden == 4096 and
+            input.num_tokens <= kSM90MoeMaxLatencyOverlapTokens);
     // `smem_capacity` is the opt-in per-block limit. Reserve the remaining
     // 1 KiB/CTA implementation overhead in the two-CTA static precheck; the
     // exact JIT kernel still goes through the runtime occupancy hard gate.

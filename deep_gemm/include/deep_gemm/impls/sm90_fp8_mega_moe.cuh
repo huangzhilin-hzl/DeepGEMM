@@ -489,11 +489,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K * sizeof(a_dtype_t);
     constexpr uint32_t SMEM_B_SIZE_PER_STAGE =
         LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t);
-    // Flash L1 reserves a second expanded tile so the math WG can decode the
-    // next packed-B stage while the current WGMMA group is in flight. Other
-    // MXFP4 shapes retain one fixed tile; FP8 keeps staged B tiles.
+    // Flash reserves a second expanded tile so the math WG can decode the
+    // next packed-B stage while the current phase's final WGMMA group is in
+    // flight. Other MXFP4 shapes retain one fixed tile; FP8 keeps staged B
+    // tiles.
     constexpr bool kDoubleBufferedMXFP4ExpandedBStorage =
-        kMXFP4Weights and MegaMoEPhase::runs_linear1 and
+        kMXFP4Weights and
         kHidden == 4096 and BLOCK_N == 128 and BLOCK_K == 128 and
         kProcessedMXFP4Scales and kOverlapProcessedScalePath;
     constexpr bool kPipelineMXFP4ExpandedB =
@@ -1770,11 +1771,29 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                     stage_idx, 0, processed_secondary);
                             } else {
                                 issue_processed_wgmma.template operator()<0, 2>(
-                                    stage_idx, 0);
+                                    stage_idx, expanded_slot);
                                 promote_processed.template operator()<false>(
                                     stage_idx, 0, processed_secondary);
                                 issue_processed_wgmma.template operator()<2, 2>(
-                                    stage_idx, 0);
+                                    stage_idx, expanded_slot);
+                                if constexpr (kPipelineMXFP4ExpandedB) {
+                                    // L2's first K64 group must be promoted
+                                    // before the second group can reuse the
+                                    // fragment. Hide the next packed-stage
+                                    // decode under the final K64 WGMMA flight.
+                                    if (k_block_idx + 1 < num_k_blocks) {
+                                        const uint32_t next_stage =
+                                            stage_idx == kNumStages - 1 ?
+                                                0u : stage_idx + 1u;
+                                        const uint32_t next_phase =
+                                            phase ^ (next_stage == 0u);
+                                        full_barriers[next_stage]->wait(
+                                            next_phase);
+                                        prepare_stage_weights(
+                                            k_block_idx + 1, next_stage,
+                                            expanded_slot ^ 1u);
+                                    }
+                                }
                                 promote_processed.template operator()<
                                     kEarlyReleaseProcessedStage>(
                                     stage_idx, 1, processed_secondary);
