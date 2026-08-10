@@ -22,22 +22,14 @@
 
 namespace deep_gemm::mega {
 
-// The persistent MXFP4 specialization is fixed to BM64. Sizing for inactive
-// BM128 split-kernel candidates would unnecessarily double the physical ring
-// and obscure wrap-around coverage.
-static constexpr int kSM90MegaMoECandidateBlockMs[] = {64};
+static constexpr int kSM90MegaMoEBlockM = MegaMoESM90Config::block_m;
 static constexpr int kSM90MegaMoETokenAlignment = 128;
-static constexpr int kSM90MegaMoEBlockN = 128;
+static constexpr int kSM90MegaMoEBlockN = MegaMoESM90Config::block_n;
 static constexpr int kSM90MegaMoEWorkerCTAsPerSM = 2;
 static constexpr int kSM90MegaMoECTAsPerTask = 1;
 // The dispatch-side NVLink barrier assigns one signaling thread per rank and
 // the compact MXFP4 frontend has 64 dispatch threads.
 static constexpr int kSM90MegaMoEMaxRanks = 64;
-
-// Packed-MXFP4 uses the single-launch persistent scheduler and all four
-// live-block generation counters, so only physical activation/SF/weight slots
-// are ring-sized. Full logical-pool source metadata remains in Workspace.
-static constexpr bool kSM90MegaMoELiveBlockRuntimeEnabled = true;
 
 using SM90MegaMoEBufferViews = std::tuple<
     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
@@ -60,28 +52,21 @@ static int get_num_ring_tokens_for_sm90_mega_moe(
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden) {
     const auto num_experts_per_rank = num_experts / num_ranks;
-    const auto num_max_pool_tokens = layout::get_num_max_pool_tokens(
-        num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
-    if (not kSM90MegaMoELiveBlockRuntimeEnabled)
-        return num_max_pool_tokens;
-
-    // Mirror main's conservative live-block bound, restricted to the SM90
-    // BLOCK_M candidates.  Only physical activation/SF/top-k-weight storage is
-    // ring-sized; Workspace keeps full-pool source metadata.
+    // Only physical activation/SF/top-k-weight slots are ring-sized; Workspace
+    // retains the full logical-pool source metadata.
     const auto num_worker_ctas =
         kSM90MegaMoEWorkerCTAsPerSM * device_runtime->get_num_sms();
     const auto num_active_topk = std::min(num_topk, num_experts_per_rank);
     const auto num_max_routed_tokens =
         num_max_tokens_per_rank * num_ranks * num_active_topk;
-    int num_ring_tokens = 0;
-    for (const auto& block_m: kSM90MegaMoECandidateBlockMs) {
-        const auto num_pool_blocks =
-            math::ceil_div(num_max_routed_tokens, block_m) + num_experts_per_rank;
-        const auto num_live_pool_blocks = sched::get_num_max_live_pool_blocks(
-            num_pool_blocks, num_worker_ctas, hidden, intermediate_hidden,
-            kSM90MegaMoEBlockN, kSM90MegaMoECTAsPerTask);
-        num_ring_tokens = std::max(num_ring_tokens, num_live_pool_blocks * block_m);
-    }
+    const auto num_pool_blocks =
+        math::ceil_div(num_max_routed_tokens, kSM90MegaMoEBlockM) +
+        num_experts_per_rank;
+    const auto num_live_pool_blocks = sched::get_num_max_live_pool_blocks(
+        num_pool_blocks, num_worker_ctas, hidden, intermediate_hidden,
+        kSM90MegaMoEBlockN, kSM90MegaMoECTAsPerTask);
+    const auto num_ring_tokens =
+        num_live_pool_blocks * kSM90MegaMoEBlockM;
     return math::align(num_ring_tokens, kSM90MegaMoETokenAlignment);
 }
 
@@ -112,12 +97,8 @@ get_symm_buffer_size_for_sm90_mega_moe(
     const auto num_ring_tokens = get_num_ring_tokens_for_sm90_mega_moe(
         num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden);
-    int num_sf_ring_tokens = 0;
-    for (int block_m: kSM90MegaMoECandidateBlockMs) {
-        num_sf_ring_tokens = std::max(
-            num_sf_ring_tokens,
-            layout::get_num_sf_ring_tokens(num_ring_tokens, block_m));
-    }
+    const auto num_sf_ring_tokens = layout::get_num_sf_ring_tokens(
+        num_ring_tokens, kSM90MegaMoEBlockM);
     const auto scale_layout_spec =
         layout::ScaleLayoutSpec::sm90_fp32_k128_k64(hidden, intermediate_hidden);
     const auto mega_buffer = layout::MegaMoEBuffer(

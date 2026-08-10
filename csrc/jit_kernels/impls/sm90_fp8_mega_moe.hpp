@@ -46,7 +46,6 @@ public:
         int num_ring_tokens, num_sf_ring_tokens;
         float activation_clamp;
         bool fast_math;
-        bool bf16_scaled_accum;
         MegaMoESM90Config config;
 
         // Runtime arguments. num_tokens also selects the canonical compile-time
@@ -98,15 +97,7 @@ static void __instantiate_kernel() {{
         {},
         {}, {},
         {}, {},
-        {},
-        {}, {}, {},
-        {},
         {}, {},
-        {},
-        {}, {}, {},
-        {}, {},
-        {},
-        {},
         {},
         {},
         {},
@@ -117,18 +108,9 @@ static void __instantiate_kernel() {{
     args.num_max_tokens_per_rank,
     args.hidden, args.intermediate_hidden,
     args.num_experts, args.num_topk,
-    args.config.num_experts_per_wave,
-    args.config.block_m, args.config.block_n, args.config.block_k,
-    args.config.num_max_pool_tokens,
-    args.config.num_padded_sf_pool_tokens,
-    args.config.sf_pool_stride_tokens,
-    args.config.num_stages,
-    args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.config.num_sms, args.num_ranks,
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false",
-    args.config.swap_ab ? "true" : "false",
-    args.bf16_scaled_accum ? "true" : "false",
     overlap_mxfp4_scale_path ? "true" : "false",
     args.num_ring_tokens, args.num_sf_ring_tokens, args.num_shared_experts);
     }
@@ -218,8 +200,7 @@ static void sm90_fp8_mxfp4_mega_moe(
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_ring_tokens = static_cast<int>(l1_acts.size(0));
-    const auto num_padded_sf_pool_tokens = static_cast<int>(l1_acts_sf.size(0));
-    const auto num_sf_ring_tokens = num_padded_sf_pool_tokens;
+    const auto num_sf_ring_tokens = static_cast<int>(l1_acts_sf.size(0));
     const auto shared_intermediate_hidden =
         intermediate_hidden * num_shared_experts;
     DG_HOST_ASSERT(num_shared_experts >= 0);
@@ -229,15 +210,13 @@ static void sm90_fp8_mxfp4_mega_moe(
                     shared_l1_weights.defined() and shared_l2_weights.defined() and
                     shared_l1_weights_sf.defined() and shared_l2_weights_sf.defined()));
 
-    // Resolve the production MXFP4 schedule and numerical mode once. The
-    // runtime only consumes the resulting complete persistent launch config.
+    // Resolve the production MXFP4 persistent launch config once.
     const int num_sms = device_runtime->get_num_sms();
     const Sm90MoeHeuristicInput heuristic_input {
         num_sms,
-        num_ranks, num_experts, num_experts_per_rank,
-        num_max_tokens_per_rank, num_tokens, num_topk,
-        hidden, intermediate_hidden,
-        num_padded_sf_pool_tokens
+        num_experts,
+        num_tokens,
+        hidden, intermediate_hidden
     };
     const auto config = select_mxfp4_mega_moe_sm90(heuristic_input);
 
@@ -249,9 +228,8 @@ static void sm90_fp8_mxfp4_mega_moe(
     // a block-(128, 128) FP32 pointer.
     constexpr int kGranK = 128;
     constexpr int kL2ActsSFGranK = 64;
-    // A BK256 pipeline stage is represented in shared memory as two adjacent
-    // independently-swizzled BK128 TMA tiles. Keep the tensor-map box at 128
-    // and issue two copies; the kernel config/scheduler still advances by 256.
+    // Keep each tensor-map box within Hopper's TMA limits if the schedule is
+    // widened later; the current Humming schedule resolves both to 128.
     const int tma_block_k = std::min(config.block_k, kGranK);
     const int tma_block_n = std::min(config.block_n, 256);
     const int pool_tokens = num_ring_tokens;
@@ -277,17 +255,9 @@ static void sm90_fp8_mxfp4_mega_moe(
     // staging tile to SMEM as plain row-major bytes, so the TMA store descriptor
     // must use no shared-memory swizzle. Later L2 TMA loads may still swizzle
     // from this row-major global buffer into their own SMEM tile.
-    // The default TMA store is issued per warpgroup, each writing a WG_BLOCK_M
-    // row tile. In split-N mode, two WGs produce different N halves of the same
-    // M rows, then one TMA store writes the full 64x128 post-SwiGLU tile.
-    const int num_epilogue_warpgroups_h = config.num_epilogue_threads / 128;
-    const auto wg_layout = layout::get_sm90_moe_warpgroup_layout(
-        config.block_m, config.block_n, num_epilogue_warpgroups_h);
-    const int wg_block_m = static_cast<int>(wg_layout.block_m);
-    const int wg_block_n = static_cast<int>(wg_layout.block_n);
-    const int wg_l1_out_block_n = wg_block_n / 2;
-    const int l1_output_box_n = wg_layout.split_n ? config.block_n / 2 : wg_l1_out_block_n;
-    const int l1_output_box_m = wg_layout.split_n ? config.block_m : wg_block_m;
+    // One warpgroup produces and stores the complete post-SwiGLU tile.
+    constexpr int l1_output_box_n = MegaMoESM90Config::block_n / 2;
+    constexpr int l1_output_box_m = MegaMoESM90Config::block_m;
     const auto tensor_map_l1_output = make_tma_2d_desc(l2_acts,
                                                        intermediate_hidden, pool_tokens,
                                                        l1_output_box_n, l1_output_box_m,
@@ -369,7 +339,6 @@ static void sm90_fp8_mxfp4_mega_moe(
         cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
 
     // Launch
-    constexpr bool bf16_scaled_accum = false;
     auto persistent_config = config;
     // The unified sizing already covers both logical phases. Add only the
     // persistent scheduler mailboxes/barriers here; the physical SF ring is the
@@ -378,7 +347,6 @@ static void sm90_fp8_mxfp4_mega_moe(
         (4 + (num_shared_experts > 0 ? 2 : 0)) *
             static_cast<int>(sizeof(cutlass::arch::ClusterTransactionBarrier)) +
         2 * static_cast<int>(sizeof(sched::TaskInfo<true>));
-    persistent_config.sf_pool_stride_tokens = num_sf_ring_tokens;
 
     const SM90FP8MXFP4MegaMoERuntime::Args args = {
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
@@ -391,7 +359,6 @@ static void sm90_fp8_mxfp4_mega_moe(
         .num_sf_ring_tokens = num_sf_ring_tokens,
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
-        .bf16_scaled_accum = bf16_scaled_accum,
         .config = persistent_config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
@@ -420,7 +387,7 @@ static void sm90_fp8_mxfp4_mega_moe(
         .shared_l2_weights_sf = num_shared_experts > 0 ?
             shared_l2_weights_sf.data_ptr<float>() : nullptr,
         .launch_args = LaunchArgs(
-            persistent_config.num_sms,
+            config.num_sms,
             persistent_config.num_dispatch_threads +
                 persistent_config.num_non_epilogue_threads +
                 persistent_config.num_epilogue_threads,
