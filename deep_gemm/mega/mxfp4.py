@@ -6,14 +6,12 @@ can therefore be contract-tested on CPU.
 """
 
 from typing import Optional, Tuple
-import warnings
 
 import torch
 
 
-MXFP4RawWeights = Tuple[torch.Tensor, torch.Tensor]
+MXFP4CheckpointWeights = Tuple[torch.Tensor, torch.Tensor]
 MXFP4ProcessedWeights = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-MXFP4Weights = Tuple[torch.Tensor, ...]
 
 
 def _is_valid_sm90_mxfp4_hidden_size(hidden: int) -> bool:
@@ -77,10 +75,10 @@ def _normalize_mxfp4_packed_weight(weight: torch.Tensor) -> torch.Tensor:
     return weight if weight.dtype == torch.int8 else weight.view(torch.int8)
 
 
-def _validate_raw_mxfp4_weights(
-    weights: MXFP4RawWeights,
+def _validate_checkpoint_mxfp4_weights(
+    weights: MXFP4CheckpointWeights,
     name: str,
-) -> MXFP4RawWeights:
+) -> MXFP4CheckpointWeights:
     if not isinstance(weights, tuple) or len(weights) != 2:
         raise TypeError(f'{name} must be a (packed_weight, ue8m0_scale) tuple')
     weight = _normalize_mxfp4_packed_weight(weights[0])
@@ -98,8 +96,8 @@ def _validate_raw_mxfp4_weights(
 
 
 def _validate_mxfp4_layer_pair(
-    l1_weights: MXFP4RawWeights,
-    l2_weights: MXFP4RawWeights,
+    l1_weights: MXFP4CheckpointWeights,
+    l2_weights: MXFP4CheckpointWeights,
 ) -> None:
     l1_w, _ = l1_weights
     l2_w, _ = l2_weights
@@ -182,7 +180,7 @@ def _restore_mxfp4_sign_bits_from_sm90(weight: torch.Tensor) -> torch.Tensor:
     return restored.reshape(weight.shape).view(original_dtype)
 
 
-def _process_mxfp4_fused_e8m0(
+def _process_mxfp4_e8m0(
     weight: torch.Tensor,
     sf: torch.Tensor,
     interleave_rows: bool = False,
@@ -194,7 +192,7 @@ def _process_mxfp4_fused_e8m0(
     the returned FP32 secondary scale restores the common expert exponent in
     the MegaMoE accumulation path.
     """
-    weight, raw_sf = _validate_raw_mxfp4_weights((weight, sf), 'MXFP4')
+    weight, raw_sf = _validate_checkpoint_mxfp4_weights((weight, sf), 'MXFP4')
     _require(not bool((raw_sf == 255).any().item()),
              'processed MXFP4 does not accept UE8M0 NaN code 255')
     if interleave_rows:
@@ -268,43 +266,6 @@ def _process_mxfp4_fused_e8m0(
     return rewritten.view(torch.int8), offsets.contiguous(), secondary
 
 
-def transform_weights_for_fp8_mxfp4_mega_moe_sm90(
-    l1_weights: MXFP4RawWeights,
-    l2_weights: MXFP4RawWeights,
-) -> Tuple[MXFP4RawWeights, MXFP4RawWeights]:
-    """Prepare raw Humming-compatible MXFP4 weights for Hopper MegaMoE.
-
-    Input weights are packed E2M1 ``[E, N, K/2]`` and scale tensors are
-    natural-layout UE8M0 ``[E, N, K/32]``.  L1 weight and scale rows are
-    interleaved at granularity 8 for the fused SwiGLU epilogue; L2 remains in
-    its natural row order.
-    """
-    l1 = _validate_raw_mxfp4_weights(l1_weights, 'L1 MXFP4')
-    l2 = _validate_raw_mxfp4_weights(l2_weights, 'L2 MXFP4')
-    _validate_mxfp4_layer_pair(l1, l2)
-    return (
-        _interleave_mxfp4_rows(l1[0]),
-        _interleave_mxfp4_rows(l1[1]),
-    ), (l2[0].contiguous(), l2[1].contiguous())
-
-
-def _resolve_weight_scale_2(
-    primary: Optional[torch.Tensor],
-    legacy: Optional[torch.Tensor],
-    name: str,
-) -> Optional[torch.Tensor]:
-    if primary is not None and legacy is not None:
-        raise ValueError(f'{name}_weight_scale_2 and legacy {name}_global_scale are mutually exclusive')
-    if legacy is not None:
-        warnings.warn(
-            f'`{name}_global_scale` is deprecated; use `{name}_weight_scale_2`',
-            DeprecationWarning,
-            stacklevel=3,
-        )
-        return legacy
-    return primary
-
-
 def _apply_weight_scale_2(
     scale: torch.Tensor,
     secondary: torch.Tensor,
@@ -326,35 +287,28 @@ def _apply_weight_scale_2(
 
 
 def transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
-    l1_weights: MXFP4RawWeights,
-    l2_weights: MXFP4RawWeights,
+    l1_weights: MXFP4CheckpointWeights,
+    l2_weights: MXFP4CheckpointWeights,
     l1_weight_scale_2: Optional[torch.Tensor] = None,
     l2_weight_scale_2: Optional[torch.Tensor] = None,
-    *,
-    l1_global_scale: Optional[torch.Tensor] = None,
-    l2_global_scale: Optional[torch.Tensor] = None,
 ) -> Tuple[MXFP4ProcessedWeights, MXFP4ProcessedWeights]:
-    """Prepare processed MXFP4 triples for Hopper MegaMoE.
+    """Prepare Humming-compatible MXFP4 triples for Hopper MegaMoE.
 
     Each result is ``(processed_e2m1, relative_ue8m0, weight_scale_2)``.
     ``weight_scale_2`` is FP32 ``[E]`` and includes the optional Humming
-    checkpoint secondary scale.  The legacy ``*_global_scale`` keywords are
-    accepted temporarily for migration from the experimental SM90 branch.
+    checkpoint secondary scale. This is the only routed MXFP4 weight contract
+    accepted by the SM90 runtime.
     """
-    l1 = _validate_raw_mxfp4_weights(l1_weights, 'L1 MXFP4')
-    l2 = _validate_raw_mxfp4_weights(l2_weights, 'L2 MXFP4')
+    l1 = _validate_checkpoint_mxfp4_weights(l1_weights, 'L1 MXFP4')
+    l2 = _validate_checkpoint_mxfp4_weights(l2_weights, 'L2 MXFP4')
     _validate_mxfp4_layer_pair(l1, l2)
 
-    l1_weight_scale_2 = _resolve_weight_scale_2(
-        l1_weight_scale_2, l1_global_scale, 'l1')
-    l2_weight_scale_2 = _resolve_weight_scale_2(
-        l2_weight_scale_2, l2_global_scale, 'l2')
     _require((l1_weight_scale_2 is None) == (l2_weight_scale_2 is None),
              'L1 and L2 weight_scale_2 must either both be provided or both be omitted')
 
-    l1_w, l1_sf, l1_secondary = _process_mxfp4_fused_e8m0(
+    l1_w, l1_sf, l1_secondary = _process_mxfp4_e8m0(
         *l1, interleave_rows=True)
-    l2_w, l2_sf, l2_secondary = _process_mxfp4_fused_e8m0(*l2)
+    l2_w, l2_sf, l2_secondary = _process_mxfp4_e8m0(*l2)
     if l1_weight_scale_2 is not None:
         l1_secondary = _apply_weight_scale_2(
             l1_weight_scale_2, l1_secondary, 'l1')
@@ -368,20 +322,22 @@ def transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
     ), (l2_w.contiguous(), l2_sf.contiguous(), l2_secondary)
 
 
-def validate_mxfp4_kernel_weights(
-    l1_weights: MXFP4Weights,
-    l2_weights: MXFP4Weights,
-) -> int:
-    """Validate transformed raw pairs or processed triples for the wrapper.
-
-    Returns the common tuple arity (2 for raw, 3 for processed).
-    """
+def _validate_processed_mxfp4_kernel_weights(
+    l1_weights: MXFP4ProcessedWeights,
+    l2_weights: MXFP4ProcessedWeights,
+) -> None:
+    """Validate transformed Humming triples for the SM90 wrapper."""
     if not isinstance(l1_weights, tuple) or not isinstance(l2_weights, tuple):
         raise TypeError('SM90 MXFP4 weights must be tuples')
-    if len(l1_weights) != len(l2_weights) or len(l1_weights) not in (2, 3):
-        raise ValueError('L1/L2 SM90 MXFP4 weights must be matching pairs or triples')
+    if len(l1_weights) != 3 or len(l2_weights) != 3:
+        raise ValueError(
+            'L1/L2 SM90 MXFP4 weights must be Humming processed triples; '
+            'call transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90 first')
 
-    def validate_payload(weights: MXFP4Weights, name: str) -> MXFP4RawWeights:
+    def validate_payload(
+        weights: MXFP4ProcessedWeights,
+        name: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         weight, sf = weights[:2]
         if not isinstance(weight, torch.Tensor) or not isinstance(sf, torch.Tensor):
             raise TypeError(f'{name} payload entries must be torch.Tensor objects')
@@ -406,20 +362,18 @@ def validate_mxfp4_kernel_weights(
     l1 = validate_payload(l1_weights, 'transformed L1 MXFP4')
     l2 = validate_payload(l2_weights, 'transformed L2 MXFP4')
     _validate_mxfp4_layer_pair(l1, l2)
-    if len(l1_weights) == 3:
-        for weights, payload, name in (
-            (l1_weights, l1, 'l1'),
-            (l2_weights, l2, 'l2'),
-        ):
-            scale = weights[2]
-            if not isinstance(scale, torch.Tensor):
-                raise TypeError(f'{name}_weight_scale_2 must be a torch.Tensor')
-            if scale.dtype != torch.float32:
-                raise TypeError(f'{name}_weight_scale_2 must have dtype float32')
-            _require(scale.dim() == 1 and scale.numel() == payload[0].size(0),
-                     f'{name}_weight_scale_2 must have shape [E]')
-            _require(scale.device == payload[0].device,
-                     f'{name}_weight_scale_2 must be on the weight device')
-            _require(scale.is_contiguous(),
-                     f'{name}_weight_scale_2 must be contiguous before launch')
-    return len(l1_weights)
+    for weights, payload, name in (
+        (l1_weights, l1, 'l1'),
+        (l2_weights, l2, 'l2'),
+    ):
+        scale = weights[2]
+        if not isinstance(scale, torch.Tensor):
+            raise TypeError(f'{name}_weight_scale_2 must be a torch.Tensor')
+        if scale.dtype != torch.float32:
+            raise TypeError(f'{name}_weight_scale_2 must have dtype float32')
+        _require(scale.dim() == 1 and scale.numel() == payload[0].size(0),
+                 f'{name}_weight_scale_2 must have shape [E]')
+        _require(scale.device == payload[0].device,
+                 f'{name}_weight_scale_2 must be on the weight device')
+        _require(scale.is_contiguous(),
+                 f'{name}_weight_scale_2 must be contiguous before launch')

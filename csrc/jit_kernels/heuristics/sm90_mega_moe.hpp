@@ -77,7 +77,6 @@ struct Sm90MoeHeuristicInput {
     int num_max_tokens_per_rank, num_tokens, num_topk;
     int hidden, intermediate_hidden;
     int num_padded_sf_pool_tokens;
-    bool processed_mxfp4_scales;
 };
 
 struct Sm90MoeNumericalConfig {
@@ -287,16 +286,13 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     // SF on SM90:
     //   * SFA per stage must hold one aligned BLOCK_M-float vector for every
     //     per-64-K L2 scale group (two for BK128, four for BK256)
-    //   * MXFP4 SFB reserves one byte for every (N, K32) group. Producer
-    //     prefetch uses one copy per pipeline stage; direct-load phases retain
-    //     one fixed scratch copy for raw-scale promotion.
+    //   * MXFP4 SFB reserves one byte for every (N, K32) group only when the
+    //     producer prefetches relative scales, with one copy per stage.
     const int smem_sfa_half_stride_bytes = align(block_m * static_cast<int>(sizeof(float)), 128);
     const int smem_sfa_per_stage =
         (block_k / 64) * smem_sfa_half_stride_bytes;
     const int smem_sfb_per_stage =
         mxfp4_weights ? block_n * (block_k / 32) : 0;
-    const int smem_sfb_fixed =
-        mxfp4_weights and not stage_mxfp4_sfb ? smem_sfb_per_stage : 0;
     const int smem_sfb_staged_per_stage =
         stage_mxfp4_sfb ? smem_sfb_per_stage : 0;
     // The sole MXFP4 math warpgroup normally expands into fixed CTA scratch.
@@ -321,8 +317,7 @@ static std::pair<int, int> get_pipeline_config_for_mega_moe_sm90(
     const int smem_barriers_per_stage = 2 * 8;
 
     const int smem_fixed = smem_dispatch_size + smem_cd +
-                           smem_expanded_b_scratch + smem_sfb_fixed +
-                           smem_barriers_fixed;
+                           smem_expanded_b_scratch + smem_barriers_fixed;
 
     const int max_num_stages = (smem_capacity - smem_fixed) /
                                (smem_per_stage + smem_barriers_per_stage);
@@ -908,8 +903,7 @@ static Sm90MoeLaunchConfig select_mxfp4_mega_moe_sm90(
         true,
         true,
         stage_l1_mxfp4_sfb,
-        input.processed_mxfp4_scales and
-            input.hidden == 4096 and
+        input.hidden == 4096 and
             input.num_tokens <= kSM90MoeMaxLatencyOverlapTokens);
     const auto [l2_num_stages, l2_smem_size] = get_pipeline_config_for_mega_moe_sm90(
         SM90ArchSpec::smem_capacity,
@@ -922,8 +916,7 @@ static Sm90MoeLaunchConfig select_mxfp4_mega_moe_sm90(
         true,
         true,
         true,
-        input.processed_mxfp4_scales and
-            input.hidden == 4096 and
+        input.hidden == 4096 and
             input.num_tokens <= kSM90MoeMaxLatencyOverlapTokens);
     // `smem_capacity` is the opt-in per-block limit. Reserve the remaining
     // 1 KiB/CTA implementation overhead in the two-CTA static precheck; the

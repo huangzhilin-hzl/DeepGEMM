@@ -16,7 +16,7 @@ mxfp4 = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(mxfp4)
 
 
-def _valid_raw_weights(num_experts: int = 1):
+def _valid_checkpoint_weights(num_experts: int = 1):
     hidden = 512
     intermediate = 256
     l1_w = torch.arange(
@@ -65,20 +65,24 @@ def _unload_fake_package(package_name: str) -> None:
             sys.modules.pop(name, None)
 
 
-def test_raw_transform_preserves_humming_bytes_and_interleaves_l1():
-    (l1_w, l1_sf), (l2_w, l2_sf) = _valid_raw_weights()
-    l1_sf.copy_(torch.arange(
-        l1_sf.size(1), dtype=torch.int32
+def test_canonical_transform_returns_processed_triples_and_interleaves_l1():
+    (l1_w, l1_sf), (l2_w, l2_sf) = _valid_checkpoint_weights()
+    # Avoid negative-zero E2M1 nibbles, which preprocessing intentionally
+    # canonicalizes to positive zero, while retaining varied sign bits.
+    l1_w.bitwise_or_(0x11)
+    l2_w.bitwise_or_(0x11)
+    l1_sf.copy_((
+        109 + torch.arange(l1_sf.size(1), dtype=torch.int32) % 4
     ).to(torch.uint8).reshape(1, -1, 1).expand_as(l1_sf))
-    l2_sf.copy_(torch.arange(
-        l2_sf.size(1), dtype=torch.int32
+    l2_sf.copy_((
+        109 + torch.arange(l2_sf.size(1), dtype=torch.int32) % 4
     ).to(torch.uint8).reshape(1, -1, 1).expand_as(l2_sf))
     e8m0_dtype = getattr(torch, 'float8_e8m0fnu', None)
     l1_sf_input = l1_sf if e8m0_dtype is None else l1_sf.view(e8m0_dtype)
     l2_sf_input = l2_sf if e8m0_dtype is None else l2_sf.view(e8m0_dtype)
 
     transformed_l1, transformed_l2 = (
-        mxfp4.transform_weights_for_fp8_mxfp4_mega_moe_sm90(
+        mxfp4.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
             (l1_w, l1_sf_input), (l2_w, l2_sf_input)))
     half = l1_w.size(1) // 2
     row_order = torch.tensor([
@@ -90,13 +94,24 @@ def test_raw_transform_preserves_humming_bytes_and_interleaves_l1():
         )
     ])
 
+    assert len(transformed_l1) == len(transformed_l2) == 3
     assert transformed_l1[0].dtype == torch.int8
     assert transformed_l1[1].dtype == torch.uint8
-    assert torch.equal(transformed_l1[0].view(torch.uint8), l1_w[:, row_order])
-    assert torch.equal(transformed_l1[1], l1_sf[:, row_order])
+    assert torch.equal(
+        mxfp4._restore_mxfp4_sign_bits_from_sm90(transformed_l1[0])
+            .view(torch.uint8),
+        l1_w[:, row_order],
+    )
+    assert torch.equal(transformed_l1[1], l1_sf[:, row_order] - 108)
     assert transformed_l2[0].dtype == torch.int8
-    assert torch.equal(transformed_l2[0].view(torch.uint8), l2_w)
-    assert torch.equal(transformed_l2[1], l2_sf)
+    assert torch.equal(
+        mxfp4._restore_mxfp4_sign_bits_from_sm90(transformed_l2[0])
+            .view(torch.uint8),
+        l2_w,
+    )
+    assert torch.equal(transformed_l2[1], l2_sf - 108)
+    assert transformed_l1[2].item() == pytest.approx(2.0 ** -19)
+    assert transformed_l2[2].item() == pytest.approx(2.0 ** -19)
     assert all(tensor.is_contiguous() for tensor in transformed_l1 + transformed_l2)
 
 
@@ -144,7 +159,7 @@ def test_processed_e8m0_requantization_matches_golden_contract():
         [109, 108, 107, 106, 105, 104, 120], dtype=torch.uint8
     ).reshape(1, 7, 1)
     processed_w, relative_sf, weight_scale_2 = (
-        mxfp4._process_mxfp4_fused_e8m0(weight, sf))
+        mxfp4._process_mxfp4_e8m0(weight, sf))
     expected = torch.tensor([
         [0x10, 0x32, 0x54, 0x76, 0x90, 0xba, 0xdc, 0xfe],
         [0x10, 0x21, 0x32, 0x54, 0x90, 0xa9, 0xba, 0xdc],
@@ -164,8 +179,8 @@ def test_processed_e8m0_requantization_matches_golden_contract():
     assert torch.equal(weight_scale_2, torch.tensor([2.0 ** -19], dtype=torch.float32))
 
 
-def test_fused_transform_returns_processed_triples_and_applies_weight_scale_2():
-    (l1_w, l1_sf), (l2_w, l2_sf) = _valid_raw_weights(num_experts=2)
+def test_canonical_transform_applies_checkpoint_weight_scale_2():
+    (l1_w, l1_sf), (l2_w, l2_sf) = _valid_checkpoint_weights(num_experts=2)
     l1_sf[:, -1] = 120
     l2_sf[:, -1] = 120
     transformed_l1, transformed_l2 = (
@@ -185,52 +200,28 @@ def test_fused_transform_returns_processed_triples_and_applies_weight_scale_2():
     assert torch.equal(
         transformed_l2[2],
         torch.tensor([3.0, 5.0], dtype=torch.float32) * (2.0 ** -19))
-    assert mxfp4.validate_mxfp4_kernel_weights(transformed_l1, transformed_l2) == 3
-
-
-def test_legacy_global_scale_alias_warns_and_is_mutually_exclusive():
-    l1, l2 = _valid_raw_weights()
-    with pytest.warns(DeprecationWarning, match='weight_scale_2'):
-        transformed_l1, transformed_l2 = (
-            mxfp4.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
-                l1,
-                l2,
-                l1_global_scale=torch.tensor([2.0], dtype=torch.float32),
-                l2_global_scale=torch.tensor([3.0], dtype=torch.float32),
-            ))
-    assert transformed_l1[2].item() == pytest.approx(2.0 ** -19 * 2.0)
-    assert transformed_l2[2].item() == pytest.approx(2.0 ** -19 * 3.0)
-
-    with pytest.raises(ValueError, match='mutually exclusive'):
-        mxfp4.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
-            l1,
-            l2,
-            l1_weight_scale_2=torch.ones(1),
-            l2_weight_scale_2=torch.ones(1),
-            l1_global_scale=torch.ones(1),
-            l2_global_scale=torch.ones(1),
-        )
+    mxfp4._validate_processed_mxfp4_kernel_weights(transformed_l1, transformed_l2)
 
 
 def test_invalid_mxfp4_contracts_fail_before_kernel_launch():
-    l1, l2 = _valid_raw_weights()
+    l1, l2 = _valid_checkpoint_weights()
 
     with pytest.raises(TypeError, match='uint8 or int8'):
-        mxfp4.transform_weights_for_fp8_mxfp4_mega_moe_sm90(
+        mxfp4.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
             (l1[0].float(), l1[1]), l2)
     with pytest.raises(ValueError, match='packed K/2'):
-        mxfp4.transform_weights_for_fp8_mxfp4_mega_moe_sm90(
+        mxfp4.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
             (l1[0][..., :-1], l1[1]), l2)
     with pytest.raises(ValueError, match='incompatible L1/L2'):
-        mxfp4.transform_weights_for_fp8_mxfp4_mega_moe_sm90(
+        mxfp4.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
             l1, (l2[0][:, :-1], l2[1][:, :-1]))
     with pytest.raises(ValueError, match='hidden size must be divisible by 512'):
-        mxfp4.transform_weights_for_fp8_mxfp4_mega_moe_sm90(
+        mxfp4.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
             (l1[0][..., :128], l1[1][..., :8]),
             (l2[0][:, :256], l2[1][:, :256]),
         )
     with pytest.raises(ValueError, match='intermediate hidden size must be divisible by 256'):
-        mxfp4.transform_weights_for_fp8_mxfp4_mega_moe_sm90(
+        mxfp4.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
             (l1[0][:, :256], l1[1][:, :256]),
             (l2[0][..., :64], l2[1][..., :4]),
         )
@@ -241,30 +232,21 @@ def test_invalid_mxfp4_contracts_fail_before_kernel_launch():
     with pytest.raises(ValueError, match='both be provided'):
         mxfp4.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
             l1, l2, l1_weight_scale_2=torch.ones(1))
-    with pytest.raises(ValueError, match='matching pairs or triples'):
-        mxfp4.validate_mxfp4_kernel_weights(l1, (*l2, torch.ones(1)))
 
 
-def test_kernel_payload_validation_never_normalizes_or_copies_inputs():
-    raw_l1, raw_l2 = _valid_raw_weights(num_experts=2)
-    with pytest.raises(TypeError, match='transformed to int8'):
-        mxfp4.validate_mxfp4_kernel_weights(raw_l1, raw_l2)
-
-    transformed_l1, transformed_l2 = (
-        mxfp4.transform_weights_for_fp8_mxfp4_mega_moe_sm90(raw_l1, raw_l2))
-    with pytest.raises(ValueError, match='contiguous before launch'):
-        mxfp4.validate_mxfp4_kernel_weights(
-            (transformed_l1[0].transpose(1, 2), transformed_l1[1]),
-            transformed_l2,
-        )
+def test_kernel_payload_validation_accepts_only_processed_contiguous_triples():
+    checkpoint_l1, checkpoint_l2 = _valid_checkpoint_weights(num_experts=2)
+    with pytest.raises(ValueError, match='processed triples'):
+        mxfp4._validate_processed_mxfp4_kernel_weights(checkpoint_l1, checkpoint_l2)
 
     processed_l1, processed_l2 = (
         mxfp4.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
-            raw_l1, raw_l2))
+            checkpoint_l1, checkpoint_l2))
+    mxfp4._validate_processed_mxfp4_kernel_weights(processed_l1, processed_l2)
     noncontiguous_scale = torch.ones(4, dtype=torch.float32)[::2]
     assert not noncontiguous_scale.is_contiguous()
     with pytest.raises(ValueError, match='contiguous before launch'):
-        mxfp4.validate_mxfp4_kernel_weights(
+        mxfp4._validate_processed_mxfp4_kernel_weights(
             (processed_l1[0], processed_l1[1], noncontiguous_scale),
             processed_l2,
         )
@@ -290,15 +272,66 @@ def test_explicit_wrapper_rejects_wrong_local_expert_shard_before_launch():
     buffer = mega.SM90SymmBuffer.__new__(mega.SM90SymmBuffer)
     buffer.group = FakeGroup()
     buffer.num_experts = 4
-    raw_l1, raw_l2 = _valid_raw_weights(num_experts=1)
+    checkpoint_l1, checkpoint_l2 = _valid_checkpoint_weights(num_experts=1)
     transformed_l1, transformed_l2 = (
-        mega.transform_weights_for_fp8_mxfp4_mega_moe_sm90(raw_l1, raw_l2))
+        mega.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
+            checkpoint_l1, checkpoint_l2))
     try:
         with pytest.raises(ValueError, match='expected E_local=2, got 1'):
             mega.fp8_mxfp4_mega_moe(
                 None, transformed_l1, transformed_l2, buffer)
     finally:
         _unload_fake_package(package_name)
+
+
+def test_explicit_wrapper_forwards_only_processed_triples():
+    mega, package_name = _load_mega_api_for_cpu()
+    calls = []
+
+    class FakeGroup:
+        @staticmethod
+        def size():
+            return 1
+
+        @staticmethod
+        def rank():
+            return 0
+
+    buffer = mega.SM90SymmBuffer.__new__(mega.SM90SymmBuffer)
+    buffer.group = FakeGroup()
+    buffer.num_experts = 1
+    buffer.num_max_tokens_per_rank = 128
+    buffer.num_topk = 1
+    buffer.hidden = 512
+    buffer.intermediate_hidden = 256
+    buffer.num_shared_experts = 0
+    buffer.buffer = object()
+    buffer.handle = types.SimpleNamespace(buffer_ptrs=[0x1234])
+    checkpoint_l1, checkpoint_l2 = _valid_checkpoint_weights()
+    processed_l1, processed_l2 = (
+        mega.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
+            checkpoint_l1, checkpoint_l2))
+    mega._C = types.SimpleNamespace(
+        fp8_mxfp4_mega_moe=lambda *args: calls.append(args))
+    y = object()
+    try:
+        mega.fp8_mxfp4_mega_moe(
+            y, processed_l1, processed_l2, buffer,
+            recipe=(1, 1, 32), activation='swiglu',
+            activation_clamp=10.0, fast_math=False)
+    finally:
+        _unload_fake_package(package_name)
+
+    assert len(calls) == 1
+    args = calls[0]
+    assert len(args) == 16
+    assert args[0] is y
+    assert args[1] is processed_l1 and len(args[1]) == 3
+    assert args[2] is processed_l2 and len(args[2]) == 3
+    assert args[3] is None and args[4] is None
+    assert args[7] == [0x1234]
+    assert args[12] == (1, 1, 32)
+    assert args[13:] == ('swiglu', 10.0, False)
 
 
 def test_sm90_buffer_uses_dedicated_alignment_and_twelve_view_abi():

@@ -4,14 +4,13 @@ import warnings
 from typing import Tuple, Optional, Union
 from ..utils.math import align
 from .mxfp4 import (
-    MXFP4Weights,
+    MXFP4ProcessedWeights as _MXFP4ProcessedWeights,
     _normalize_mxfp4_ue8m0,
-    _process_mxfp4_fused_e8m0,
+    _process_mxfp4_e8m0,
     _reorder_mxfp4_sign_bits_for_sm90,
     _restore_mxfp4_sign_bits_from_sm90,
-    transform_weights_for_fp8_mxfp4_mega_moe_sm90,
     transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90,
-    validate_mxfp4_kernel_weights,
+    _validate_processed_mxfp4_kernel_weights,
 )
 
 # noinspection PyBroadException
@@ -324,8 +323,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
 
 
 def fp8_mxfp4_mega_moe(y: torch.Tensor,
-                       l1_weights: MXFP4Weights,
-                       l2_weights: MXFP4Weights,
+                       l1_weights: _MXFP4ProcessedWeights,
+                       l2_weights: _MXFP4ProcessedWeights,
                        sym_buffer: SM90SymmBuffer,
                        shared_l1_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                        shared_l2_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
@@ -334,13 +333,14 @@ def fp8_mxfp4_mega_moe(y: torch.Tensor,
                        activation: str = 'swiglu',
                        activation_clamp: Optional[float] = None,
                        fast_math: bool = True):
-    """Run the explicit SM90 FP8-activation, MXFP4-weight MegaMoE path.
+    """Run the SM90 Humming-compatible MXFP4 MegaMoE path.
 
-    Raw transformed weights are pairs ``(packed_e2m1, ue8m0)``.  Processed
-    weights are triples ``(processed_e2m1, relative_ue8m0, weight_scale_2)``.
-    Keeping this explicit entry point avoids architecture-dependent Python
-    dispatch while the common ``fp8_fp4_mega_moe`` facade remains backward
-    compatible with the SM100 implementation.
+    Routed weights must be processed triples
+    ``(processed_e2m1, relative_ue8m0, weight_scale_2)`` returned by
+    :func:`transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90`. Keeping this
+    explicit entry point avoids architecture-dependent Python dispatch while
+    the common ``fp8_fp4_mega_moe`` facade remains backward compatible with
+    the SM100 implementation.
 
     When shared experts are enabled, prepare their FP8/FP32 pairs with
     :func:`transform_shared_weights_for_fp8_mxfp4_mega_moe_sm90` and copy the
@@ -362,7 +362,7 @@ def fp8_mxfp4_mega_moe(y: torch.Tensor,
     if num_shared_experts > 0 and shared_l1_weights is None:
         raise ValueError(
             'an SM90SymmBuffer with shared experts requires both shared weight tuples')
-    weight_arity = validate_mxfp4_kernel_weights(l1_weights, l2_weights)
+    _validate_processed_mxfp4_kernel_weights(l1_weights, l2_weights)
     num_ranks = sym_buffer.group.size()
     if sym_buffer.num_experts % num_ranks != 0:
         raise ValueError('global num_experts must be divisible by the number of ranks')
@@ -403,13 +403,12 @@ def fp8_mxfp4_mega_moe(y: torch.Tensor,
                 f'and {expected_shared_l2_shape}, got '
                 f'{tuple(shared_l1_weights[0].shape)} and '
                 f'{tuple(shared_l2_weights[0].shape)}')
-    op_name = 'fp8_mxfp4_mega_moe' if weight_arity == 2 \
-        else 'fp8_mxfp4_processed_mega_moe'
     try:
-        op = getattr(_C, op_name)
+        op = _C.fp8_mxfp4_mega_moe
     except AttributeError as exception:
         raise RuntimeError(
-            f'DeepGEMM was built without the SM90 MXFP4 MegaMoE binding `{op_name}`; '
+            'DeepGEMM was built without the SM90 MXFP4 MegaMoE binding '
+            '`fp8_mxfp4_mega_moe`; '
             'rebuild the extension after enabling the SM90 backend') from exception
     op(
         y,

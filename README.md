@@ -161,7 +161,7 @@ buffer = deep_gemm.get_symm_buffer_for_sm90_mega_moe(
     hidden, intermediate_hidden,
 )
 
-# Recommended model-load transform. Each result is
+# Required model-load transform. Each result is
 # (processed_e2m1, relative_ue8m0, weight_scale_2_fp32[E_local]).
 l1_weights, l2_weights = (
     deep_gemm.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
@@ -203,12 +203,11 @@ deep_gemm.fp8_mxfp4_mega_moe(
 )
 ```
 
-The raw pair transform
-`transform_weights_for_fp8_mxfp4_mega_moe_sm90` is also supported for
-checkpoint bring-up. The processed triple is the recommended preprocessed
-path: it performs the sign-bit reorder and fused exponent rebasing once at
-model load instead of inside every decode tile. Optional `weight_scale_2` is
-per expert (`[E_local]`); channel-wise secondary scales are rejected.
+The routed-weight runtime accepts only the processed triple above. The
+model-load transform performs sign-bit reordering and fused exponent rebasing
+once instead of in every decode tile. Optional `weight_scale_2` is per expert
+(`[E_local]`); channel-wise secondary scales and unprocessed routed-weight
+pairs are rejected.
 
 Current SM90 constraints are `num_max_tokens_per_rank % 128 == 0`,
 `hidden % 512 == 0` (and `hidden % 1024 == 0` when `hidden > 8192`),
@@ -218,8 +217,8 @@ Current SM90 constraints are `num_max_tokens_per_rank % 128 == 0`,
 `num_ranks <= 64`. FP8 dispatch, SwiGLU, and cooperative launch are required;
 the symmetric buffer must be reallocated if its H/I/shared-expert or active-SM
 layout contract changes. Eligible shapes remain subject to the exact JIT
-kernel's cooperative occupancy check. Run the cross-rank
-raw/processed oracle smoke test with:
+kernel's cooperative occupancy check. Run the cross-rank Humming-contract
+oracle smoke test with:
 
 ```bash
 python tests/test_mega_moe_sm90.py --num-processes 8 --suite smoke

@@ -1,9 +1,9 @@
 """Multi-rank runtime validation for SM90 FP8 x MXFP4 MegaMoE.
 
-The default smoke suite runs routed-only and shared-expert cases for raw and
-processed routed scales.  ``--suite standard`` additionally covers the
-heuristic token bands, fast-math modes, activation clamps, and 0/1/max token
-boundaries.  ``--suite full`` adds production-shaped and randomized cases.
+The default smoke suite runs routed-only and shared-expert cases through the
+single Humming processed-MXFP4 triplet contract. ``--suite standard`` also
+covers heuristic token bands, fast-math modes, activation clamps, and 0/1/max
+token boundaries. ``--suite full`` adds production-shaped and randomized cases.
 
 This file intentionally delays importing DeepGEMM until the spawned CUDA
 worker starts, so ``--help`` and ``py_compile`` work on non-CUDA hosts.
@@ -152,7 +152,7 @@ def _gather_token_sizes(
     return all_sizes.cpu().tolist()
 
 
-def _reference_fused(
+def _reference_mega_moe(
     x_fp8_local: torch.Tensor,
     x_sf_local: torch.Tensor,
     topk_idx_local: torch.Tensor,
@@ -174,7 +174,7 @@ def _reference_fused(
     intermediate_hidden: int,
     activation_clamp: float,
 ) -> torch.Tensor:
-    """Cross-rank PyTorch oracle independent of the fused CUDA kernel."""
+    """Cross-rank PyTorch oracle independent of the CUDA kernel."""
     from deep_gemm.utils.dist import uneven_all_gather
 
     sizes = _gather_token_sizes(x_fp8_local.size(0), num_ranks, group)
@@ -217,7 +217,7 @@ def _reference_fused(
         local_expert = expert_id - local_expert_start
 
         # Dequantize each routed expert once. This keeps the oracle independent
-        # of the fused kernel while bounding production-shape memory to one
+        # of the CUDA kernel while bounding production-shape memory to one
         # expert instead of materializing a per-token weight batch.
         l1_weight = _dequant_mxfp4(
             l1_weight_local[local_expert],
@@ -311,7 +311,6 @@ def _run_scenario(
     num_experts = config['num_experts']
     num_topk = config['num_topk']
     num_shared_experts = config.get('num_shared_experts', 0)
-    scale_mode = config['scale_mode']
     fast_math = config.get('fast_math', True)
     activation_clamp = config.get('activation_clamp', 10.0)
     masked_ratio = config.get('masked_ratio', 0.0)
@@ -353,7 +352,7 @@ def _run_scenario(
         dtype=torch.bfloat16,
         device='cuda',
     ) * 0.05
-    l1_raw = _quantize_grouped_mxfp4(l1_bf16)
+    l1_quantized = _quantize_grouped_mxfp4(l1_bf16)
     del l1_bf16
     l2_bf16 = torch.randn(
         num_local_experts,
@@ -362,7 +361,7 @@ def _run_scenario(
         dtype=torch.bfloat16,
         device='cuda',
     ) * 0.05
-    l2_raw = _quantize_grouped_mxfp4(l2_bf16)
+    l2_quantized = _quantize_grouped_mxfp4(l2_bf16)
     del l2_bf16
 
     scores = torch.randn(
@@ -389,26 +388,20 @@ def _run_scenario(
     ].to(torch.int32)
     expected_recv_stats = local_recv_counts * repeat_count
 
-    if scale_mode == 'processed':
-        transformed_l1, transformed_l2 = (
-            deep_gemm.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
-                l1_raw, l2_raw))
-        reference_l1_weight = _restore_mxfp4_sign_bits_from_sm90(
-            _deinterleave_l1(transformed_l1[0]))
-        reference_l1_sf = (
-            transformed_l1[2][:, None, None] *
-            torch.exp2(_deinterleave_l1(transformed_l1[1]).float()))
-        reference_l2_weight = _restore_mxfp4_sign_bits_from_sm90(
-            transformed_l2[0])
-        reference_l2_sf = (
-            transformed_l2[2][:, None, None] *
-            torch.exp2(transformed_l2[1].float()))
-    else:
-        transformed_l1, transformed_l2 = (
-            deep_gemm.transform_weights_for_fp8_mxfp4_mega_moe_sm90(
-                l1_raw, l2_raw))
-        reference_l1_weight, reference_l1_sf = l1_raw
-        reference_l2_weight, reference_l2_sf = l2_raw
+    transformed_l1, transformed_l2 = (
+        deep_gemm.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
+            l1_quantized, l2_quantized))
+    assert len(transformed_l1) == 3 and len(transformed_l2) == 3
+    reference_l1_weight = _restore_mxfp4_sign_bits_from_sm90(
+        _deinterleave_l1(transformed_l1[0]))
+    reference_l1_sf = (
+        transformed_l1[2][:, None, None] *
+        torch.exp2(_deinterleave_l1(transformed_l1[1]).float()))
+    reference_l2_weight = _restore_mxfp4_sign_bits_from_sm90(
+        transformed_l2[0])
+    reference_l2_sf = (
+        transformed_l2[2][:, None, None] *
+        torch.exp2(transformed_l2[1].float()))
 
     transformed_shared_l1 = transformed_shared_l2 = None
     reference_shared_l1_weight = reference_shared_l1_sf = None
@@ -438,14 +431,16 @@ def _run_scenario(
             device='cuda',
             generator=shared_generator,
         ) * 0.05
-        shared_l1_raw = _quantize_block_fp8(shared_l1_bf16)
-        shared_l2_raw = _quantize_block_fp8(shared_l2_bf16)
+        shared_l1_quantized = _quantize_block_fp8(shared_l1_bf16)
+        shared_l2_quantized = _quantize_block_fp8(shared_l2_bf16)
         del shared_l1_bf16, shared_l2_bf16
         transformed_shared_l1, transformed_shared_l2 = (
             deep_gemm.transform_shared_weights_for_fp8_mxfp4_mega_moe_sm90(
-                shared_l1_raw, shared_l2_raw))
-        reference_shared_l1_weight, reference_shared_l1_sf = shared_l1_raw
-        reference_shared_l2_weight, reference_shared_l2_sf = shared_l2_raw
+                shared_l1_quantized, shared_l2_quantized))
+        reference_shared_l1_weight, reference_shared_l1_sf = (
+            shared_l1_quantized)
+        reference_shared_l2_weight, reference_shared_l2_sf = (
+            shared_l2_quantized)
 
     buffer = deep_gemm.get_symm_buffer_for_sm90_mega_moe(
         group,
@@ -553,7 +548,7 @@ def _run_scenario(
                 f'actual={recv_stats.cpu().tolist()}, '
                 f'expected={expected_recv_stats.cpu().tolist()}')
 
-        reference = _reference_fused(
+        reference = _reference_mega_moe(
             x_fp8,
             x_sf,
             topk_idx,
@@ -591,7 +586,7 @@ def _run_scenario(
         buffer.destroy()
 
 
-def _smoke_scenarios(num_ranks: int, scale_modes: List[str]) -> List[Scenario]:
+def _smoke_scenarios(num_ranks: int) -> List[Scenario]:
     base = dict(
         num_max_tokens_per_rank=128,
         num_tokens=64,
@@ -602,28 +597,19 @@ def _smoke_scenarios(num_ranks: int, scale_modes: List[str]) -> List[Scenario]:
         fast_math=True,
         activation_clamp=10.0,
     )
-    routed = [
-        (f'smoke.{scale_mode}', dict(
-            base,
-            scale_mode=scale_mode,
-            repeat_count=2 if scale_mode == 'processed' else 1,
-        ))
-        for scale_mode in scale_modes
-    ]
+    routed = [('smoke.routed', dict(base, repeat_count=2))]
     shared = [
-        (f'smoke.shared_s{num_shared_experts}.{scale_mode}', dict(
+        (f'smoke.shared_s{num_shared_experts}', dict(
             base,
-            scale_mode=scale_mode,
             num_shared_experts=num_shared_experts,
             repeat_count=2,
         ))
         for num_shared_experts in (1, 2)
-        for scale_mode in scale_modes
     ]
     return routed + shared
 
 
-def _standard_scenarios(num_ranks: int, scale_modes: List[str]) -> List[Scenario]:
+def _standard_scenarios(num_ranks: int) -> List[Scenario]:
     scenarios: List[Scenario] = []
     base = dict(
         hidden=512,
@@ -635,36 +621,33 @@ def _standard_scenarios(num_ranks: int, scale_modes: List[str]) -> List[Scenario
     # Token-per-expert bands used by the SM90 heuristic.
     for num_tokens in (64, 256, 512, 2048):
         scenarios.append((
-            f'heuristic.t{num_tokens}.processed',
+            f'heuristic.t{num_tokens}',
             dict(
                 base,
                 num_max_tokens_per_rank=(
                     (num_tokens + 127) // 128 * 128),
                 num_tokens=num_tokens,
-                scale_mode='processed',
                 fast_math=True,
             ),
         ))
     # Explicit fast-math and clamp behavior.
     for fast_math in (False, True):
         scenarios.append((
-            f'fast_math.{int(fast_math)}.processed',
+            f'fast_math.{int(fast_math)}',
             dict(
                 base,
                 num_max_tokens_per_rank=128,
                 num_tokens=128,
-                scale_mode='processed',
                 fast_math=fast_math,
             ),
         ))
     for clamp in (1.0, math.inf):
         scenarios.append((
-            f'clamp.{clamp}.processed',
+            f'clamp.{clamp}',
             dict(
                 base,
                 num_max_tokens_per_rank=128,
                 num_tokens=128,
-                scale_mode='processed',
                 fast_math=True,
                 activation_clamp=clamp,
             ),
@@ -672,70 +655,61 @@ def _standard_scenarios(num_ranks: int, scale_modes: List[str]) -> List[Scenario
     # 0, 1, and maximum-token boundaries plus masked routing.
     for num_tokens in (0, 1, 128):
         scenarios.append((
-            f'token_boundary.{num_tokens}.raw',
+            f'token_boundary.{num_tokens}',
             dict(
                 base,
                 num_max_tokens_per_rank=128,
                 num_tokens=num_tokens,
-                scale_mode='raw',
                 fast_math=True,
             ),
         ))
     scenarios.append((
-        'masked_routes.processed',
+        'masked_routes',
         dict(
             base,
             num_max_tokens_per_rank=128,
             num_tokens=128,
-            scale_mode='processed',
             fast_math=True,
             masked_ratio=0.5,
         ),
     ))
-    return [
-        scenario for scenario in scenarios
-        if scenario[1]['scale_mode'] in scale_modes
-    ]
+    return scenarios
 
 
 def _full_scenarios(
     num_ranks: int,
-    scale_modes: List[str],
     stress_count: int,
 ) -> List[Scenario]:
     scenarios: List[Scenario] = [
-        ('ring_wrap.h2048.processed', dict(
+        ('ring_wrap.h2048', dict(
             num_max_tokens_per_rank=128,
             num_tokens=128,
             hidden=2048,
             intermediate_hidden=1024,
             num_experts=32 * num_ranks,
             num_topk=6,
-            scale_mode='processed',
             fast_math=True,
             activation_clamp=10.0,
             require_ring_wrap=True,
         )),
-        ('production.flash_m128.processed', dict(
+        ('production.flash_m128', dict(
             num_max_tokens_per_rank=128,
             num_tokens=128,
             hidden=4096,
             intermediate_hidden=2048,
             num_experts=32 * num_ranks,
             num_topk=6,
-            scale_mode='processed',
             fast_math=True,
             activation_clamp=10.0,
             require_ring_wrap=True,
         )),
-        ('production.pro_m256.processed', dict(
+        ('production.pro_m256', dict(
             num_max_tokens_per_rank=256,
             num_tokens=256,
             hidden=7168,
             intermediate_hidden=3072,
             num_experts=48 * num_ranks,
             num_topk=6,
-            scale_mode='processed',
             fast_math=True,
             activation_clamp=10.0,
         )),
@@ -750,15 +724,11 @@ def _full_scenarios(
             intermediate_hidden=rng.choice((512, 1024, 2048)),
             num_experts=8 * num_ranks,
             num_topk=rng.choice((1, 2, 4)),
-            scale_mode=rng.choice(scale_modes),
             fast_math=rng.choice((False, True)),
             activation_clamp=rng.choice((1.0, 10.0, math.inf)),
             masked_ratio=rng.choice((0.0, 0.0, 0.3, 0.7)),
         )))
-    return [
-        scenario for scenario in scenarios
-        if scenario[1]['scale_mode'] in scale_modes
-    ]
+    return scenarios
 
 
 def _test_worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace) -> None:
@@ -782,14 +752,12 @@ def _test_worker(local_rank: int, num_local_ranks: int, args: argparse.Namespace
             dist.destroy_process_group()
         return
 
-    scale_modes = ['raw', 'processed'] if args.scale_mode == 'both' \
-        else [args.scale_mode]
-    scenarios = _smoke_scenarios(num_ranks, scale_modes)
+    scenarios = _smoke_scenarios(num_ranks)
     if args.suite in ('standard', 'full'):
-        scenarios.extend(_standard_scenarios(num_ranks, scale_modes))
+        scenarios.extend(_standard_scenarios(num_ranks))
     if args.suite == 'full':
         scenarios.extend(_full_scenarios(
-            num_ranks, scale_modes, args.stress_count))
+            num_ranks, args.stress_count))
     if args.filter:
         scenarios = [
             scenario for scenario in scenarios if args.filter in scenario[0]
@@ -872,10 +840,7 @@ def _parse_args() -> argparse.Namespace:
         help='run one GPU without NCCL (intended for compute-sanitizer)')
     parser.add_argument(
         '--suite', choices=('smoke', 'standard', 'full'), default='smoke',
-        help='scenario breadth; smoke runs raw and processed nonzero cases')
-    parser.add_argument(
-        '--scale-mode', choices=('raw', 'processed', 'both'), default='both',
-        help='MXFP4 scale representation to validate (default: both)')
+        help='scenario breadth; all cases use Humming processed MXFP4 triplets')
     parser.add_argument(
         '--fast-math', type=int, choices=(0, 1), default=None,
         help='override fast_math for every selected scenario')

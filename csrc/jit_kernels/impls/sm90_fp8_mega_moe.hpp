@@ -28,9 +28,9 @@ namespace deep_gemm {
 // Differences from SM100 path:
 //   * Activations are FP8 (e4m3). Weights are either FP8 or packed MXFP4
 //     expanded to FP8 in shared memory before Hopper WGMMA.
-//   * FP8-weight scale factors are per-128-channel float. MXFP4 weight scale
-//     factors are natural-layout UE8M0 bytes at K32 granularity; neither path
-//     uses the SM100 UTCCP layout.
+//   * FP8-weight scale factors are per-128-channel float. MXFP4 uses
+//     relative/rebased UE8M0 bytes at K32 granularity plus one FP32 secondary
+//     scale per expert; neither path uses the SM100 UTCCP layout.
 //   * No tensor memory: WGMMA accumulators are register-resident.
 //   * One CTA processes each work item; there is no cluster multicast or 2-CTA UMMA.
 // ============================================================================
@@ -54,20 +54,19 @@ public:
         bool fast_math;
         bool bf16_scaled_accum;
         bool mxfp4_weights;
-        bool processed_mxfp4_scales;
         KernelPhase kernel_phase;
         MegaMoESM90Config config;
 
         // Runtime arguments. num_tokens also selects the canonical compile-time
-        // processed-scale overlap bucket during generated-source construction.
+        // MXFP4 scale-overlap bucket during generated-source construction.
         void* y;
         int* cumulative_local_expert_recv_stats;
         int num_tokens;
         layout::SymBuffer<> sym_buffer_ptrs;
 
         // Tensormaps for activations and weights. The B producer can stage
-        // MXFP4 weight scale factors with ordinary global/shared instructions
-        // because their natural-layout four-byte TMA box is not legal on SM90.
+        // MXFP4 relative-scale bytes with ordinary global/shared instructions
+        // because each row exposes only a four-byte TMA box, illegal on SM90.
         CUtensorMap tensor_map_l1_acts;
         CUtensorMap tensor_map_l1_acts_sf;
         CUtensorMap tensor_map_l1_weights;
@@ -99,8 +98,8 @@ public:
                 "sm90_fp8_mxfp4_mega_moe_persistent_impl" :
             (args.kernel_phase == KernelPhase::Linear1 ?
                 "sm90_fp8_mega_moe_l1_impl" : "sm90_fp8_mega_moe_l2_impl");
-        const bool overlap_processed_scale_path =
-            args.processed_mxfp4_scales and
+        const bool overlap_mxfp4_scale_path =
+            args.mxfp4_weights and
             (args.hidden > 4096 or
              args.num_tokens <= kSM90MoeMaxLatencyOverlapTokens);
         const auto phase_template_args =
@@ -134,7 +133,6 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
-        {},
         {}, {}, {}{}
     >);
 }};
@@ -156,8 +154,7 @@ static void __instantiate_kernel() {{
     args.config.swap_ab ? "true" : "false",
     args.bf16_scaled_accum ? "true" : "false",
     args.mxfp4_weights ? "true" : "false",
-    args.processed_mxfp4_scales ? "true" : "false",
-    overlap_processed_scale_path ? "true" : "false",
+    overlap_mxfp4_scale_path ? "true" : "false",
     args.num_ring_tokens, args.num_sf_ring_tokens, args.num_shared_experts,
     phase_template_args);
     }
@@ -242,13 +239,11 @@ static void sm90_fp8_mega_moe(
     const float& activation_clamp,
     const bool& fast_math,
     const bool& mxfp4_weights = false,
-    const bool& processed_mxfp4_scales = false,
     const std::optional<torch::Tensor>& l1_mxfp4_secondary = std::nullopt,
     const std::optional<torch::Tensor>& l2_mxfp4_secondary = std::nullopt
 ) {
-    DG_HOST_ASSERT(not processed_mxfp4_scales or mxfp4_weights);
-    DG_HOST_ASSERT(processed_mxfp4_scales == l1_mxfp4_secondary.has_value());
-    DG_HOST_ASSERT(processed_mxfp4_scales == l2_mxfp4_secondary.has_value());
+    DG_HOST_ASSERT(mxfp4_weights == l1_mxfp4_secondary.has_value());
+    DG_HOST_ASSERT(mxfp4_weights == l2_mxfp4_secondary.has_value());
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
     const auto num_ring_tokens = static_cast<int>(l1_acts.size(0));
@@ -271,8 +266,7 @@ static void sm90_fp8_mega_moe(
         num_ranks, num_experts, num_experts_per_rank,
         num_max_tokens_per_rank, num_tokens, num_topk,
         hidden, intermediate_hidden,
-        num_padded_sf_pool_tokens,
-        processed_mxfp4_scales
+        num_padded_sf_pool_tokens
     };
     const auto launch_config = mxfp4_weights ?
         select_mxfp4_mega_moe_sm90(heuristic_input) :
@@ -453,7 +447,6 @@ static void sm90_fp8_mega_moe(
         .fast_math = fast_math,
         .bf16_scaled_accum = bf16_scaled_accum,
         .mxfp4_weights = mxfp4_weights,
-        .processed_mxfp4_scales = processed_mxfp4_scales,
         .kernel_phase = mxfp4_weights ?
             SM90FP8MegaMoERuntime::KernelPhase::Persistent :
             SM90FP8MegaMoERuntime::KernelPhase::Linear1,
@@ -465,18 +458,18 @@ static void sm90_fp8_mega_moe(
         .tensor_map_l1_acts = tensor_map_l1_acts,
         .tensor_map_l1_acts_sf = tensor_map_l1_acts_sf,
         .tensor_map_l1_weights = tensor_map_l1_weights,
-        .l1_weights_sf = processed_mxfp4_scales ?
+        .l1_weights_sf = mxfp4_weights ?
             l1_mxfp4_secondary->data_ptr<float>() :
-            (mxfp4_weights ? nullptr : l1_weights_sf.data_ptr<float>()),
+            l1_weights_sf.data_ptr<float>(),
         .l1_mxfp4_weights_sf = mxfp4_weights ?
             l1_weights_sf.data_ptr<uint8_t>() : nullptr,
         .tensor_map_l1_output = tensor_map_l1_output,
         .tensor_map_l2_acts = tensor_map_l2_acts,
         .tensor_map_l2_acts_sf = tensor_map_l2_acts_sf,
         .tensor_map_l2_weights = tensor_map_l2_weights,
-        .l2_weights_sf = processed_mxfp4_scales ?
+        .l2_weights_sf = mxfp4_weights ?
             l2_mxfp4_secondary->data_ptr<float>() :
-            (mxfp4_weights ? nullptr : l2_weights_sf.data_ptr<float>()),
+            l2_weights_sf.data_ptr<float>(),
         .l2_mxfp4_weights_sf = mxfp4_weights ?
             l2_weights_sf.data_ptr<uint8_t>() : nullptr,
         .tensor_map_shared_l1_acts = tensor_map_shared_l1_acts,
@@ -522,9 +515,7 @@ static void sm90_fp8_mega_moe(
         // sequentially would deadlock as soon as the physical ring wraps.
         const auto code = SM90FP8MegaMoERuntime::generate(args);
         const auto runtime = compiler->build(
-            processed_mxfp4_scales ?
-                "sm90_fp8_mxfp4_fused_mega_moe_persistent_impl" :
-                "sm90_fp8_mxfp4_mega_moe_persistent_impl",
+            "sm90_fp8_mxfp4_mega_moe_persistent_impl",
             code);
         SM90FP8MegaMoERuntime::launch(runtime, args);
         return;
