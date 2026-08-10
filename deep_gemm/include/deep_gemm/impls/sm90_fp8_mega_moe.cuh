@@ -1312,10 +1312,6 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         };
 
         // WGMMA-output register layout helpers
-        const uint32_t row_idx = lane_idx / 4;
-        const uint32_t col_idx = lane_idx % 4;
-        const uint32_t r_0 = warp_idx_in_wg * 16 + row_idx;
-        const uint32_t r_1 = r_0 + 8;
         constexpr uint32_t WG_SMEM_CD_L1_STRIDE_N = WG_L1_OUT_BLOCK_N;
         DG_STATIC_ASSERT(WG_BLOCK_M == L1WGMMA::M and
                          WG_BLOCK_N == L1WGMMA::N,
@@ -1347,11 +1343,6 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             const uint32_t m_idx = block_idx * BLOCK_M;
             const uint32_t pool_m_idx = pool_block_idx * BLOCK_M;
             const uint32_t n_idx = n_block_idx * BLOCK_N;
-            const uint32_t row_offset_r0 = r_0;
-            const uint32_t row_offset_r1 = r_1;
-            const bool valid_r0 = row_offset_r0 < valid_m;
-            const bool valid_r1 = row_offset_r1 < valid_m;
-
             const auto arrive_task_empty_barrier = [&](const uint32_t& s) {
                 arrive_empty_barrier(s);
                 if constexpr (is_shared_phase) {
@@ -1570,14 +1561,19 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             const uint32_t pipeline_stage,
                             const uint32_t activation_sf_group,
                             const float secondary) {
+                        // Rematerialize the cheap row offset at the SFA load.
+                        // Keeping it live across decode/WGMMA spills it to the
+                        // local stack once per stage on the 128-register build.
+                        const uint32_t stage_row_offset_r0 =
+                            warp_idx_in_wg * 16 + lane_idx / 4;
                         const float scale_a_0 = ptx::ld_shared(
                             smem_sfa[pipeline_stage] +
                                 activation_sf_group * kL2SFAHalfStride +
-                                row_offset_r0);
+                                stage_row_offset_r0);
                         const float scale_a_1 = ptx::ld_shared(
                             smem_sfa[pipeline_stage] +
                                 activation_sf_group * kL2SFAHalfStride +
-                                row_offset_r1);
+                                stage_row_offset_r0 + 8);
                         // Applying the E2M1-to-E4M3 bias correction after
                         // scale_a * secondary can underflow for valid UE8M0
                         // codes 0/1. Apply x64 to the secondary first except
@@ -1768,15 +1764,25 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 // Read SF (must precede warpgroup_arrive)
                 float scale_a_0_lo, scale_a_1_lo;
                 float scale_a_0_hi, scale_a_1_hi;  // Only used in L2 (per-64 K)
+                const uint32_t stage_row_offset_r0 =
+                    warp_idx_in_wg * 16 + lane_idx / 4;
                 if (is_linear1_phase) {
-                    scale_a_0_lo = ptx::ld_shared(smem_sfa[stage_idx] + row_offset_r0);
-                    scale_a_1_lo = ptx::ld_shared(smem_sfa[stage_idx] + row_offset_r1);
+                    scale_a_0_lo = ptx::ld_shared(
+                        smem_sfa[stage_idx] + stage_row_offset_r0);
+                    scale_a_1_lo = ptx::ld_shared(
+                        smem_sfa[stage_idx] + stage_row_offset_r0 + 8);
                 } else {
                     // L2: SFA layout is (K=2, M=BLOCK_M) MN-major; first half SF at offset 0, second at BLOCK_M
-                    scale_a_0_lo = ptx::ld_shared(smem_sfa[stage_idx] + row_offset_r0);
-                    scale_a_1_lo = ptx::ld_shared(smem_sfa[stage_idx] + row_offset_r1);
-                    scale_a_0_hi = ptx::ld_shared(smem_sfa[stage_idx] + kL2SFAHalfStride + row_offset_r0);
-                    scale_a_1_hi = ptx::ld_shared(smem_sfa[stage_idx] + kL2SFAHalfStride + row_offset_r1);
+                    scale_a_0_lo = ptx::ld_shared(
+                        smem_sfa[stage_idx] + stage_row_offset_r0);
+                    scale_a_1_lo = ptx::ld_shared(
+                        smem_sfa[stage_idx] + stage_row_offset_r0 + 8);
+                    scale_a_0_hi = ptx::ld_shared(
+                        smem_sfa[stage_idx] + kL2SFAHalfStride +
+                            stage_row_offset_r0);
+                    scale_a_1_hi = ptx::ld_shared(
+                        smem_sfa[stage_idx] + kL2SFAHalfStride +
+                            stage_row_offset_r0 + 8);
                 }
 
                 // ----- Block (128, 128) weight SF (loaded directly from global) -----
@@ -1935,6 +1941,15 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 return;
             }
+
+            const uint32_t row_idx = lane_idx / 4;
+            const uint32_t col_idx = lane_idx % 4;
+            const uint32_t r_0 = warp_idx_in_wg * 16 + row_idx;
+            const uint32_t r_1 = r_0 + 8;
+            const uint32_t row_offset_r0 = r_0;
+            const uint32_t row_offset_r1 = r_1;
+            const bool valid_r0 = row_offset_r0 < valid_m;
+            const bool valid_r1 = row_offset_r1 < valid_m;
 
             if (is_linear1_phase) {
                 // ---------------- L1 EPILOGUE: SwiGLU + FP8 quantize + TMA store ----------------
