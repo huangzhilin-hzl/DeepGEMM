@@ -139,6 +139,65 @@ deep_gemm.fp8_fp4_mega_moe(y, transformed_l1, transformed_l2, buffer)
 
 For the full example with multi-process setup and benchmarking, please refer to `tests/test_mega_moe.py`.
 
+##### SM90 FP8 x MXFP4 Mega MoE
+
+Hopper uses an explicit API because its symmetric-buffer ABI and FP32 scale
+layout differ from the SM100 backend. It uses two cooperative persistent phase
+launches (linear 1, then linear 2), not the SM100 single-kernel path.
+Checkpoint weights follow the
+[Humming fused-E8M0 contract](https://github.com/inclusionAI/humming/blob/a1e6bd3fec719640c6877462edc5f8dbe5b80061/humming/transform.py):
+packed E2M1 bytes are shaped `[E_local, N, K/2]`, and natural-layout UE8M0
+scales are shaped `[E_local, N, K/32]`.
+`num_experts_global` is the global expert count and must be evenly sharded:
+rank `r` supplies weights for the contiguous expert-ID interval
+`[r * E_local, (r + 1) * E_local)`. `topk_idx` contains global expert IDs;
+`-1` is the only masked-route sentinel.
+
+```python
+buffer = deep_gemm.get_symm_buffer_for_sm90_mega_moe(
+    group, num_experts_global, num_max_tokens_per_rank, num_topk,
+    hidden, intermediate_hidden,
+)
+
+# Recommended model-load transform. Each result is
+# (processed_e2m1, relative_ue8m0, weight_scale_2_fp32[E_local]).
+l1_weights, l2_weights = (
+    deep_gemm.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
+        raw_l1_weights, raw_l2_weights,
+        l1_weight_scale_2=l1_weight_scale_2,
+        l2_weight_scale_2=l2_weight_scale_2,
+    )
+)
+
+buffer.x[:num_tokens].copy_(x_fp8)
+buffer.x_sf[:num_tokens].copy_(x_sf_fp32_k128)
+buffer.topk_idx[:num_tokens].copy_(topk_idx)
+buffer.topk_weights[:num_tokens].copy_(topk_weights)
+
+y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+deep_gemm.fp8_mxfp4_mega_moe(y, l1_weights, l2_weights, buffer)
+```
+
+The raw pair transform
+`transform_weights_for_fp8_mxfp4_mega_moe_sm90` is also supported for
+checkpoint bring-up. The processed triple is the recommended preprocessed
+path: it performs the sign-bit reorder and fused exponent rebasing once at
+model load instead of inside every decode tile. Optional `weight_scale_2` is
+per expert (`[E_local]`); channel-wise secondary scales are rejected.
+
+Current SM90 constraints are `num_max_tokens_per_rank % 128 == 0`,
+`hidden % 512 == 0` (and `hidden % 1024 == 0` when `hidden > 8192`),
+`intermediate_hidden % 256 == 0`,
+`num_topk <= min(num_experts, 32)`, `num_experts % num_ranks == 0`, and
+`num_ranks <= 64`. FP8 dispatch, SwiGLU, and cooperative launch are required;
+shared experts are not yet supported. Eligible shapes remain subject to the
+exact JIT kernel's cooperative occupancy check. Run the cross-rank
+raw/processed oracle smoke test with:
+
+```bash
+python tests/test_mega_moe_sm90.py --num-processes 8 --suite smoke
+```
+
 #### Utilities
 
 The library provides some utility functions besides the above kernels:

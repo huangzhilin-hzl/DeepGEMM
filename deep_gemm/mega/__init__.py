@@ -3,6 +3,16 @@ import types
 import warnings
 from typing import Tuple, Optional, Union
 from ..utils.math import align
+from .mxfp4 import (
+    MXFP4Weights,
+    _normalize_mxfp4_ue8m0,
+    _process_mxfp4_fused_e8m0,
+    _reorder_mxfp4_sign_bits_for_sm90,
+    _restore_mxfp4_sign_bits_from_sm90,
+    transform_weights_for_fp8_mxfp4_mega_moe_sm90,
+    transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90,
+    validate_mxfp4_kernel_weights,
+)
 
 # noinspection PyBroadException
 try:
@@ -66,6 +76,68 @@ class SymmBuffer:
         self.x_sf = None
 
 
+class SM90SymmBuffer:
+    """Symmetric buffer for the SM90 two-stage MegaMoE backend.
+
+    The Hopper backend has an eight-view ABI with FP32 K128 input scales and
+    FP32 K64 intermediate scales.  It must not be backed by the SM100
+    ``SymmBuffer`` whose ring/shared-expert ABI slices twelve views.
+    """
+    def __init__(self, group: dist.ProcessGroup,
+                 num_experts: int,
+                 num_max_tokens_per_rank: int, num_topk: int,
+                 hidden: int, intermediate_hidden: int,
+                 use_fp8_dispatch: bool = True,
+                 activation: str = 'swiglu',
+                 num_shared_experts: int = 0):
+        if num_shared_experts != 0:
+            raise ValueError('SM90 MXFP4 MegaMoE does not support shared experts yet')
+        if not use_fp8_dispatch:
+            raise ValueError('SM90 MXFP4 MegaMoE requires FP8 dispatch')
+        if activation != 'swiglu':
+            raise ValueError(
+                f'Only `swiglu` activation is supported, got `{activation}`')
+
+        self.group = group
+        self.num_experts = num_experts
+        self.num_max_tokens_per_rank = num_max_tokens_per_rank
+        self.num_topk = num_topk
+        self.hidden = hidden
+        self.intermediate_hidden = intermediate_hidden
+
+        num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_sm90_mega_moe(
+            group.size(), num_experts,
+            num_max_tokens_per_rank, num_topk,
+            hidden, intermediate_hidden,
+            use_fp8_dispatch, activation,
+        )
+        allocator = torch if group.size() == 1 else symm_mem
+        self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
+        self.handle = (
+            types.SimpleNamespace(buffer_ptrs=[self.buffer.data_ptr()])
+            if group.size() == 1
+            else symm_mem.rendezvous(self.buffer, group=group)
+        )
+        self.buffer.zero_()
+        self.group.barrier()
+        torch.cuda.synchronize()
+
+        (self.x, self.x_sf,
+         self.topk_idx, self.topk_weights,
+         self.l1_acts, self.l1_acts_sf,
+         self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
+
+    def destroy(self):
+        self.handle = None
+        for name in (
+            'x', 'x_sf', 'topk_idx', 'topk_weights',
+            'l1_acts', 'l1_acts_sf', 'l2_acts', 'l2_acts_sf',
+        ):
+            setattr(self, name, None)
+        self.buffer = None
+        self.group = None
+
+
 def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  num_experts: int,
                                  num_max_tokens_per_rank: int, num_topk: int,
@@ -91,6 +163,32 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
         hidden, intermediate_hidden,
         num_shared_experts,
         mma_type=mma_type, activation=activation
+    )
+
+
+def get_symm_buffer_for_sm90_mega_moe(group: dist.ProcessGroup,
+                                      num_experts: int,
+                                      num_max_tokens_per_rank: int, num_topk: int,
+                                      hidden: int, intermediate_hidden: int,
+                                      use_fp8_dispatch: bool = True,
+                                      activation: str = 'swiglu',
+                                      num_shared_experts: int = 0) -> SM90SymmBuffer:
+    """Allocate the explicit eight-view SM90 MegaMoE symmetric buffer.
+
+    ``num_experts`` is global. Each rank supplies ``num_experts / group.size()``
+    weights for its contiguous global expert-ID interval.
+    """
+    if num_shared_experts != 0:
+        raise ValueError('SM90 MXFP4 MegaMoE does not support shared experts yet')
+    num_max_tokens_per_rank = align(
+        num_max_tokens_per_rank, _C.get_token_alignment_for_sm90_mega_moe())
+    return SM90SymmBuffer(
+        group, num_experts,
+        num_max_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden,
+        use_fp8_dispatch=use_fp8_dispatch,
+        activation=activation,
+        num_shared_experts=num_shared_experts,
     )
 
 
@@ -165,6 +263,58 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         y,
         l1_weights, l2_weights,
         shared_l1_weights, shared_l2_weights,
+        cumulative_local_expert_recv_stats,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts, sym_buffer.num_topk,
+        recipe,
+        activation, activation_clamp,
+        fast_math
+    )
+
+
+def fp8_mxfp4_mega_moe(y: torch.Tensor,
+                       l1_weights: MXFP4Weights,
+                       l2_weights: MXFP4Weights,
+                       sym_buffer: SM90SymmBuffer,
+                       cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                       recipe: Tuple[int, int, int] = (1, 1, 32),
+                       activation: str = 'swiglu',
+                       activation_clamp: Optional[float] = None,
+                       fast_math: bool = True):
+    """Run the explicit SM90 FP8-activation, MXFP4-weight MegaMoE path.
+
+    Raw transformed weights are pairs ``(packed_e2m1, ue8m0)``.  Processed
+    weights are triples ``(processed_e2m1, relative_ue8m0, weight_scale_2)``.
+    Keeping this explicit entry point avoids architecture-dependent Python
+    dispatch while the common ``fp8_fp4_mega_moe`` facade remains backward
+    compatible with the SM100 implementation.
+    """
+    if not isinstance(sym_buffer, SM90SymmBuffer):
+        raise TypeError(
+            'fp8_mxfp4_mega_moe requires an SM90SymmBuffer allocated by '
+            'get_symm_buffer_for_sm90_mega_moe')
+    weight_arity = validate_mxfp4_kernel_weights(l1_weights, l2_weights)
+    num_ranks = sym_buffer.group.size()
+    if sym_buffer.num_experts % num_ranks != 0:
+        raise ValueError('global num_experts must be divisible by the number of ranks')
+    expected_local_experts = sym_buffer.num_experts // num_ranks
+    if l1_weights[0].size(0) != expected_local_experts:
+        raise ValueError(
+            'SM90 MXFP4 weights must contain the contiguous local expert shard: '
+            f'expected E_local={expected_local_experts}, got {l1_weights[0].size(0)}')
+    op_name = 'fp8_mxfp4_mega_moe' if weight_arity == 2 \
+        else 'fp8_mxfp4_processed_mega_moe'
+    try:
+        op = getattr(_C, op_name)
+    except AttributeError as exception:
+        raise RuntimeError(
+            f'DeepGEMM was built without the SM90 MXFP4 MegaMoE binding `{op_name}`; '
+            'rebuild the extension after enabling the SM90 backend') from exception
+    op(
+        y,
+        l1_weights, l2_weights,
         cumulative_local_expert_recv_stats,
         sym_buffer.buffer,
         sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),

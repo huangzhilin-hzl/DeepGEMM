@@ -30,6 +30,15 @@ CUTLASS_HOST_DEVICE constexpr T get_num_sf_ring_tokens(T num_ring_tokens, T bloc
     return (num_ring_tokens / block_m) * math::constexpr_align(block_m, static_cast<T>(128));
 }
 
+// SM90's split L1/L2 MegaMoE backend uses the complete routed-token pool
+// instead of the SM100 live-block ring.  The SF padding rule is otherwise
+// identical.  Keep the legacy name as a narrow compatibility entry point so
+// the SM90 kernel does not need to reuse the SM100 scheduling vocabulary.
+template <typename T>
+CUTLASS_HOST_DEVICE constexpr T get_num_padded_sf_pool_tokens(T num_max_pool_tokens, T block_m) {
+    return get_num_sf_ring_tokens(num_max_pool_tokens, block_m);
+}
+
 // Shared L2 input SF capacity: worst-case aligned SF pages over all candidate BLOCK_M.
 template <typename T>
 CUTLASS_HOST_DEVICE constexpr T get_num_max_shared_sf_tokens(const T& num_max_tokens_per_rank) {
@@ -81,6 +90,26 @@ struct Workspace {
         num_ring_blocks = num_ring_tokens / kMinCandidateBlockM;
         num_shared_l2_pool_blocks = math::ceil_div<uint32_t>(num_max_tokens_per_rank, kMinCandidateBlockM);
     }
+
+    // Full-pool compatibility constructor for the SM90 split-kernel backend.
+    // Current SM100 callers always use the six-argument constructor above.
+    CUTLASS_HOST_DEVICE
+    Workspace(void* base,
+              const uint32_t& num_ranks,
+              const uint32_t& num_experts,
+              const uint32_t& num_max_tokens_per_rank,
+              const uint32_t& num_topk):
+        Workspace(
+            base,
+            num_ranks,
+            num_experts,
+            num_max_tokens_per_rank,
+            num_topk,
+            get_num_max_pool_tokens(
+                num_ranks,
+                num_max_tokens_per_rank,
+                num_topk,
+                num_experts / num_ranks)) {}
 
     CUTLASS_HOST_DEVICE
     uint64_t get_num_bytes() const {
@@ -195,6 +224,14 @@ struct Workspace {
     uint32_t* get_l1_full_count_ptr(const uint32_t& ring_block_idx = 0) const {
         const auto base = get_expert_recv_count_sum_ptr(num_experts_per_rank);
         return reinterpret_cast<uint32_t*>(base) + ring_block_idx;
+    }
+
+    // SM90 publishes one arrival count per full-pool block.  With the
+    // five-argument constructor `num_ring_tokens == num_max_pool_tokens`, so
+    // the existing L1 full-count region is exactly the required storage.
+    CUTLASS_DEVICE
+    uint32_t* get_l1_arrival_count_ptr(const uint32_t& pool_block_idx = 0) const {
+        return get_l1_full_count_ptr(pool_block_idx);
     }
 
     CUTLASS_DEVICE
