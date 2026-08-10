@@ -301,7 +301,7 @@ def test_explicit_wrapper_rejects_wrong_local_expert_shard_before_launch():
         _unload_fake_package(package_name)
 
 
-def test_sm90_buffer_uses_dedicated_alignment_and_eight_view_abi():
+def test_sm90_buffer_uses_dedicated_alignment_and_twelve_view_abi():
     mega, package_name = _load_mega_api_for_cpu()
     sizing_calls = []
 
@@ -329,7 +329,7 @@ def test_sm90_buffer_uses_dedicated_alignment_and_eight_view_abi():
         def barrier(self):
             self.barriers += 1
 
-    views = tuple(object() for _ in range(8))
+    views = tuple(object() for _ in range(12))
 
     def get_size(*args):
         sizing_calls.append(args)
@@ -355,21 +355,54 @@ def test_sm90_buffer_uses_dedicated_alignment_and_eight_view_abi():
             hidden=512,
             intermediate_hidden=256,
         )
-        assert sizing_calls == [(1, 16, 128, 2, 512, 256, True, 'swiglu')]
+        assert sizing_calls == [(
+            1, 16, 128, 2, 512, 256, True, 'swiglu', 0)]
         assert buffer.num_max_tokens_per_rank == 128
         assert group.barriers == 1
         assert (
             buffer.x, buffer.x_sf,
             buffer.topk_idx, buffer.topk_weights,
+            buffer.shared_l1_acts, buffer.shared_l1_acts_sf,
+            buffer.shared_l2_acts, buffer.shared_l2_acts_sf,
             buffer.l1_acts, buffer.l1_acts_sf,
             buffer.l2_acts, buffer.l2_acts_sf,
         ) == views
         buffer.destroy()
         assert all(getattr(buffer, name) is None for name in (
             'x', 'x_sf', 'topk_idx', 'topk_weights',
+            'shared_l1_acts', 'shared_l1_acts_sf',
+            'shared_l2_acts', 'shared_l2_acts_sf',
             'l1_acts', 'l1_acts_sf', 'l2_acts', 'l2_acts_sf'))
-        with pytest.raises(ValueError, match='does not support shared experts'):
-            mega.get_symm_buffer_for_sm90_mega_moe(
-                group, 16, 128, 2, 512, 256, num_shared_experts=1)
+        shared_buffer = mega.get_symm_buffer_for_sm90_mega_moe(
+            group, 16, 128, 2, 512, 256, num_shared_experts=1)
+        assert shared_buffer.num_shared_experts == 1
+        assert sizing_calls[-1] == (
+            1, 16, 128, 2, 512, 256, True, 'swiglu', 1)
+        shared_buffer.destroy()
+    finally:
+        _unload_fake_package(package_name)
+
+
+def test_sm90_shared_weight_transform_interleaves_only_l1_fp8_rows():
+    mega, package_name = _load_mega_api_for_cpu()
+    try:
+        row_values = (
+            torch.arange(256, dtype=torch.float32) % 16
+        ).to(torch.float8_e4m3fn)
+        l1_weight = row_values[:, None].expand(256, 128).contiguous()
+        l2_weight = torch.ones(
+            (128, 128), dtype=torch.float8_e4m3fn)
+        l1_scale = torch.tensor([[1.0], [2.0]], dtype=torch.float32)
+        l2_scale = torch.tensor([[3.0]], dtype=torch.float32)
+
+        transformed_l1, transformed_l2 = (
+            mega.transform_shared_weights_for_fp8_mxfp4_mega_moe_sm90(
+                (l1_weight, l1_scale), (l2_weight, l2_scale)))
+
+        expected_rows = torch.cat((row_values[:8], row_values[128:136]))
+        assert torch.equal(transformed_l1[0][:16, 0], expected_rows)
+        assert transformed_l1[1].data_ptr() == l1_scale.data_ptr()
+        assert transformed_l2[0].data_ptr() == l2_weight.data_ptr()
+        assert transformed_l2[1].data_ptr() == l2_scale.data_ptr()
     finally:
         _unload_fake_package(package_name)

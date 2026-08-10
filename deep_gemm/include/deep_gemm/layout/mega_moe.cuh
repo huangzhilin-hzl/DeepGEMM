@@ -365,6 +365,36 @@ struct Buffer {
     }
 };
 
+// Per-token activation scale-factor storage.  The default matches the SM100
+// packed-UE8M0 ABI (one 32-bit word per 128 K elements).  Hopper keeps FP32
+// activation scales and uses K64 for the L2 input, so it overrides only the
+// intermediate row size while reusing the rest of MegaMoEBuffer.
+struct ScaleLayoutSpec {
+    uint32_t input_sf_bytes_per_token;
+    uint32_t intermediate_sf_bytes_per_token;
+
+    CUTLASS_HOST_DEVICE
+    constexpr ScaleLayoutSpec(
+        const uint32_t& input_sf_bytes_per_token = 0,
+        const uint32_t& intermediate_sf_bytes_per_token = 0):
+        input_sf_bytes_per_token(input_sf_bytes_per_token),
+        intermediate_sf_bytes_per_token(intermediate_sf_bytes_per_token) {}
+
+    CUTLASS_HOST_DEVICE
+    static constexpr ScaleLayoutSpec sm100(
+        const uint32_t& hidden,
+        const uint32_t& intermediate_hidden) {
+        return {hidden / 32, intermediate_hidden / 32};
+    }
+
+    CUTLASS_HOST_DEVICE
+    static constexpr ScaleLayoutSpec sm90_fp32_k128_k64(
+        const uint32_t& hidden,
+        const uint32_t& intermediate_hidden) {
+        return {hidden / 32, intermediate_hidden / 16};
+    }
+};
+
 struct MegaMoEBuffer {
     Workspace workspace;
 
@@ -374,7 +404,7 @@ struct MegaMoEBuffer {
            input_topk_idx_buffer,
            input_topk_weights_buffer;
 
-    // Routed expert ring buffers
+    // Shared expert buffers
     // NOTE: shared L1 tokens reuse `input_token_buffer`.
     Buffer shared_l1_token_buffer, shared_l1_sf_buffer,
            shared_l2_token_buffer, shared_l2_sf_buffer;
@@ -398,7 +428,8 @@ struct MegaMoEBuffer {
                   const uint32_t& num_ring_tokens,
                   const uint32_t& num_sf_ring_tokens,
                   const bool& with_sf,
-                  const uint32_t& num_shared_experts = 0) {
+                  const uint32_t& num_shared_experts = 0,
+                  const ScaleLayoutSpec& scale_layout_spec = ScaleLayoutSpec()) {
         // Workspace
         workspace = Workspace(base, num_ranks, num_experts,
                               num_max_tokens_per_rank, num_topk, num_ring_tokens);
@@ -407,15 +438,31 @@ struct MegaMoEBuffer {
         const auto shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
         const auto num_max_shared_sf_tokens = with_sf ? get_num_max_shared_sf_tokens(num_max_tokens_per_rank) : 0u;
 
+        // A zero-initialized spec is the backward-compatible SM100 default.
+        // Keeping the scale row sizes explicit prevents an SM90 K64 L2 scale
+        // buffer from being silently allocated with the SM100 K128 byte span.
+        const auto default_scale_layout = ScaleLayoutSpec::sm100(hidden, intermediate_hidden);
+        const auto input_sf_bytes_per_token = with_sf ?
+            (scale_layout_spec.input_sf_bytes_per_token == 0 ?
+                default_scale_layout.input_sf_bytes_per_token :
+                scale_layout_spec.input_sf_bytes_per_token) : 0u;
+        const auto intermediate_sf_bytes_per_token = with_sf ?
+            (scale_layout_spec.intermediate_sf_bytes_per_token == 0 ?
+                default_scale_layout.intermediate_sf_bytes_per_token :
+                scale_layout_spec.intermediate_sf_bytes_per_token) : 0u;
+        DG_UNIFIED_ASSERT(not with_sf or input_sf_bytes_per_token % 16 == 0);
+        DG_UNIFIED_ASSERT(not with_sf or intermediate_sf_bytes_per_token % 16 == 0);
+
         // Layouts
         const uint32_t num_mma_elem_bytes = with_sf ? 1 : 2;
         const auto input_token_layout = layout::Data(hidden * num_mma_elem_bytes);
         const auto bf16_token_layout = layout::Data(hidden * 2);
         const auto intermediate_token_layout = layout::Data(intermediate_hidden * num_mma_elem_bytes);
         const auto shared_intermediate_token_layout = layout::Data(shared_intermediate_hidden * num_mma_elem_bytes);
-        const auto input_sf_layout = layout::Data(with_sf ? hidden / 32 : 0);
-        const auto intermediate_sf_layout = layout::Data(with_sf ? intermediate_hidden / 32 : 0);
-        const auto shared_intermediate_sf_layout = layout::Data(with_sf ? shared_intermediate_hidden / 32 : 0);
+        const auto input_sf_layout = layout::Data(input_sf_bytes_per_token);
+        const auto intermediate_sf_layout = layout::Data(intermediate_sf_bytes_per_token);
+        const auto shared_intermediate_sf_layout = layout::Data(
+            intermediate_sf_bytes_per_token * num_shared_experts);
         const auto input_topk_idx_layout = layout::Data(num_topk * sizeof(int64_t), false);
         const auto input_topk_weights_layout = layout::Data(num_topk * sizeof(float), false);
         const auto l1_topk_weights_layout = layout::Data(sizeof(float), false);

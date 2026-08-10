@@ -1,7 +1,7 @@
 """Multi-rank runtime validation for SM90 FP8 x MXFP4 MegaMoE.
 
-The default smoke suite runs one nonzero raw-scale scenario and one nonzero
-processed-scale scenario.  ``--suite standard`` additionally covers the
+The default smoke suite runs routed-only and shared-expert cases for raw and
+processed routed scales.  ``--suite standard`` additionally covers the
 heuristic token bands, fast-math modes, activation clamps, and 0/1/max token
 boundaries.  ``--suite full`` adds production-shaped and randomized cases.
 
@@ -14,7 +14,7 @@ import math
 import os
 import random
 import sys
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -61,6 +61,40 @@ def _quantize_grouped_mxfp4(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.T
         packed[expert_idx], sf[expert_idx] = per_token_cast_to_fp4(
             weight[expert_idx], use_ue8m0=True, gran_k=32)
     return packed, sf
+
+
+def _quantize_block_fp8(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a 2D weight with natural FP32 block-(128, 128) scales."""
+    from deep_gemm.utils import per_block_cast_to_fp8
+
+    fp8, sf = per_block_cast_to_fp8(
+        weight, use_ue8m0=False, gran_k=128)
+    assert sf.dtype == torch.float32
+    assert sf.shape == (weight.size(0) // 128, weight.size(1) // 128)
+    return fp8, sf.contiguous()
+
+
+def _dequant_block_fp8(weight: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
+    """Restore a 2D FP8 tensor from natural block-(128, 128) scales."""
+    n, k = weight.shape
+    assert n % 128 == 0 and k % 128 == 0
+    assert sf.shape == (n // 128, k // 128)
+    blocks = weight.float().view(n // 128, 128, k // 128, 128)
+    return (
+        blocks * sf[:, None, :, None]
+    ).view(n, k)
+
+
+def _copy_shared_l1_sf(
+    dst: torch.Tensor,
+    src: torch.Tensor,
+) -> None:
+    """Copy K128 FP32 scales into the shared L1 column-major view."""
+    num_tokens, num_sf_columns = src.shape
+    assert dst.size(0) >= num_tokens and dst.size(1) == num_sf_columns
+    dst.zero_()
+    if num_tokens > 0:
+        dst[:num_tokens].copy_(src)
 
 
 def _dequant_mxfp4(packed: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
@@ -127,6 +161,10 @@ def _reference_fused(
     l1_sf_local: torch.Tensor,
     l2_weight_local: torch.Tensor,
     l2_sf_local: torch.Tensor,
+    shared_l1_weight: Optional[torch.Tensor],
+    shared_l1_sf: Optional[torch.Tensor],
+    shared_l2_weight: Optional[torch.Tensor],
+    shared_l2_sf: Optional[torch.Tensor],
     rank_idx: int,
     num_ranks: int,
     group: dist.ProcessGroup,
@@ -214,7 +252,41 @@ def _reference_fused(
     if num_ranks > 1:
         dist.all_reduce(combine, op=dist.ReduceOp.SUM, group=group)
 
-    output = combine.to(torch.bfloat16).sum(dim=1).to(torch.bfloat16)
+    combine = combine.to(torch.bfloat16).float()
+    if shared_l1_weight is not None:
+        assert shared_l1_sf is not None
+        assert shared_l2_weight is not None
+        assert shared_l2_sf is not None
+        shared_l1 = _dequant_block_fp8(
+            shared_l1_weight, shared_l1_sf)
+        shared_l1_output = torch.matmul(x, shared_l1.transpose(0, 1))
+        del shared_l1
+        shared_l1_output = _swiglu_fp32(
+            shared_l1_output, activation_clamp)
+
+        shared_width = shared_l1_output.size(1)
+        shared_l1_view = shared_l1_output.view(
+            num_global_tokens, shared_width // 64, 64)
+        shared_l1_scale = (
+            shared_l1_view.abs().amax(dim=-1).clamp(1e-4) / 448.0)
+        shared_l1_quantized = (
+            shared_l1_view / shared_l1_scale.unsqueeze(-1)
+        ).to(torch.float8_e4m3fn).float()
+        shared_l2_input = (
+            shared_l1_quantized * shared_l1_scale.unsqueeze(-1)
+        ).view(num_global_tokens, shared_width)
+
+        shared_l2 = _dequant_block_fp8(
+            shared_l2_weight, shared_l2_sf)
+        shared_output = torch.matmul(
+            shared_l2_input, shared_l2.transpose(0, 1))
+        del shared_l2
+        combine = torch.cat(
+            [combine, shared_output.to(torch.bfloat16).float().unsqueeze(1)],
+            dim=1,
+        )
+
+    output = combine.sum(dim=1).to(torch.bfloat16)
     rank_start = sum(sizes[:rank_idx])
     return output[rank_start:rank_start + sizes[rank_idx]].contiguous()
 
@@ -238,6 +310,7 @@ def _run_scenario(
     intermediate_hidden = config['intermediate_hidden']
     num_experts = config['num_experts']
     num_topk = config['num_topk']
+    num_shared_experts = config.get('num_shared_experts', 0)
     scale_mode = config['scale_mode']
     fast_math = config.get('fast_math', True)
     activation_clamp = config.get('activation_clamp', 10.0)
@@ -248,6 +321,8 @@ def _run_scenario(
     assert num_experts % num_ranks == 0
     assert num_max_tokens % 128 == 0
     assert hidden % 512 == 0 and intermediate_hidden % 256 == 0
+    assert num_shared_experts >= 0
+    assert num_topk + int(num_shared_experts > 0) <= 32
     assert repeat_count > 0
     num_local_experts = num_experts // num_ranks
 
@@ -309,9 +384,10 @@ def _run_scenario(
     expected_global_recv_stats = torch.bincount(
         valid_topk_idx, minlength=num_experts)
     local_expert_start = rank_idx * num_local_experts
-    expected_recv_stats = expected_global_recv_stats[
+    local_recv_counts = expected_global_recv_stats[
         local_expert_start:local_expert_start + num_local_experts
-    ].to(torch.int32) * repeat_count
+    ].to(torch.int32)
+    expected_recv_stats = local_recv_counts * repeat_count
 
     if scale_mode == 'processed':
         transformed_l1, transformed_l2 = (
@@ -334,6 +410,43 @@ def _run_scenario(
         reference_l1_weight, reference_l1_sf = l1_raw
         reference_l2_weight, reference_l2_sf = l2_raw
 
+    transformed_shared_l1 = transformed_shared_l2 = None
+    reference_shared_l1_weight = reference_shared_l1_sf = None
+    reference_shared_l2_weight = reference_shared_l2_sf = None
+    if num_shared_experts > 0:
+        # Shared weights are replicated, so use a rank-independent generator.
+        # Keeping this separate from the routed RNG also makes the routed-only
+        # scenarios byte-for-byte stable when shared coverage is added.
+        shared_generator = torch.Generator(device='cuda')
+        shared_generator.manual_seed(
+            700001 + sum(
+                (index + 1) * ord(character)
+                for index, character in enumerate(name)))
+        shared_intermediate_hidden = (
+            num_shared_experts * intermediate_hidden)
+        shared_l1_bf16 = torch.randn(
+            2 * shared_intermediate_hidden,
+            hidden,
+            dtype=torch.bfloat16,
+            device='cuda',
+            generator=shared_generator,
+        ) * 0.05
+        shared_l2_bf16 = torch.randn(
+            hidden,
+            shared_intermediate_hidden,
+            dtype=torch.bfloat16,
+            device='cuda',
+            generator=shared_generator,
+        ) * 0.05
+        shared_l1_raw = _quantize_block_fp8(shared_l1_bf16)
+        shared_l2_raw = _quantize_block_fp8(shared_l2_bf16)
+        del shared_l1_bf16, shared_l2_bf16
+        transformed_shared_l1, transformed_shared_l2 = (
+            deep_gemm.transform_shared_weights_for_fp8_mxfp4_mega_moe_sm90(
+                shared_l1_raw, shared_l2_raw))
+        reference_shared_l1_weight, reference_shared_l1_sf = shared_l1_raw
+        reference_shared_l2_weight, reference_shared_l2_sf = shared_l2_raw
+
     buffer = deep_gemm.get_symm_buffer_for_sm90_mega_moe(
         group,
         num_experts,
@@ -341,10 +454,69 @@ def _run_scenario(
         num_topk,
         hidden,
         intermediate_hidden,
+        num_shared_experts=num_shared_experts,
     )
     try:
+        # SM90 shares main's twelve-view host ABI even when shared experts are
+        # disabled.  The routed L2 activation SF remains Hopper-specific FP32
+        # K64: one logical scale column per 64 intermediate elements.
+        assert buffer.shared_l1_acts.data_ptr() == buffer.x.data_ptr()
+        if num_shared_experts == 0:
+            assert buffer.shared_l1_acts_sf is None
+            assert buffer.shared_l2_acts is None
+            assert buffer.shared_l2_acts_sf is None
+        else:
+            shared_intermediate_hidden = (
+                num_shared_experts * intermediate_hidden)
+            assert buffer.shared_l1_acts_sf is not None
+            assert buffer.shared_l2_acts is not None
+            assert buffer.shared_l2_acts_sf is not None
+            assert buffer.shared_l1_acts_sf.shape[1] == hidden // 128
+            assert buffer.shared_l2_acts.shape == (
+                num_max_tokens, shared_intermediate_hidden)
+            assert buffer.shared_l2_acts_sf.shape[1] == (
+                shared_intermediate_hidden // 64)
+            assert buffer.shared_l1_acts_sf.stride() == (
+                1, buffer.shared_l1_acts_sf.shape[0])
+            assert buffer.shared_l2_acts_sf.stride() == (
+                1, buffer.shared_l2_acts_sf.shape[0])
+        assert buffer.l1_acts.shape[1] == hidden
+        assert buffer.l1_acts_sf.shape[1] == hidden // 128
+        assert buffer.l2_acts.shape[1] == intermediate_hidden
+        assert buffer.l2_acts_sf.shape[1] == intermediate_hidden // 64
+        assert buffer.l1_acts_sf.stride() == (1, buffer.l1_acts_sf.shape[0])
+        assert buffer.l2_acts_sf.stride() == (1, buffer.l2_acts_sf.shape[0])
+        if config.get('require_ring_wrap', False):
+            num_logical_pool_blocks = int(
+                ((local_recv_counts + 63) // 64).sum().item())
+            num_physical_ring_blocks = buffer.l1_acts.shape[0] // 64
+            did_wrap = torch.tensor(
+                [int(num_logical_pool_blocks > num_physical_ring_blocks)],
+                dtype=torch.int32,
+                device='cuda',
+            )
+            if num_ranks > 1:
+                dist.all_reduce(did_wrap, op=dist.ReduceOp.MIN, group=group)
+            if rank_idx == 0:
+                print(
+                    f'  [RING] {name:<40} '
+                    f'logical_blocks(rank0)={num_logical_pool_blocks} '
+                    f'physical_blocks={num_physical_ring_blocks} '
+                    f'all_ranks_wrap={did_wrap.item()}',
+                    flush=True,
+                )
+            if did_wrap.item() == 0:
+                raise AssertionError(
+                    f'{name}: scenario did not force ring wrap; logical_blocks='
+                    f'{num_logical_pool_blocks}, physical_blocks='
+                    f'{num_physical_ring_blocks}')
+
         buffer.x[:num_tokens].copy_(x_fp8)
         buffer.x_sf[:num_tokens].copy_(x_sf)
+        if num_shared_experts > 0:
+            # The SM90 descriptor indexes m_idx directly. The exposed view is
+            # already column-major, so tensor copy performs the physical layout.
+            _copy_shared_l1_sf(buffer.shared_l1_acts_sf, x_sf)
         buffer.topk_idx[:num_tokens].copy_(topk_idx)
         buffer.topk_weights[:num_tokens].copy_(topk_weights)
         output = torch.empty(
@@ -357,6 +529,8 @@ def _run_scenario(
                 transformed_l1,
                 transformed_l2,
                 buffer,
+                shared_l1_weights=transformed_shared_l1,
+                shared_l2_weights=transformed_shared_l2,
                 cumulative_local_expert_recv_stats=recv_stats,
                 recipe=(1, 1, 32),
                 activation='swiglu',
@@ -388,6 +562,10 @@ def _run_scenario(
             reference_l1_sf,
             reference_l2_weight,
             reference_l2_sf,
+            reference_shared_l1_weight,
+            reference_shared_l1_sf,
+            reference_shared_l2_weight,
+            reference_shared_l2_sf,
             rank_idx,
             num_ranks,
             group,
@@ -424,7 +602,7 @@ def _smoke_scenarios(num_ranks: int, scale_modes: List[str]) -> List[Scenario]:
         fast_math=True,
         activation_clamp=10.0,
     )
-    return [
+    routed = [
         (f'smoke.{scale_mode}', dict(
             base,
             scale_mode=scale_mode,
@@ -432,6 +610,17 @@ def _smoke_scenarios(num_ranks: int, scale_modes: List[str]) -> List[Scenario]:
         ))
         for scale_mode in scale_modes
     ]
+    shared = [
+        (f'smoke.shared_s{num_shared_experts}.{scale_mode}', dict(
+            base,
+            scale_mode=scale_mode,
+            num_shared_experts=num_shared_experts,
+            repeat_count=2,
+        ))
+        for num_shared_experts in (1, 2)
+        for scale_mode in scale_modes
+    ]
+    return routed + shared
 
 
 def _standard_scenarios(num_ranks: int, scale_modes: List[str]) -> List[Scenario]:
@@ -515,6 +704,18 @@ def _full_scenarios(
     stress_count: int,
 ) -> List[Scenario]:
     scenarios: List[Scenario] = [
+        ('ring_wrap.h2048.processed', dict(
+            num_max_tokens_per_rank=128,
+            num_tokens=128,
+            hidden=2048,
+            intermediate_hidden=1024,
+            num_experts=32 * num_ranks,
+            num_topk=6,
+            scale_mode='processed',
+            fast_math=True,
+            activation_clamp=10.0,
+            require_ring_wrap=True,
+        )),
         ('production.flash_m128.processed', dict(
             num_max_tokens_per_rank=128,
             num_tokens=128,
@@ -525,6 +726,7 @@ def _full_scenarios(
             scale_mode='processed',
             fast_math=True,
             activation_clamp=10.0,
+            require_ring_wrap=True,
         )),
         ('production.pro_m256.processed', dict(
             num_max_tokens_per_rank=256,

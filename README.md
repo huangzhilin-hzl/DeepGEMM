@@ -142,8 +142,10 @@ For the full example with multi-process setup and benchmarking, please refer to 
 ##### SM90 FP8 x MXFP4 Mega MoE
 
 Hopper uses an explicit API because its symmetric-buffer ABI and FP32 scale
-layout differ from the SM100 backend. It uses two cooperative persistent phase
-launches (linear 1, then linear 2), not the SM100 single-kernel path.
+layout differ from the SM100 backend. Packed-MXFP4 runs one cooperative
+persistent kernel: dispatch, dynamic MegaMoE scheduling, routed linear 1/2,
+optional shared experts, and combine overlap over a live-block ring. Logical
+source metadata remains full-pool while activation/SF scratch is ring-sized.
 Checkpoint weights follow the
 [Humming fused-E8M0 contract](https://github.com/inclusionAI/humming/blob/a1e6bd3fec719640c6877462edc5f8dbe5b80061/humming/transform.py):
 packed E2M1 bytes are shaped `[E_local, N, K/2]`, and natural-layout UE8M0
@@ -178,6 +180,29 @@ y = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
 deep_gemm.fp8_mxfp4_mega_moe(y, l1_weights, l2_weights, buffer)
 ```
 
+Shared experts use replicated FP8 weights with natural row-major FP32
+block-(128, 128) scales. Allocate the buffer with `num_shared_experts=S`, then
+prepare the two weight pairs with
+`transform_shared_weights_for_fp8_mxfp4_mega_moe_sm90`. The helper interleaves
+only the L1 FP8 gate/up rows; it intentionally does not apply the SM100 UTCCP
+scale transform. Before every launch, also copy the K128 input scales into the
+separate M-major shared view (the shared activation data itself aliases `x`):
+
+```python
+shared_l1, shared_l2 = (
+    deep_gemm.transform_shared_weights_for_fp8_mxfp4_mega_moe_sm90(
+        shared_l1_fp8_and_fp32_scale,
+        shared_l2_fp8_and_fp32_scale,
+    )
+)
+buffer.shared_l1_acts_sf[:num_tokens].copy_(x_sf_fp32_k128)
+deep_gemm.fp8_mxfp4_mega_moe(
+    y, l1_weights, l2_weights, buffer,
+    shared_l1_weights=shared_l1,
+    shared_l2_weights=shared_l2,
+)
+```
+
 The raw pair transform
 `transform_weights_for_fp8_mxfp4_mega_moe_sm90` is also supported for
 checkpoint bring-up. The processed triple is the recommended preprocessed
@@ -188,10 +213,12 @@ per expert (`[E_local]`); channel-wise secondary scales are rejected.
 Current SM90 constraints are `num_max_tokens_per_rank % 128 == 0`,
 `hidden % 512 == 0` (and `hidden % 1024 == 0` when `hidden > 8192`),
 `intermediate_hidden % 256 == 0`,
-`num_topk <= min(num_experts, 32)`, `num_experts % num_ranks == 0`, and
+`num_topk + int(num_shared_experts > 0) <= 32`,
+`num_topk <= num_experts`, `num_experts % num_ranks == 0`, and
 `num_ranks <= 64`. FP8 dispatch, SwiGLU, and cooperative launch are required;
-shared experts are not yet supported. Eligible shapes remain subject to the
-exact JIT kernel's cooperative occupancy check. Run the cross-rank
+the symmetric buffer must be reallocated if its H/I/shared-expert or active-SM
+layout contract changes. Eligible shapes remain subject to the exact JIT
+kernel's cooperative occupancy check. Run the cross-rank
 raw/processed oracle smoke test with:
 
 ```bash
