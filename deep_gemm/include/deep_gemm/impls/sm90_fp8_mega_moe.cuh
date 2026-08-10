@@ -492,12 +492,10 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         (kIntermediateHidden * 2) * kL1MXFP4WeightSFStrideK;
     constexpr uint32_t kL2MXFP4WeightSFPerExpert =
         kHidden * kL2MXFP4WeightSFStrideK;
-    // L2 consistently benefits from removing weight-SF loads from the math
-    // critical path. L1 needs a longer K loop to amortize the producer's
-    // strided loads: H4096/BK128 regresses, while H7168/BK128 improves.
-    constexpr bool kPrefetchMXFP4WeightSF =
-        layout::should_stage_sm90_mxfp4_weight_sf(
-            false, kHidden, BLOCK_K);
+    // The unified persistent specialization stages routed weight SF for both
+    // logical phases. One shared-memory layout must cover whichever task the
+    // dynamic scheduler publishes next.
+    constexpr bool kPrefetchMXFP4WeightSF = true;
     constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE =
         BLOCK_N * kNumMXFP4SFBKGroups * sizeof(uint8_t);
     constexpr uint32_t SMEM_SFB_STORAGE_SIZE =

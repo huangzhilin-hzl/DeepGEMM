@@ -239,9 +239,7 @@ static void sm90_fp8_mxfp4_mega_moe(
         hidden, intermediate_hidden,
         num_padded_sf_pool_tokens
     };
-    const auto launch_config = select_mxfp4_mega_moe_sm90(heuristic_input);
-    const auto& l1_config = launch_config.l1;
-    const auto& l2_config = launch_config.l2;
+    const auto config = select_mxfp4_mega_moe_sm90(heuristic_input);
 
     // Tensormap construction
     // Acts/weights: standard 2D TMA descriptors (FP8 K-major).
@@ -254,29 +252,25 @@ static void sm90_fp8_mxfp4_mega_moe(
     // A BK256 pipeline stage is represented in shared memory as two adjacent
     // independently-swizzled BK128 TMA tiles. Keep the tensor-map box at 128
     // and issue two copies; the kernel config/scheduler still advances by 256.
-    const int l1_tma_block_k = std::min(l1_config.block_k, kGranK);
-    const int l2_tma_block_k = std::min(l2_config.block_k, kGranK);
-    const int l1_tma_block_n = std::min(l1_config.block_n, 256);
-    const int l2_tma_block_n = std::min(l2_config.block_n, 256);
-    const int l1_pool_tokens = num_ring_tokens;
-    const int l2_pool_tokens = num_ring_tokens;
-    const int l1_sf_stride_tokens = num_sf_ring_tokens;
-    const int l2_sf_stride_tokens = num_sf_ring_tokens;
+    const int tma_block_k = std::min(config.block_k, kGranK);
+    const int tma_block_n = std::min(config.block_n, 256);
+    const int pool_tokens = num_ring_tokens;
+    const int sf_stride_tokens = num_sf_ring_tokens;
     const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts,
-                                                     hidden, l1_pool_tokens,
-                                                     l1_tma_block_k, l1_config.block_m,
+                                                     hidden, pool_tokens,
+                                                     tma_block_k, config.block_m,
                                                      static_cast<int>(l1_acts.stride(-2)),
                                                      128);
     const auto tensor_map_l1_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_acts_sf,
-                                                        l1_sf_stride_tokens, hidden,
-                                                        l1_config.block_m, kGranK,
+                                                        sf_stride_tokens, hidden,
+                                                        config.block_m, kGranK,
                                                         1, 0);
     const auto tensor_map_l1_weights = make_tma_2d_desc(
         l1_weights,
         hidden / 2,
         num_experts_per_rank * intermediate_hidden * 2,
-        l1_tma_block_k / 2,
-        l1_tma_block_n,
+        tma_block_k / 2,
+        tma_block_n,
         static_cast<int>(l1_weights.stride(-2)),
         64, 0, false, true, true);
     // L1 output (post-SwiGLU FP8): N is halved. The SM90 epilogue writes this
@@ -286,34 +280,34 @@ static void sm90_fp8_mxfp4_mega_moe(
     // The default TMA store is issued per warpgroup, each writing a WG_BLOCK_M
     // row tile. In split-N mode, two WGs produce different N halves of the same
     // M rows, then one TMA store writes the full 64x128 post-SwiGLU tile.
-    const int num_epilogue_warpgroups_h = l1_config.num_epilogue_threads / 128;
+    const int num_epilogue_warpgroups_h = config.num_epilogue_threads / 128;
     const auto wg_layout = layout::get_sm90_moe_warpgroup_layout(
-        l1_config.block_m, l1_config.block_n, num_epilogue_warpgroups_h);
+        config.block_m, config.block_n, num_epilogue_warpgroups_h);
     const int wg_block_m = static_cast<int>(wg_layout.block_m);
     const int wg_block_n = static_cast<int>(wg_layout.block_n);
     const int wg_l1_out_block_n = wg_block_n / 2;
-    const int l1_output_box_n = wg_layout.split_n ? l1_config.block_n / 2 : wg_l1_out_block_n;
-    const int l1_output_box_m = wg_layout.split_n ? l1_config.block_m : wg_block_m;
+    const int l1_output_box_n = wg_layout.split_n ? config.block_n / 2 : wg_l1_out_block_n;
+    const int l1_output_box_m = wg_layout.split_n ? config.block_m : wg_block_m;
     const auto tensor_map_l1_output = make_tma_2d_desc(l2_acts,
-                                                       intermediate_hidden, l1_pool_tokens,
+                                                       intermediate_hidden, pool_tokens,
                                                        l1_output_box_n, l1_output_box_m,
                                                        static_cast<int>(l2_acts.stride(-2)),
                                                        0);
     const auto tensor_map_l2_acts = make_tma_2d_desc(l2_acts,
-                                                     intermediate_hidden, l2_pool_tokens,
-                                                     l2_tma_block_k, l2_config.block_m,
+                                                     intermediate_hidden, pool_tokens,
+                                                     tma_block_k, config.block_m,
                                                      static_cast<int>(l2_acts.stride(-2)),
                                                      128);
     const auto tensor_map_l2_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_acts_sf,
-                                                        l2_sf_stride_tokens, intermediate_hidden,
-                                                        l2_config.block_m, kL2ActsSFGranK,
+                                                        sf_stride_tokens, intermediate_hidden,
+                                                        config.block_m, kL2ActsSFGranK,
                                                         1, 0);
     const auto tensor_map_l2_weights = make_tma_2d_desc(
         l2_weights,
         intermediate_hidden / 2,
         num_experts_per_rank * hidden,
-        l2_tma_block_k / 2,
-        l2_tma_block_n,
+        tma_block_k / 2,
+        tma_block_n,
         static_cast<int>(l2_weights.stride(-2)),
         64, 0, false, true, true);
 
@@ -324,20 +318,20 @@ static void sm90_fp8_mxfp4_mega_moe(
         make_tma_2d_desc(
             shared_l1_acts,
             hidden, num_max_tokens_per_rank,
-            l1_tma_block_k, l1_config.block_m,
+            tma_block_k, config.block_m,
             static_cast<int>(shared_l1_acts.stride(-2)),
             128) : tensor_map_l1_acts;
     const auto tensor_map_shared_l1_acts_sf = num_shared_experts > 0 ?
         make_tma_sf_desc(
             cute::UMMA::Major::MN, shared_l1_acts_sf,
             static_cast<int>(shared_l1_acts_sf.size(0)), hidden,
-            l1_config.block_m, kGranK,
+            config.block_m, kGranK,
             1, 0) : tensor_map_l1_acts_sf;
     const auto tensor_map_shared_l1_weights = num_shared_experts > 0 ?
         make_tma_2d_desc(
             shared_l1_weights,
             hidden, shared_intermediate_hidden * 2,
-            l1_tma_block_k, l1_tma_block_n,
+            tma_block_k, tma_block_n,
             static_cast<int>(shared_l1_weights.stride(-2)),
             128) : tensor_map_l1_weights;
     const auto tensor_map_shared_l1_output = num_shared_experts > 0 ?
@@ -351,7 +345,7 @@ static void sm90_fp8_mxfp4_mega_moe(
         make_tma_2d_desc(
             shared_l2_acts,
             shared_intermediate_hidden, num_max_tokens_per_rank,
-            l2_tma_block_k, l2_config.block_m,
+            tma_block_k, config.block_m,
             static_cast<int>(shared_l2_acts.stride(-2)),
             128) : tensor_map_l2_acts;
     const auto tensor_map_shared_l2_acts_sf = num_shared_experts > 0 ?
@@ -359,13 +353,13 @@ static void sm90_fp8_mxfp4_mega_moe(
             cute::UMMA::Major::MN, shared_l2_acts_sf,
             static_cast<int>(shared_l2_acts_sf.size(0)),
             shared_intermediate_hidden,
-            l2_config.block_m, kL2ActsSFGranK,
+            config.block_m, kL2ActsSFGranK,
             1, 0) : tensor_map_l2_acts_sf;
     const auto tensor_map_shared_l2_weights = num_shared_experts > 0 ?
         make_tma_2d_desc(
             shared_l2_weights,
             shared_intermediate_hidden, hidden,
-            l2_tma_block_k, l2_tma_block_n,
+            tma_block_k, tma_block_n,
             static_cast<int>(shared_l2_weights.stride(-2)),
             128) : tensor_map_l2_weights;
 
@@ -375,24 +369,12 @@ static void sm90_fp8_mxfp4_mega_moe(
         cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
 
     // Launch
-    const bool bf16_scaled_accum = launch_config.numerical.bf16_scaled_accum;
-    auto persistent_config = l1_config;
-    // The compact MXFP4 frontend has one persistent kernel specialization, so
-    // both logical phases must agree on every compile-time schedule dimension.
-    // The physical SF ring is also the descriptor stride used after wraparound;
-    // the full logical pool remains workspace metadata.
-    DG_HOST_ASSERT(l1_config.block_m == l2_config.block_m and
-                   l1_config.block_n == l2_config.block_n and
-                   l1_config.block_k == l2_config.block_k and
-                   l1_config.num_stages == l2_config.num_stages and
-                   l1_config.num_dispatch_threads == l2_config.num_dispatch_threads and
-                   l1_config.num_non_epilogue_threads == l2_config.num_non_epilogue_threads and
-                   l1_config.num_epilogue_threads == l2_config.num_epilogue_threads and
-                   l1_config.num_sms == l2_config.num_sms and
-                   l1_config.num_experts_per_wave == l2_config.num_experts_per_wave and
-                   l1_config.swap_ab == l2_config.swap_ab);
-    persistent_config.smem_size =
-        std::max(l1_config.smem_size, l2_config.smem_size) +
+    constexpr bool bf16_scaled_accum = false;
+    auto persistent_config = config;
+    // The unified sizing already covers both logical phases. Add only the
+    // persistent scheduler mailboxes/barriers here; the physical SF ring is the
+    // descriptor stride used after wraparound.
+    persistent_config.smem_size +=
         (4 + (num_shared_experts > 0 ? 2 : 0)) *
             static_cast<int>(sizeof(cutlass::arch::ClusterTransactionBarrier)) +
         2 * static_cast<int>(sizeof(sched::TaskInfo<true>));

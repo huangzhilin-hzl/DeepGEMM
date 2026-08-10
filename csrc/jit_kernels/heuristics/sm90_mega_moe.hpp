@@ -861,7 +861,7 @@ static bool try_apply_sm90_moe_tuning(
 // while A, packed-B, and SFA retain a three-stage TMA pipeline.
 // Two logical worker CTAs are launched per physical H20 SM; launch bounds and
 // an exact-kernel occupancy check are the hard safety gate for grid barriers.
-static Sm90MoeLaunchConfig select_mxfp4_mega_moe_sm90(
+static MegaMoESM90Config select_mxfp4_mega_moe_sm90(
     const Sm90MoeHeuristicInput& input) {
     constexpr int block_m = 64;
     constexpr int block_n = 128;
@@ -889,23 +889,13 @@ static Sm90MoeLaunchConfig select_mxfp4_mega_moe_sm90(
     const int num_experts_per_wave =
         normalize_num_experts_per_wave_for_mega_moe_sm90(
             input.num_experts_per_rank, requested_epw);
-    const bool stage_l1_mxfp4_sfb =
-        layout::should_stage_sm90_mxfp4_weight_sf(
-            true, input.hidden, block_k);
-    const auto [l1_num_stages, l1_smem_size] = get_pipeline_config_for_mega_moe_sm90(
-        SM90ArchSpec::smem_capacity,
-        input.num_experts, input.hidden,
-        block_m, block_n, block_k,
-        num_dispatch_threads / 32, num_epilogue_threads / 32,
-        direct_l2_scatter,
-        3,
-        swap_ab,
-        true,
-        true,
-        stage_l1_mxfp4_sfb,
+    // The Humming path has one persistent specialization for both logical
+    // phases. Size the union once: L2 requires producer-staged MXFP4 SFB, while
+    // the helper already reserves the larger L2 SFA and max(L1, L2) C/D region.
+    const bool double_buffer_mxfp4_expanded_b =
         input.hidden == 4096 and
-            input.num_tokens <= kSM90MoeMaxLatencyOverlapTokens);
-    const auto [l2_num_stages, l2_smem_size] = get_pipeline_config_for_mega_moe_sm90(
+        input.num_tokens <= kSM90MoeMaxLatencyOverlapTokens;
+    const auto [num_stages, smem_size] = get_pipeline_config_for_mega_moe_sm90(
         SM90ArchSpec::smem_capacity,
         input.num_experts, input.hidden,
         block_m, block_n, block_k,
@@ -916,32 +906,26 @@ static Sm90MoeLaunchConfig select_mxfp4_mega_moe_sm90(
         true,
         true,
         true,
-        input.hidden == 4096 and
-            input.num_tokens <= kSM90MoeMaxLatencyOverlapTokens);
+        double_buffer_mxfp4_expanded_b);
     // `smem_capacity` is the opt-in per-block limit. Reserve the remaining
     // 1 KiB/CTA implementation overhead in the two-CTA static precheck; the
     // exact JIT kernel still goes through the runtime occupancy hard gate.
-    DG_HOST_ASSERT(l1_num_stages == 3 and l1_smem_size > 0 and
-                   l2_num_stages == 3 and l2_smem_size > 0 and
-                   2 * std::max(l1_smem_size, l2_smem_size) <=
+    DG_HOST_ASSERT(num_stages == 3 and smem_size > 0 and
+                   2 * smem_size <=
                        SM90ArchSpec::smem_capacity - 1024);
     const int sf_pool_stride_tokens =
         layout::get_num_padded_sf_pool_tokens(num_max_pool_tokens, block_m);
-    MegaMoESM90Config l1_phase {
+    return {
         block_m, block_n, block_k,
         num_max_pool_tokens, input.num_padded_sf_pool_tokens,
         sf_pool_stride_tokens,
         num_experts_per_wave,
         num_worker_ctas,
-        l1_num_stages, l1_smem_size,
+        num_stages, smem_size,
         num_dispatch_threads, num_non_epilogue_threads,
         num_epilogue_threads,
         direct_l2_scatter, nmajor_schedule, one_warp_cleanup, swap_ab,
     };
-    auto l2_phase = l1_phase;
-    l2_phase.num_stages = l2_num_stages;
-    l2_phase.smem_size = l2_smem_size;
-    return {l1_phase, l2_phase, {false}};
 }
 
 static Sm90MoeLaunchConfig select_mega_moe_sm90(
