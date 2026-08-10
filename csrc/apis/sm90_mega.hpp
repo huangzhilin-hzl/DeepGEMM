@@ -215,8 +215,8 @@ static void sm90_mega_moe(
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math
 ) {
-    const auto [l1_weights, l1_weights_sf, l1_mxfp4_secondary] = l1_weights_tuple;
-    const auto [l2_weights, l2_weights_sf, l2_mxfp4_secondary] = l2_weights_tuple;
+    const auto [l1_weights, l1_mxfp4_weights_sf, l1_mxfp4_secondary] = l1_weights_tuple;
+    const auto [l2_weights, l2_mxfp4_weights_sf, l2_mxfp4_secondary] = l2_weights_tuple;
     torch::Tensor shared_l1_weights, shared_l1_weights_sf;
     torch::Tensor shared_l2_weights, shared_l2_weights_sf;
     DG_HOST_ASSERT(
@@ -263,11 +263,11 @@ static void sm90_mega_moe(
     DG_HOST_ASSERT(hidden == hidden_);
     DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
     DG_HOST_ASSERT(l1_weights.is_contiguous() and l2_weights.is_contiguous());
-    DG_HOST_ASSERT(l1_weights_sf.is_cuda() and l2_weights_sf.is_cuda());
+    DG_HOST_ASSERT(l1_mxfp4_weights_sf.is_cuda() and l2_mxfp4_weights_sf.is_cuda());
     DG_HOST_ASSERT(l1_weights.device() == y.device() and
                    l2_weights.device() == y.device() and
-                   l1_weights_sf.device() == y.device() and
-                   l2_weights_sf.device() == y.device());
+                   l1_mxfp4_weights_sf.device() == y.device() and
+                   l2_mxfp4_weights_sf.device() == y.device());
 
     // Keep host validation aligned with the default TMA-aligned Data layouts
     // reconstructed by the generated SM90 kernel.
@@ -276,18 +276,18 @@ static void sm90_mega_moe(
 
     // Check weight SF layout. SF is not TMA-loaded, so no TMA-stride alignment
     // is required; the K direction must still be contiguous within each expert.
-    DG_HOST_ASSERT(l1_weights_sf.scalar_type() == torch::kUInt8 and
-                   l2_weights_sf.scalar_type() == torch::kUInt8);
-    DG_HOST_ASSERT(l1_weights_sf.is_contiguous() and
-                   l2_weights_sf.is_contiguous());
-    DG_HOST_ASSERT(l1_weights_sf.dim() == 3 and
-                   l1_weights_sf.size(0) == num_experts_per_rank and
-                   l1_weights_sf.size(1) == intermediate_hidden * 2 and
-                   l1_weights_sf.size(2) == hidden / 32);
-    DG_HOST_ASSERT(l2_weights_sf.dim() == 3 and
-                   l2_weights_sf.size(0) == num_experts_per_rank and
-                   l2_weights_sf.size(1) == hidden and
-                   l2_weights_sf.size(2) == intermediate_hidden / 32);
+    DG_HOST_ASSERT(l1_mxfp4_weights_sf.scalar_type() == torch::kUInt8 and
+                   l2_mxfp4_weights_sf.scalar_type() == torch::kUInt8);
+    DG_HOST_ASSERT(l1_mxfp4_weights_sf.is_contiguous() and
+                   l2_mxfp4_weights_sf.is_contiguous());
+    DG_HOST_ASSERT(l1_mxfp4_weights_sf.dim() == 3 and
+                   l1_mxfp4_weights_sf.size(0) == num_experts_per_rank and
+                   l1_mxfp4_weights_sf.size(1) == intermediate_hidden * 2 and
+                   l1_mxfp4_weights_sf.size(2) == hidden / 32);
+    DG_HOST_ASSERT(l2_mxfp4_weights_sf.dim() == 3 and
+                   l2_mxfp4_weights_sf.size(0) == num_experts_per_rank and
+                   l2_mxfp4_weights_sf.size(1) == hidden and
+                   l2_mxfp4_weights_sf.size(2) == intermediate_hidden / 32);
     DG_HOST_ASSERT(l1_mxfp4_secondary.is_cuda() and
                    l2_mxfp4_secondary.is_cuda());
     DG_HOST_ASSERT(l1_mxfp4_secondary.device() == y.device() and
@@ -391,24 +391,24 @@ static void sm90_mega_moe(
                 shared_l2_acts, shared_l2_acts_sf,
                 l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] = slice(sym_buffer);
 
-    sm90_fp8_mega_moe(y,
-                     l1_acts, l1_acts_sf,
-                     l2_acts, l2_acts_sf,
-                     shared_l1_acts, shared_l1_acts_sf,
-                     shared_l2_acts, shared_l2_acts_sf,
-                     l1_weights, l2_weights,
-                     l1_weights_sf, l2_weights_sf,
-                     shared_l1_weights, shared_l2_weights,
-                     shared_l1_weights_sf, shared_l2_weights_sf,
-                     cumulative_local_expert_recv_stats,
-                     sym_buffer_ptrs,
-                     rank_idx, num_max_tokens_per_rank,
-                     num_experts_per_rank,
-                     num_shared_experts,
-                     num_tokens, num_topk,
-                     hidden, intermediate_hidden,
-                     activation_clamp, fast_math, true,
-                     l1_mxfp4_secondary, l2_mxfp4_secondary);
+    sm90_fp8_mxfp4_mega_moe(y,
+                            l1_acts, l1_acts_sf,
+                            l2_acts, l2_acts_sf,
+                            shared_l1_acts, shared_l1_acts_sf,
+                            shared_l2_acts, shared_l2_acts_sf,
+                            l1_weights, l2_weights,
+                            l1_mxfp4_weights_sf, l2_mxfp4_weights_sf,
+                            shared_l1_weights, shared_l2_weights,
+                            shared_l1_weights_sf, shared_l2_weights_sf,
+                            cumulative_local_expert_recv_stats,
+                            sym_buffer_ptrs,
+                            rank_idx, num_max_tokens_per_rank,
+                            num_experts_per_rank,
+                            num_shared_experts,
+                            num_tokens, num_topk,
+                            hidden, intermediate_hidden,
+                            activation_clamp, fast_math,
+                            l1_mxfp4_secondary, l2_mxfp4_secondary);
 
     if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();

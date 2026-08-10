@@ -32,7 +32,7 @@
 namespace deep_gemm {
 
 // ============================================================================
-// SM90 (Hopper) FP8 MegaMoE — full implementation
+// SM90 (Hopper) FP8 x MXFP4 MegaMoE — persistent implementation
 // ----------------------------------------------------------------------------
 // Pipeline (cluster=1, no TMA multicast):
 //   * Dispatch warps: pull tokens (FP8) and SF (per-128 channel float) from
@@ -51,11 +51,6 @@ namespace deep_gemm {
 //   * After all GEMM blocks, the math warps run the COMBINE step (top-k
 //     reduction in BF16) — ported verbatim from the SM100 kernel.
 // ============================================================================
-
-enum class MegaMoEPhaseKind {
-    Linear1,
-    Linear2
-};
 
 // The model-load preprocessing keeps every magnitude nibble in place but moves
 // the eight signs in each packed word to [s0,s4,s1,s5,s2,s6,s3,s7].  The low
@@ -94,38 +89,6 @@ __forceinline__ __device__ void sm90_fp8_mega_moe_get_e4m3_sf_and_sf_inv(
     sf.x = math::fast_pow2(exp_x), sf_inv.x = math::fast_pow2(-exp_x);
     sf.y = math::fast_pow2(exp_y), sf_inv.y = math::fast_pow2(-exp_y);
 }
-
-template <MegaMoEPhaseKind kKind,
-          bool kNMajorScheduleRequested,
-          bool kDirectL2ScatterRequested = false,
-          bool kOneWarpCleanupRequested = false>
-struct MegaMoEPhasePolicy {
-    static constexpr bool persistent = false;
-    static constexpr bool runs_linear1 = kKind == MegaMoEPhaseKind::Linear1;
-    static constexpr bool runs_linear2 = kKind == MegaMoEPhaseKind::Linear2;
-    static constexpr bool nmajor_schedule = kNMajorScheduleRequested;
-    static constexpr bool direct_l2_scatter =
-        runs_linear2 and kDirectL2ScatterRequested;
-    static constexpr bool one_warp_cleanup =
-        runs_linear2 and kOneWarpCleanupRequested;
-
-    template <typename Scheduler, typename Func>
-    CUTLASS_DEVICE static void for_each_selected_block(Scheduler& scheduler, Func&& func) {
-        if constexpr (runs_linear1) {
-            scheduler.template for_each_phase_block<sched::SM90BlockPhase::Linear1>(
-                [&](const uint32_t& local_expert_idx, const uint32_t& num_k_blocks,
-                    const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-                    func(local_expert_idx, num_k_blocks, m_block_idx, n_block_idx);
-                });
-        } else {
-            scheduler.template for_each_phase_block<sched::SM90BlockPhase::Linear2>(
-                [&](const uint32_t& local_expert_idx, const uint32_t& num_k_blocks,
-                    const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
-                    func(local_expert_idx, num_k_blocks, m_block_idx, n_block_idx);
-                });
-        }
-    }
-};
 
 struct MegaMoEPersistentPolicy {
     static constexpr bool persistent = true;
@@ -225,7 +188,6 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     bool kFastMath, \
     bool kFP8SwapAB = false, \
     bool kBF16ScaledAccumRequested = false, \
-    bool kMXFP4Weights = false, \
     bool kOverlapMXFP4ScalePath = false, \
     uint32_t kNumRingTokens = kNumMaxPoolTokens, \
     uint32_t kNumSFRingTokens = kNumPaddedSFPoolTokens, \
@@ -239,13 +201,13 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts, \
     const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf, \
     const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights, \
-    const float* __restrict__ l1_weights_sf, \
+    const float* __restrict__ l1_mxfp4_secondary, \
     const uint8_t* __restrict__ l1_mxfp4_weights_sf, \
     const __grid_constant__ cute::TmaDescriptor tensor_map_l1_output, \
     const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts, \
     const __grid_constant__ cute::TmaDescriptor tensor_map_l2_acts_sf, \
     const __grid_constant__ cute::TmaDescriptor tensor_map_l2_weights, \
-    const float* __restrict__ l2_weights_sf, \
+    const float* __restrict__ l2_mxfp4_secondary, \
     const uint8_t* __restrict__ l2_mxfp4_weights_sf, \
     const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l1_acts, \
     const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l1_acts_sf, \
@@ -265,13 +227,13 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     const cute::TmaDescriptor& tensor_map_l1_acts, \
     const cute::TmaDescriptor& tensor_map_l1_acts_sf, \
     const cute::TmaDescriptor& tensor_map_l1_weights, \
-    const float* __restrict__ l1_weights_sf, \
+    const float* __restrict__ l1_mxfp4_secondary, \
     const uint8_t* __restrict__ l1_mxfp4_weights_sf, \
     const cute::TmaDescriptor& tensor_map_l1_output, \
     const cute::TmaDescriptor& tensor_map_l2_acts, \
     const cute::TmaDescriptor& tensor_map_l2_acts_sf, \
     const cute::TmaDescriptor& tensor_map_l2_weights, \
-    const float* __restrict__ l2_weights_sf, \
+    const float* __restrict__ l2_mxfp4_secondary, \
     const uint8_t* __restrict__ l2_mxfp4_weights_sf, \
     const cute::TmaDescriptor& tensor_map_shared_l1_acts, \
     const cute::TmaDescriptor& tensor_map_shared_l1_acts_sf, \
@@ -286,8 +248,8 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
 #define DG_SM90_FP8_MOE_KERNEL_ARGS \
     y, cumulative_local_expert_recv_stats, num_tokens, sym_buffer, \
     tensor_map_l1_acts, tensor_map_l1_acts_sf, tensor_map_l1_weights, \
-    l1_weights_sf, l1_mxfp4_weights_sf, tensor_map_l1_output, tensor_map_l2_acts, \
-    tensor_map_l2_acts_sf, tensor_map_l2_weights, l2_weights_sf, \
+    l1_mxfp4_secondary, l1_mxfp4_weights_sf, tensor_map_l1_output, tensor_map_l2_acts, \
+    tensor_map_l2_acts_sf, tensor_map_l2_weights, l2_mxfp4_secondary, \
     l2_mxfp4_weights_sf, tensor_map_shared_l1_acts, \
     tensor_map_shared_l1_acts_sf, tensor_map_shared_l1_weights, \
     shared_l1_weights_sf, tensor_map_shared_l1_output, \
@@ -300,7 +262,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     kNumPaddedSFPoolTokens, kSFPoolStrideTokens, kNumStages, kNumDispatchThreads, \
     kNumNonEpilogueThreads, kNumEpilogueThreads, kNumSMs, kNumRanks, \
     kActivationClamp, kFastMath, kFP8SwapAB, kBF16ScaledAccumRequested, \
-    kMXFP4Weights, kOverlapMXFP4ScalePath, \
+    kOverlapMXFP4ScalePath, \
     kNumRingTokens, kNumSFRingTokens, kNumSharedExperts
 
 template <typename MegaMoEPhase, DG_SM90_FP8_MOE_TEMPLATE_PARAMS>
@@ -347,26 +309,15 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                      "BLOCK_K must be 128 or 256");
     DG_STATIC_ASSERT(kHidden % BLOCK_K == 0 and kIntermediateHidden % BLOCK_K == 0,
                      "GEMM K dimensions must be divisible by BLOCK_K");
-    DG_STATIC_ASSERT(not kMXFP4Weights or
-                     (BLOCK_M == 64 and BLOCK_N == 128 and BLOCK_K == 128 and
-                      kNumDispatchThreads == 64 and
-                      kNumNonEpilogueThreads == 64 and
-                      kNumEpilogueWarpgroups == 1 and kNumStages == 3),
+    DG_STATIC_ASSERT(BLOCK_M == 64 and BLOCK_N == 128 and BLOCK_K == 128 and
+                     kNumDispatchThreads == 64 and
+                     kNumNonEpilogueThreads == 64 and
+                     kNumEpilogueWarpgroups == 1 and kNumStages == 3,
                      "SM90 MXFP4 uses the compact BM64/BN128/BK128 three-stage schedule");
-    DG_STATIC_ASSERT(not kMXFP4Weights or not kFP8SwapAB,
+    DG_STATIC_ASSERT(not kFP8SwapAB,
                      "MXFP4 does not use the FP8 swap-AB schedule");
-    DG_STATIC_ASSERT(not kMXFP4Weights or not kBF16ScaledAccumRequested,
+    DG_STATIC_ASSERT(not kBF16ScaledAccumRequested,
                      "MXFP4 K32 promotion requires FP32 scaled accumulation");
-    DG_STATIC_ASSERT(not kOverlapMXFP4ScalePath or kMXFP4Weights,
-                     "Scale-path overlap requires MXFP4 weights");
-    DG_STATIC_ASSERT(not MegaMoEPhase::persistent or kMXFP4Weights,
-                     "The SM90 persistent runtime is specialized for routed MXFP4 weights");
-    DG_STATIC_ASSERT(not MegaMoEPhase::persistent or
-                     (BLOCK_M == 64 and BLOCK_N == 128 and BLOCK_K == 128 and
-                      kNumStages == 3 and kNumNonEpilogueThreads == 64 and
-                      kNumEpilogueWarpgroups == 1),
-                     "The SM90 persistent runtime requires the compact three-stage schedule");
-
     // =====================================================================
     // Thread / warp identification
     // =====================================================================
@@ -469,7 +420,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     // fragment. Strict mode multiplies and accumulates in FP32 and rounds only
     // the persistent storage. Fast math also rounds each promotion's scale and
     // WGMMA fragment to BF16 so the packed pairs can be updated with HFMA2.
-    constexpr bool kMXFP4PackedBF16Accum = kMXFP4Weights;
+    constexpr bool kMXFP4PackedBF16Accum = true;
     using L1WGMMA = typename mma::sm90::FP8MMASelector<WG_BLOCK_N>::type;
     static_assert(L1WGMMA::M == 64 and L1WGMMA::N == WG_BLOCK_N and L1WGMMA::K == 32,
                   "Unexpected WGMMA shape");
@@ -506,24 +457,22 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t);
     // Flash reserves a second expanded tile so the math WG can decode the
     // next packed-B stage while the current phase's final WGMMA group is in
-    // flight. Other MXFP4 shapes retain one fixed tile; FP8 keeps staged B
-    // tiles.
+    // flight. Other MXFP4 shapes retain one fixed expanded tile. Shared FP8
+    // tasks alias this storage through a separately synchronized pipeline.
     constexpr bool kDoubleBufferedMXFP4ExpandedBStorage =
-        kMXFP4Weights and
         kHidden == 4096 and BLOCK_N == 128 and BLOCK_K == 128 and
         kOverlapMXFP4ScalePath;
     constexpr bool kPipelineMXFP4ExpandedB =
         kDoubleBufferedMXFP4ExpandedBStorage;
-    constexpr uint32_t SMEM_B_STORAGE_SIZE = kMXFP4Weights ?
+    constexpr uint32_t SMEM_B_STORAGE_SIZE =
         (kDoubleBufferedMXFP4ExpandedBStorage ? 2u : 1u) *
-            SMEM_B_SIZE_PER_STAGE :
-        kNumStages * SMEM_B_SIZE_PER_STAGE;
+            SMEM_B_SIZE_PER_STAGE;
     // Packed MXFP4 is TMA-loaded with B64 swizzle into a temporary half-sized
     // region. The packed row is exactly 64 bytes at BK128, so B64 spreads the
     // one-word-per-row decoder loads across banks. The math warpgroup expands
     // it into the normal B128-swizzled FP8 B tile before issuing WGMMA.
-    constexpr uint32_t SMEM_B_PACKED_SIZE_PER_STAGE = kMXFP4Weights ?
-        LOAD_BLOCK_N * BLOCK_K / 2 : 0u;
+    constexpr uint32_t SMEM_B_PACKED_SIZE_PER_STAGE =
+        LOAD_BLOCK_N * BLOCK_K / 2;
     // SFA holds one aligned BLOCK_M-float vector per 64 channels. L1 uses every
     // other vector (per-128); L2 uses all of them (per-64).
     constexpr uint32_t kL2SFAHalfStride =
@@ -547,14 +496,13 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     // L2 consistently benefits from removing weight-SF loads from the math
     // critical path. L1 needs a longer K loop to amortize the producer's
     // strided loads: H4096/BK128 regresses, while H7168/BK128 improves.
-    constexpr bool kPrefetchMXFP4WeightSF = kMXFP4Weights and
+    constexpr bool kPrefetchMXFP4WeightSF =
         layout::should_stage_sm90_mxfp4_weight_sf(
-            MegaMoEPhase::persistent ? false : MegaMoEPhase::runs_linear1,
-            kHidden, BLOCK_K);
-    constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE = kMXFP4Weights ?
-        BLOCK_N * kNumMXFP4SFBKGroups * sizeof(uint8_t) : 0u;
+            false, kHidden, BLOCK_K);
+    constexpr uint32_t SMEM_SFB_SIZE_PER_STAGE =
+        BLOCK_N * kNumMXFP4SFBKGroups * sizeof(uint8_t);
     constexpr uint32_t SMEM_SFB_STORAGE_SIZE =
-        kMXFP4Weights and kPrefetchMXFP4WeightSF ?
+        kPrefetchMXFP4WeightSF ?
             kNumStages * SMEM_SFB_SIZE_PER_STAGE : 0u;
     // CD output: max of L1 FP8 (BLOCK_M * (BLOCK_N/2) * 1 byte * num_wg) and
     // L2 BF16 contribution.
@@ -637,16 +585,15 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr uint32_t SMEM_BARRIER_OFFSET =
         SMEM_SFA_OFFSET + kNumStages * SMEM_SFA_SIZE_PER_STAGE +
         SMEM_SFB_STORAGE_SIZE;
-    DG_STATIC_ASSERT(not kMXFP4Weights or
-                     (SMEM_A_SIZE_PER_STAGE == 8192 and
-                      SMEM_B_STORAGE_SIZE ==
-                          (kDoubleBufferedMXFP4ExpandedBStorage ?
-                               32768u : 16384u) and
-                      SMEM_B_PACKED_SIZE_PER_STAGE == 8192 and
-                      SMEM_SFA_SIZE_PER_STAGE == 512 and
-                      SMEM_SFB_SIZE_PER_STAGE == 512 and
-                      SMEM_SFB_STORAGE_SIZE ==
-                          (kPrefetchMXFP4WeightSF ? 1536 : 0)),
+    DG_STATIC_ASSERT(SMEM_A_SIZE_PER_STAGE == 8192 and
+                     SMEM_B_STORAGE_SIZE ==
+                         (kDoubleBufferedMXFP4ExpandedBStorage ?
+                              32768u : 16384u) and
+                     SMEM_B_PACKED_SIZE_PER_STAGE == 8192 and
+                     SMEM_SFA_SIZE_PER_STAGE == 512 and
+                     SMEM_SFB_SIZE_PER_STAGE == 512 and
+                     SMEM_SFB_STORAGE_SIZE ==
+                         (kPrefetchMXFP4WeightSF ? 1536 : 0),
                      "Unexpected compact MXFP4 shared-memory tile sizes");
     DG_STATIC_ASSERT(SMEM_A_OFFSET % 128 == 0 and
                      SMEM_B_OFFSET % 128 == 0 and
@@ -666,9 +613,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             (kDoubleBufferedMXFP4ExpandedBStorage ?
                  i * SMEM_B_SIZE_PER_STAGE : 0u);
     });
-    auto smem_b = utils::PatternVisitor([=](const uint32_t& i) {
-        return smem_b_expanded_base +
-            (kMXFP4Weights ? 0u : i * SMEM_B_SIZE_PER_STAGE);
+    auto smem_b = utils::PatternVisitor([=](const uint32_t&) {
+        return smem_b_expanded_base;
     });
     auto smem_b_packed = utils::PatternVisitor([=](const uint32_t& i) {
         return math::advance_ptr<uint8_t>(
@@ -840,7 +786,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         kNumEpilogueRegisters * kNumEpilogueThreads;
     DG_STATIC_ASSERT(kCTARegisterBudget <= 64512,
                      "Too many registers");
-    DG_STATIC_ASSERT(not kMXFP4Weights or kCTARegisterBudget == 32768,
+    DG_STATIC_ASSERT(kCTARegisterBudget == 32768,
                      "Two-CTA MXFP4 must use half the SM register file");
 
     constexpr uint32_t kDispatchGridSyncIndex = 0;
@@ -1492,8 +1438,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 BlockPhaseTag::value == sched::BlockPhase::SharedLinear1 or
                 BlockPhaseTag::value == sched::BlockPhase::SharedLinear2;
             sync_task_storage_alias(is_shared_phase);
-            constexpr bool use_mxfp4_task =
-                kMXFP4Weights and not is_shared_phase;
+            constexpr bool use_mxfp4_task = not is_shared_phase;
             const auto tensor_map_b_ptr = is_shared_phase ?
                 (is_linear1_phase ? &tensor_map_shared_l1_weights :
                                     &tensor_map_shared_l2_weights) :
@@ -1694,7 +1639,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             float accum[kAccumPerThread];
 
             const auto run_mxfp4_gemm_loop = [&]() {
-                if constexpr (kMXFP4Weights) {
+                {
                     constexpr uint32_t kWeightGranK = kMXFP4WeightGranK;
                     constexpr uint32_t kWGThreads = 128;
                     const uint32_t wg_thread_idx = warp_idx_in_wg * 32 + lane_idx;
@@ -2020,7 +1965,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     };
 
                     const float mxfp4_secondary = __ldg(
-                        (is_linear1_phase ? l1_weights_sf : l2_weights_sf) +
+                        (is_linear1_phase ? l1_mxfp4_secondary : l2_mxfp4_secondary) +
                         local_expert_idx);
                     for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks;
                          advance_pipeline(k_block_idx)) {
@@ -2169,7 +2114,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     const uint32_t gate_n = (n_block_idx * BLOCK_N + wg_n_idx) / 256u;
                     const uint32_t up_n   = kL1SFGateBlks + gate_n;
                     const float* base = (is_shared_phase ?
-                        shared_l1_weights_sf : l1_weights_sf) +
+                        shared_l1_weights_sf : l1_mxfp4_secondary) +
                         (is_shared_phase ? 0u :
                             local_expert_idx * kL1SFPerExpert) +
                         k_block_idx;
@@ -2178,7 +2123,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 } else {
                     const uint32_t sf_n = (n_block_idx * BLOCK_N + wg_n_idx) / 128u;
                     const float* base = (is_shared_phase ?
-                        shared_l2_weights_sf : l2_weights_sf) +
+                        shared_l2_weights_sf : l2_mxfp4_secondary) +
                         (is_shared_phase ? 0u :
                             local_expert_idx * kL2SFPerExpert) +
                         k_block_idx;
@@ -2614,7 +2559,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             const uint32_t gate_n =
                                 (n_block_idx * BLOCK_N + wg_n_idx) / 256u;
                             const uint32_t up_n = kL1SFGateBlks + gate_n;
-                            const float* base = l1_weights_sf +
+                            const float* base = l1_mxfp4_secondary +
                                 local_expert_idx * kL1SFPerExpert;
                             #pragma unroll
                             for (uint32_t k_plane = 0;
@@ -2639,7 +2584,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         } else {
                             const uint32_t sf_n =
                                 (n_block_idx * BLOCK_N + wg_n_idx) / 128u;
-                            const float* base = l2_weights_sf +
+                            const float* base = l2_mxfp4_secondary +
                                 local_expert_idx * kL2SFPerExpert;
                             #pragma unroll
                             for (uint32_t sf_group = 0;
@@ -2781,7 +2726,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         const uint32_t gate_n =
                             (n_block_idx * BLOCK_N + wg_n_idx) / 256u;
                         const uint32_t up_n = kL1SFGateBlks + gate_n;
-                        const float* base = l1_weights_sf +
+                        const float* base = l1_mxfp4_secondary +
                             local_expert_idx * kL1SFPerExpert + k_block_idx;
                         const float gate_sf =
                             __ldg(base + gate_n * kL1SFKBlocks);
@@ -2801,7 +2746,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 row_offset_r1);
                         const uint32_t sf_n =
                             (n_block_idx * BLOCK_N + wg_n_idx) / 128u;
-                        const float* base = l2_weights_sf +
+                        const float* base = l2_mxfp4_secondary +
                             local_expert_idx * kL2SFPerExpert + k_block_idx;
                         const float l2_sf_lo =
                             __ldg(base + sf_n * kL2SFKBlocks);
@@ -2828,7 +2773,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 }
             };
 
-            if constexpr (kMXFP4Weights and not is_shared_phase) {
+            if constexpr (not is_shared_phase) {
                 run_mxfp4_gemm_loop();
             } else if constexpr (BLOCK_K == 256) {
                 run_bk256_gemm_loop();
@@ -3568,33 +3513,6 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     if (blockIdx.x == 0 and threadIdx.x == 0)
         DG_DEVICE_ASSERT(false and "This kernel only supports sm_90");
 #endif
-}
-
-template <DG_SM90_FP8_MOE_TEMPLATE_PARAMS,
-          bool kNMajorScheduleRequested = false>
-CUTLASS_GLOBAL __launch_bounds__(
-    kNumDispatchThreads + kNumNonEpilogueThreads + kNumEpilogueThreads,
-    kMXFP4Weights ? 2 : 1) void
-sm90_fp8_mega_moe_l1_impl(DG_SM90_FP8_MOE_KERNEL_ARGS_DECL) {
-    using Phase = MegaMoEPhasePolicy<
-        MegaMoEPhaseKind::Linear1, kNMajorScheduleRequested>;
-    sm90_fp8_mega_moe_core<Phase, DG_SM90_FP8_MOE_CORE_TEMPLATE_ARGS>(
-        DG_SM90_FP8_MOE_KERNEL_ARGS);
-}
-
-template <DG_SM90_FP8_MOE_TEMPLATE_PARAMS,
-          bool kDirectL2ScatterRequested = false,
-          bool kNMajorScheduleRequested = false,
-          bool kOneWarpCleanupRequested = false>
-CUTLASS_GLOBAL __launch_bounds__(
-    kNumDispatchThreads + kNumNonEpilogueThreads + kNumEpilogueThreads,
-    kMXFP4Weights ? 2 : 1) void
-sm90_fp8_mega_moe_l2_impl(DG_SM90_FP8_MOE_KERNEL_ARGS_DECL) {
-    using Phase = MegaMoEPhasePolicy<
-        MegaMoEPhaseKind::Linear2, kNMajorScheduleRequested,
-        kDirectL2ScatterRequested, kOneWarpCleanupRequested>;
-    sm90_fp8_mega_moe_core<Phase, DG_SM90_FP8_MOE_CORE_TEMPLATE_ARGS>(
-        DG_SM90_FP8_MOE_KERNEL_ARGS);
 }
 
 template <DG_SM90_FP8_MOE_TEMPLATE_PARAMS>
