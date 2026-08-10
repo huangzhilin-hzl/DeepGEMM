@@ -23,7 +23,6 @@
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/layout/sm90_mega_moe.cuh>
 #include <deep_gemm/mma/sm90.cuh>
-#include <deep_gemm/scheduler/sm90_mega_moe.cuh>
 #include <deep_gemm/scheduler/mega_moe.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/tma.cuh>
@@ -718,30 +717,15 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     // =====================================================================
     // Scheduler (cluster=1)
     // =====================================================================
-    using static_scheduler_t = sched::SM90MegaMoESchedulerAdapter<
-        BLOCK_M, BLOCK_N, BLOCK_K,
-        L1_SHAPE_N, L1_SHAPE_K,
-        L2_SHAPE_N, L2_SHAPE_K,
-        kNumExpertsPerRank, kNumExpertsPerWave, kNumSMs, kNumRanks,
-        MegaMoEPhase::runs_linear2 and MegaMoEPhase::nmajor_schedule,
-        MegaMoEPhase::runs_linear1 and MegaMoEPhase::nmajor_schedule>;
-    using persistent_scheduler_t = sched::MegaMoEScheduler<
+    using scheduler_t = sched::MegaMoEScheduler<
         BLOCK_M, BLOCK_N, BLOCK_K,
         L1_SHAPE_N, L1_SHAPE_K,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank, kNumSMs, kNumRanks,
         kNumRingBlocks, kNumSharedExperts, 1>;
-    using scheduler_t = std::conditional_t<
-        MegaMoEPhase::persistent, persistent_scheduler_t, static_scheduler_t>;
-    auto scheduler = [&]() -> scheduler_t {
-        if constexpr (MegaMoEPhase::persistent) {
-            return scheduler_t(
-                workspace, task_info_full_barriers,
-                task_info_empty_barriers, task_infos);
-        } else {
-            return scheduler_t(workspace);
-        }
-    }();
+    auto scheduler = scheduler_t(
+        workspace, task_info_full_barriers,
+        task_info_empty_barriers, task_infos);
 
     // Pipeline state shared by TMA loaders and math warpgroups
     uint32_t stage_idx = 0, phase = 0;
@@ -810,7 +794,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         const uint32_t num_k_blocks =
             math::ceil_div(task_info.shape_k, BLOCK_K);
         const uint32_t n_block_idx =
-            persistent_scheduler_t::get_n_block_idx(task_info);
+            scheduler_t::get_n_block_idx(task_info);
         if (task_info.block_phase == sched::BlockPhase::Linear1) {
             func(std::integral_constant<
                      sched::BlockPhase, sched::BlockPhase::Linear1>{},
