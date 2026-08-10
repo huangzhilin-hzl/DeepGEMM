@@ -2228,11 +2228,19 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         const uint32_t smem_elem_idx =
                             row_in_wg * WG_BLOCK_N +
                             lane_in_row * cols_per_lane;
-                        auto smem_ptr = smem_cd_base + smem_elem_idx * kCombineElementBytes;
-                        const auto dst_token = combine_token_buffer.get_rank_buffer(dst_topk_idx)
-                                               .get_data_buffer(dst_token_idx);
                         constexpr uint32_t kScatterBytesPerLane =
                             (WG_BLOCK_N / 16) * kCombineElementBytes;
+                        DG_STATIC_ASSERT(
+                            kScatterBytesPerLane == 4 or
+                            kScatterBytesPerLane == 8 or
+                            kScatterBytesPerLane == 16 or
+                            kScatterBytesPerLane == 32,
+                            "Unexpected L2 scatter width");
+                        auto smem_ptr = math::advance_ptr<uint8_t>(
+                            smem_cd_base,
+                            smem_elem_idx * kCombineElementBytes);
+                        const auto dst_token = combine_token_buffer.get_rank_buffer(dst_topk_idx)
+                                               .get_data_buffer(dst_token_idx);
                         auto dst_ptr = math::advance_ptr<uint8_t>(
                             dst_token.get_base_ptr(),
                             n_idx * kCombineElementBytes + lane_in_row * kScatterBytesPerLane);
@@ -2254,8 +2262,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 *reinterpret_cast<uint2*>(smem_ptr);
                             *reinterpret_cast<uint2*>(mapped_dst_ptr) = packed;
                         } else {
-                            DG_STATIC_ASSERT(kScatterBytesPerLane == 4,
-                                             "Unexpected L2 scatter width");
+                            // The width assertion above leaves only the 4-byte case.
                             *reinterpret_cast<uint32_t*>(mapped_dst_ptr) =
                                 *reinterpret_cast<uint32_t*>(smem_ptr);
                         }
