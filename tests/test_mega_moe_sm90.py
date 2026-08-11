@@ -130,6 +130,20 @@ def _deinterleave_l1(tensor: torch.Tensor, granularity: int = 8) -> torch.Tensor
     return result
 
 
+def _restore_sm90_mxfp4_scale_layout(
+    tensor: torch.Tensor,
+    hidden: int,
+) -> torch.Tensor:
+    """Restore the processed ``[K128,N,4]`` payload to logical scale rows."""
+    if hidden > 4096:
+        return tensor
+    num_experts, num_rows, num_k32_groups = tensor.shape
+    assert num_k32_groups % 4 == 0
+    return tensor.view(
+        num_experts, num_k32_groups // 4, num_rows, 4
+    ).permute(0, 2, 1, 3).contiguous().view(tensor.shape)
+
+
 def _swiglu_fp32(gate_up: torch.Tensor, clamp: float) -> torch.Tensor:
     half = gate_up.size(-1) // 2
     gate, up = gate_up[..., :half], gate_up[..., half:]
@@ -427,12 +441,16 @@ def _run_scenario(
         _deinterleave_l1(transformed_l1[0]))
     reference_l1_sf = (
         transformed_l1[2][:, None, None] *
-        torch.exp2(_deinterleave_l1(transformed_l1[1]).float()))
+        torch.exp2(_deinterleave_l1(
+            _restore_sm90_mxfp4_scale_layout(
+                transformed_l1[1], hidden)).float()))
     reference_l2_weight = _restore_mxfp4_sign_bits_from_sm90(
         transformed_l2[0])
     reference_l2_sf = (
         transformed_l2[2][:, None, None] *
-        torch.exp2(transformed_l2[1].float()))
+        torch.exp2(
+            _restore_sm90_mxfp4_scale_layout(
+                transformed_l2[1], hidden).float()))
 
     transformed_shared_l1 = transformed_shared_l2 = None
     reference_shared_l1_weight = reference_shared_l1_sf = None

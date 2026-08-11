@@ -239,8 +239,8 @@ static void sm90_mega_moe(
                    l2_activation_dequant_scale > 0.0f);
 
     // Tensor checks: preprocessed Humming MXFP4 uses int8 packed E2M1
-    // [E, N, K/2], row-major uint8 relative UE8M0 [E, N, K/32], and the
-    // FP32 per-expert secondary validated below.
+    // [E, N, K/2], an opaque contiguous uint8 relative-UE8M0 payload with
+    // public shape [E, N, K/32], and the FP32 per-expert secondary below.
     DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
     DG_HOST_ASSERT(get_major_type_ab(l2_weights) == cute::UMMA::Major::K);
     DG_HOST_ASSERT(l1_weights.scalar_type() == kPackedFP4);
@@ -269,8 +269,8 @@ static void sm90_mega_moe(
     DG_HOST_ASSERT(is_valid_hidden_for_sm90_mega_moe(hidden) and
                    intermediate_hidden % 256 == 0);
 
-    // Check weight SF layout. SF is not TMA-loaded, so no TMA-stride alignment
-    // is required; the K direction must still be contiguous within each expert.
+    // Check the public weight-SF shape. SF is producer-warp loaded rather than
+    // TMA-loaded; preprocessing owns its hidden-dependent physical ordering.
     DG_HOST_ASSERT(l1_mxfp4_weights_sf.scalar_type() == torch::kUInt8 and
                    l2_mxfp4_weights_sf.scalar_type() == torch::kUInt8);
     DG_HOST_ASSERT(l1_mxfp4_weights_sf.is_contiguous() and

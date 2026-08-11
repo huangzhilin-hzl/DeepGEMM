@@ -12,6 +12,7 @@ import torch
 
 MXFP4CheckpointWeights = Tuple[torch.Tensor, torch.Tensor]
 MXFP4ProcessedWeights = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+_SM90_MXFP4_COALESCED_SCALE_MAX_HIDDEN = 4096
 
 
 def _is_valid_sm90_mxfp4_hidden_size(hidden: int) -> bool:
@@ -138,6 +139,40 @@ def _interleave_mxfp4_rows(tensor: torch.Tensor, granularity: int = 8) -> torch.
         num_experts, half // granularity, 2, granularity, *tail
     ).copy_(torch.stack((gate, up), dim=2))
     return result
+
+
+def _transpose_mxfp4_scales_for_sm90(tensor: torch.Tensor) -> torch.Tensor:
+    """Store K128 scale words contiguously across N for coalesced SM90 loads.
+
+    The returned tensor deliberately retains the public ``[E, N, K/32]``
+    shape. Its opaque processed payload is physically ordered as
+    ``[E, K/128, N, 4]`` and consumed only by the SM90 Humming kernel.
+    """
+    _require(tensor.dim() == 3,
+             'MXFP4 scale tensor must be three-dimensional')
+    num_experts, num_rows, num_k32_groups = tensor.shape
+    _require(num_k32_groups % 4 == 0,
+             'SM90 MXFP4 scale K/32 dimension must be divisible by 4')
+    return tensor.reshape(
+        num_experts, num_rows, num_k32_groups // 4, 4
+    ).permute(0, 2, 1, 3).contiguous().view(tensor.shape)
+
+
+def _uses_coalesced_mxfp4_scales_sm90(hidden: int) -> bool:
+    """Match the compile-time scale-load specialization in the SM90 kernel."""
+    return hidden <= _SM90_MXFP4_COALESCED_SCALE_MAX_HIDDEN
+
+
+def _restore_mxfp4_scales_from_sm90(tensor: torch.Tensor) -> torch.Tensor:
+    """Restore an opaque SM90 scale payload to logical ``[E, N, K/32]``."""
+    _require(tensor.dim() == 3,
+             'MXFP4 scale tensor must be three-dimensional')
+    num_experts, num_rows, num_k32_groups = tensor.shape
+    _require(num_k32_groups % 4 == 0,
+             'SM90 MXFP4 scale K/32 dimension must be divisible by 4')
+    return tensor.view(
+        num_experts, num_k32_groups // 4, num_rows, 4
+    ).permute(0, 2, 1, 3).contiguous().view(tensor.shape)
 
 
 def _reorder_mxfp4_sign_bits_for_sm90(weight: torch.Tensor) -> torch.Tensor:
@@ -296,8 +331,11 @@ def transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
 
     Each result is ``(processed_e2m1, relative_ue8m0, weight_scale_2)``.
     ``weight_scale_2`` is FP32 ``[E]`` and includes the optional Humming
-    checkpoint secondary scale. This is the only routed MXFP4 weight contract
-    accepted by the SM90 runtime.
+    checkpoint secondary scale. For hidden sizes up to 4096, the scale tensor
+    keeps its public ``[E, N, K/32]`` shape but stores an opaque physical
+    ``[E, K/128, N, 4]`` payload for coalesced producer-warp loads. Larger
+    hidden sizes retain natural row-major storage. This is the only routed
+    MXFP4 weight contract accepted by the SM90 runtime.
     """
     l1 = _validate_checkpoint_mxfp4_weights(l1_weights, 'L1 MXFP4')
     l2 = _validate_checkpoint_mxfp4_weights(l2_weights, 'L2 MXFP4')
@@ -315,11 +353,21 @@ def transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
         l2_secondary = _apply_weight_scale_2(
             l2_weight_scale_2, l2_secondary, 'l2')
 
+    hidden = l2_w.size(1)
+    l1_sf = _interleave_mxfp4_rows(l1_sf)
+    if _uses_coalesced_mxfp4_scales_sm90(hidden):
+        l1_sf = _transpose_mxfp4_scales_for_sm90(l1_sf)
+        l2_sf = _transpose_mxfp4_scales_for_sm90(l2_sf)
+
     return (
         l1_w,
-        _interleave_mxfp4_rows(l1_sf),
+        l1_sf,
         l1_secondary,
-    ), (l2_w.contiguous(), l2_sf.contiguous(), l2_secondary)
+    ), (
+        l2_w.contiguous(),
+        l2_sf.contiguous(),
+        l2_secondary,
+    )
 
 
 def _validate_processed_mxfp4_kernel_weights(

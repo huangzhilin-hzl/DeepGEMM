@@ -16,9 +16,11 @@ mxfp4 = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(mxfp4)
 
 
-def _valid_checkpoint_weights(num_experts: int = 1):
-    hidden = 512
-    intermediate = 256
+def _valid_checkpoint_weights(
+    num_experts: int = 1,
+    hidden: int = 512,
+    intermediate: int = 256,
+):
     l1_w = torch.arange(
         num_experts * 2 * intermediate * (hidden // 2), dtype=torch.int32
     ).to(torch.uint8).reshape(num_experts, 2 * intermediate, hidden // 2)
@@ -102,17 +104,41 @@ def test_canonical_transform_returns_processed_triples_and_interleaves_l1():
             .view(torch.uint8),
         l1_w[:, row_order],
     )
-    assert torch.equal(transformed_l1[1], l1_sf[:, row_order] - 108)
+    assert torch.equal(
+        mxfp4._restore_mxfp4_scales_from_sm90(transformed_l1[1]),
+        l1_sf[:, row_order] - 108,
+    )
     assert transformed_l2[0].dtype == torch.int8
     assert torch.equal(
         mxfp4._restore_mxfp4_sign_bits_from_sm90(transformed_l2[0])
             .view(torch.uint8),
         l2_w,
     )
-    assert torch.equal(transformed_l2[1], l2_sf - 108)
+    assert torch.equal(
+        mxfp4._restore_mxfp4_scales_from_sm90(transformed_l2[1]),
+        l2_sf - 108,
+    )
     assert transformed_l1[2].item() == pytest.approx(2.0 ** -19)
     assert transformed_l2[2].item() == pytest.approx(2.0 ** -19)
     assert all(tensor.is_contiguous() for tensor in transformed_l1 + transformed_l2)
+
+
+def test_large_hidden_preserves_natural_scale_layout():
+    (l1_w, l1_sf), (l2_w, l2_sf) = _valid_checkpoint_weights(hidden=4608)
+    l1_sf.copy_((
+        109 + torch.arange(l1_sf.numel(), dtype=torch.int32).reshape(l1_sf.shape) % 4
+    ).to(torch.uint8))
+    l2_sf.copy_((
+        109 + torch.arange(l2_sf.numel(), dtype=torch.int32).reshape(l2_sf.shape) % 4
+    ).to(torch.uint8))
+
+    transformed_l1, transformed_l2 = (
+        mxfp4.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
+            (l1_w, l1_sf), (l2_w, l2_sf)))
+
+    assert torch.equal(
+        transformed_l1[1], mxfp4._interleave_mxfp4_rows(l1_sf - 108))
+    assert torch.equal(transformed_l2[1], l2_sf - 108)
 
 
 def test_fp32_ue8m0_conversion_including_finite_endpoints():
@@ -133,6 +159,8 @@ def test_hidden_size_contract_matches_vectorized_combine_chunks():
     assert mxfp4._is_valid_sm90_mxfp4_hidden_size(8192)
     assert not mxfp4._is_valid_sm90_mxfp4_hidden_size(8704)
     assert mxfp4._is_valid_sm90_mxfp4_hidden_size(9216)
+    assert mxfp4._uses_coalesced_mxfp4_scales_sm90(4096)
+    assert not mxfp4._uses_coalesced_mxfp4_scales_sm90(4608)
 
 
 def test_processed_sign_layout_is_invertible_and_has_golden_word():

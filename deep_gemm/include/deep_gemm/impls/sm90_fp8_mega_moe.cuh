@@ -435,10 +435,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr uint32_t kNumL2SFAKGroups = BLOCK_K / kL2ActsSFGranK;
     constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE =
         kNumL2SFAKGroups * kL2SFAHalfStride * sizeof(float);
-    // MXFP4 relative scales are laid out as one UE8M0 byte per (N, K32)
-    // group. The B producer stages one scale word per output row alongside
-    // each packed-B tile, removing the global load from the math mainloop.
+    // MXFP4 relative scales contain one UE8M0 byte per logical (N, K32)
+    // group. Small-hidden preprocessing stores K128 words contiguously across
+    // N; larger compute-bound shapes retain natural row-major storage. The B
+    // producer stages one word per output row alongside each packed-B tile.
     constexpr uint32_t kMXFP4WeightGranK = 32;
+    constexpr uint32_t kMXFP4CoalescedScaleMaxHidden = 4096;
     constexpr uint32_t kNumMXFP4SFBKGroups = BLOCK_K / kMXFP4WeightGranK;
     constexpr uint32_t kL1MXFP4WeightSFStrideK = kHidden / kMXFP4WeightGranK;
     constexpr uint32_t kL2MXFP4WeightSFStrideK =
@@ -1252,6 +1254,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 (is_linear1_phase ? kSharedL1ShapeN : kSharedL2ShapeN) :
                 (is_linear1_phase ? L1_SHAPE_N : L2_SHAPE_N);
 
+            constexpr bool kCoalescedMXFP4WeightSF =
+                kHidden <= kMXFP4CoalescedScaleMaxHidden;
             const uint32_t weight_sf_stride_k = is_linear1_phase ?
                 kL1MXFP4WeightSFStrideK : kL2MXFP4WeightSFStrideK;
             const uint32_t weight_sf_per_expert = is_linear1_phase ?
@@ -1310,16 +1314,23 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     const auto* weight_sf_base = (is_linear1_phase ?
                         l1_mxfp4_weights_sf : l2_mxfp4_weights_sf) +
                         local_expert_idx * weight_sf_per_expert;
-                    const uint32_t weight_sf_k =
-                        k_block_idx * kNumMXFP4SFBKGroups;
                     #pragma unroll
                     for (uint32_t local_n = lane_idx; local_n < BLOCK_N;
                          local_n += 32) {
-                        const uint32_t scale_word = __ldg(
-                            reinterpret_cast<const uint32_t*>(
-                                weight_sf_base +
-                                (local_n_idx + local_n) * weight_sf_stride_k +
-                                weight_sf_k));
+                        uint32_t scale_word;
+                        if constexpr (kCoalescedMXFP4WeightSF) {
+                            const auto* weight_sf_words =
+                                reinterpret_cast<const uint32_t*>(weight_sf_base) +
+                                k_block_idx * shape_n;
+                            scale_word = __ldg(
+                                weight_sf_words + local_n_idx + local_n);
+                        } else {
+                            scale_word = __ldg(
+                                reinterpret_cast<const uint32_t*>(
+                                    weight_sf_base +
+                                    (local_n_idx + local_n) * weight_sf_stride_k +
+                                    k_block_idx * kNumMXFP4SFBKGroups));
+                        }
                         ptx::st_shared(
                             reinterpret_cast<uint32_t*>(smem_sfb[stage_idx]) +
                                 local_n,
