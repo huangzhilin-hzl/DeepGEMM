@@ -945,8 +945,13 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
             false, true);
 
-        // Sync with epilogue warps before pulling tokens
-        ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+        // Shared L1 does not depend on routed dispatch. Let dispatch pull
+        // routed tokens while the math warpgroup computes shared L1 instead
+        // of serializing both paths at the frontend barrier.
+        if constexpr (not kHasSharedExperts)
+            ptx::sync_unaligned(
+                kNumDispatchThreads + kNumEpilogueThreads,
+                kDispatchWithEpilogueBarrierIdx);
 
         // Token / SF pull loop
         uint32_t pull_mbarrier_phase = 0;
@@ -1408,8 +1413,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                          WG_BLOCK_N == L1WGMMA::N,
                          "The Humming warpgroup owns one complete WGMMA tile");
 
-        // Sync with dispatch
-        ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+        // With shared experts, dispatch and shared L1 are independent and can
+        // start concurrently. Their end-of-kernel rendezvous remains paired.
+        if constexpr (not kHasSharedExperts)
+            ptx::sync_unaligned(
+                kNumDispatchThreads + kNumEpilogueThreads,
+                kDispatchWithEpilogueBarrierIdx);
 
         for_each_selected_block([&](const auto& block_phase,
                                      const uint32_t& local_expert_idx,
