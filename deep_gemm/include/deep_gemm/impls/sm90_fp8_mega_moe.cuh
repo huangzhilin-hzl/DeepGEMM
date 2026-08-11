@@ -394,13 +394,20 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         LOAD_BLOCK_N * BLOCK_K * sizeof(b_dtype_t);
     // Flash reserves a second expanded tile so the math WG can decode the
     // next packed-B stage while the current phase's final WGMMA group is in
-    // flight. Other MXFP4 shapes retain one fixed expanded tile. Shared FP8
-    // tasks alias this storage through a separately synchronized pipeline.
+    // flight. Pro cannot reserve another 16 KiB without breaking the two-CTA
+    // occupancy contract, so it aliases the second mainloop-only tile with the
+    // C/D region, whose lifetime starts after the routed GEMM loop. Shared FP8
+    // tasks keep their original expanded/packed slots because their independent
+    // B producer may prefetch across the math warpgroup's epilogue.
     constexpr bool kDoubleBufferedMXFP4ExpandedBStorage =
         kHidden == 4096 and
         kOverlapMXFP4ScalePath;
+    constexpr bool kAliasMXFP4ExpandedBWithCD =
+        kHidden > 4096 and
+        kOverlapMXFP4ScalePath;
     constexpr bool kPipelineMXFP4ExpandedB =
-        kDoubleBufferedMXFP4ExpandedBStorage;
+        kDoubleBufferedMXFP4ExpandedBStorage or
+        kAliasMXFP4ExpandedBWithCD;
     constexpr uint32_t SMEM_B_STORAGE_SIZE =
         (kDoubleBufferedMXFP4ExpandedBStorage ? 2u : 1u) *
             SMEM_B_SIZE_PER_STAGE;
@@ -449,6 +456,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr uint32_t SMEM_CD_OUTPUT_SIZE = math::constexpr_align(
         SMEM_CD_OUTPUT_BASE_SIZE, kSharedMemoryAlignment);
     constexpr uint32_t SMEM_CD_SIZE = SMEM_CD_OUTPUT_SIZE;
+    DG_STATIC_ASSERT(not kAliasMXFP4ExpandedBWithCD or
+                         SMEM_CD_SIZE >= SMEM_B_SIZE_PER_STAGE,
+                     "C/D alias must hold one expanded MXFP4 B tile");
 
     constexpr uint32_t SMEM_BEFORE_BARRIER_SIZE =
         SMEM_EXPERT_COUNT_SIZE + SMEM_SEND_BUFFER_SIZE + SMEM_CD_SIZE +
@@ -528,9 +538,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     auto smem_b_expanded_base = math::advance_ptr<b_dtype_t>(
         smem_gemm_base, SMEM_B_OFFSET);
     auto smem_b_expanded = utils::PatternVisitor([=](const uint32_t& i) {
-        return smem_b_expanded_base +
-            (kDoubleBufferedMXFP4ExpandedBStorage ?
-                 i * SMEM_B_SIZE_PER_STAGE : 0u);
+        DG_DEVICE_ASSERT(i < (kPipelineMXFP4ExpandedB ? 2u : 1u));
+        if (i == 0)
+            return smem_b_expanded_base;
+        if constexpr (kDoubleBufferedMXFP4ExpandedBStorage)
+            return smem_b_expanded_base + SMEM_B_SIZE_PER_STAGE;
+        return reinterpret_cast<b_dtype_t*>(smem_cd_base);
     });
     auto smem_b = utils::PatternVisitor([=](const uint32_t&) {
         return smem_b_expanded_base;
@@ -547,8 +560,10 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr uint32_t kNumSharedBStages = 2;
     auto smem_shared_b = utils::PatternVisitor([=](const uint32_t& i) {
         DG_DEVICE_ASSERT(i < kNumSharedBStages);
-        if (i == 0 or kDoubleBufferedMXFP4ExpandedBStorage)
-            return smem_b_expanded_base + i * SMEM_B_SIZE_PER_STAGE;
+        if (i == 0)
+            return smem_b_expanded_base;
+        if constexpr (kDoubleBufferedMXFP4ExpandedBStorage)
+            return smem_b_expanded[1];
         return reinterpret_cast<b_dtype_t*>(smem_b_packed[0]);
     });
     auto sf_start_ptr = math::advance_ptr<uint8_t>(smem_gemm_base,
