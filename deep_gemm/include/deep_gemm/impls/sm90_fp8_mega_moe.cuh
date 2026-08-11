@@ -195,6 +195,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     bool kPerTensorActivationScale, \
     bool kDeferTopKWeightToCombine, \
     bool kDirectL2Scatter, \
+    bool kSwizzleL2CD, \
     bool kOverlapMXFP4ScalePath, \
     bool kUsePRMTMXFP4Exponent, \
     bool kUseIncrementalMXFP4Descriptor, \
@@ -276,6 +277,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     kActivationClamp, kFastMath, kPerTensorActivationScale, \
     kDeferTopKWeightToCombine, \
     kDirectL2Scatter, \
+    kSwizzleL2CD, \
     kOverlapMXFP4ScalePath, \
     kUsePRMTMXFP4Exponent, \
     kUseIncrementalMXFP4Descriptor, \
@@ -313,6 +315,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     DG_STATIC_ASSERT(not kDirectL2Scatter or
                          (kPerTensorActivationScale and not kHasSharedExperts),
                      "Direct L2 scatter requires routed-only per-tensor mode");
+    DG_STATIC_ASSERT(not kSwizzleL2CD or not kDirectL2Scatter,
+                     "L2 C/D swizzle is unused by direct L2 scatter");
 
     // =====================================================================
     // Template checks
@@ -554,7 +558,6 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     auto smem_cd_base = smem_gemm_base;
     // CD output is shared by L1 and L2; reinterpret-cast as needed.
     auto smem_cd_l1 = reinterpret_cast<cutlass::float_e4m3_t*>(smem_cd_base);
-    auto smem_cd_l2 = reinterpret_cast<nv_bfloat16*>(smem_cd_base);
 
     constexpr uint32_t SMEM_A_OFFSET = SMEM_CD_SIZE;
     constexpr uint32_t SMEM_B_OFFSET =
@@ -2529,10 +2532,18 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     scatter_direct_row(row_offset_r0, valid_r0, 0);
                     scatter_direct_row(row_offset_r1, valid_r1, 2);
                 } else {
+                    const auto get_l2_cd_byte_idx = [](const uint32_t byte_idx) {
+                        if constexpr (kSwizzleL2CD)
+                            return cute::Swizzle<3, 4, 3>::apply(byte_idx);
+                        return byte_idx;
+                    };
                     auto store_l2_pair = [&](const uint32_t& elem_idx,
                                              float value0, float value1) {
-                        *reinterpret_cast<uint32_t*>(smem_cd_l2 + elem_idx) =
-                            math::cast_into_bf16_and_pack(value0, value1);
+                        const uint32_t storage_byte_idx = get_l2_cd_byte_idx(
+                            elem_idx * sizeof(nv_bfloat16));
+                        *reinterpret_cast<uint32_t*>(
+                            smem_cd_base + storage_byte_idx) =
+                                math::cast_into_bf16_and_pack(value0, value1);
                     };
                     #pragma unroll
                         for (uint32_t i = 0; i < kAccumPerThread / 8; ++ i) {
@@ -2573,7 +2584,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     const uint32_t cols_per_lane = WG_BLOCK_N / 16;
                     #pragma unroll
                     for (uint32_t j = 0; j < kNumRowsPerWarp; ++ j) {
-                        const uint32_t row_in_wg = warp_idx_in_wg * 16 + j * 2 + row_in_warp_block;
+                        const uint32_t row_in_wg =
+                            warp_idx_in_wg * 16 + j * 2 + row_in_warp_block;
                         const uint32_t m_idx_in_block = row_in_wg;
                         if (m_idx_in_block >= valid_m) break;
 
@@ -2602,14 +2614,20 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             kScatterBytesPerLane == 16 or
                             kScatterBytesPerLane == 32,
                             "Unexpected L2 scatter width");
-                        auto smem_ptr = math::advance_ptr<uint8_t>(
-                            smem_cd_base,
+                        // B128 swizzle preserves each aligned 16-byte segment,
+                        // so the vectorized scatter load stays contiguous while
+                        // epilogue stores spread row groups across SMEM banks.
+                        const uint32_t storage_smem_byte_idx = get_l2_cd_byte_idx(
                             smem_elem_idx * kCombineElementBytes);
-                        const auto dst_token = combine_token_buffer.get_rank_buffer(dst_topk_idx)
-                                               .get_data_buffer(dst_token_idx);
+                        auto smem_ptr = math::advance_ptr<uint8_t>(
+                            smem_cd_base, storage_smem_byte_idx);
+                        const auto dst_token =
+                            combine_token_buffer.get_rank_buffer(dst_topk_idx)
+                                .get_data_buffer(dst_token_idx);
                         auto dst_ptr = math::advance_ptr<uint8_t>(
                             dst_token.get_base_ptr(),
-                            n_idx * kCombineElementBytes + lane_in_row * kScatterBytesPerLane);
+                            n_idx * kCombineElementBytes +
+                                lane_in_row * kScatterBytesPerLane);
                         auto mapped_dst_ptr = sym_buffer.map(dst_ptr, dst_rank_idx);
 
                         if constexpr (kScatterBytesPerLane == 32) {

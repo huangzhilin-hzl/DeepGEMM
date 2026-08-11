@@ -49,9 +49,9 @@ public:
         bool per_tensor_activation_scale;
         MegaMoESM90Config config;
 
-        // Runtime arguments. For hidden sizes below the Flash shape,
-        // num_tokens also selects the compile-time MXFP4 scale-overlap bucket
-        // during generated-source construction.
+        // Runtime arguments. num_tokens also selects compile-time MXFP4
+        // scale-overlap and L2 C/D swizzle buckets during generated-source
+        // construction.
         void* y;
         int* cumulative_local_expert_recv_stats;
         int num_tokens;
@@ -104,6 +104,10 @@ public:
             args.per_tensor_activation_scale and
             args.num_shared_experts == 0 and
             args.num_tokens > kSM90MoeMaxLatencyOverlapTokens;
+        constexpr int kL2CDSwizzleMinTokens = 1024;
+        const bool swizzle_l2_cd =
+            not direct_l2_scatter and
+            args.num_tokens >= kL2CDSwizzleMinTokens;
         return fmt::format(R"(
 #include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
 
@@ -115,6 +119,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {},
+        {},
         {},
         {},
         {},
@@ -136,6 +141,7 @@ static void __instantiate_kernel() {{
     args.per_tensor_activation_scale ? "true" : "false",
     defer_topk_weight_to_combine ? "true" : "false",
     direct_l2_scatter ? "true" : "false",
+    swizzle_l2_cd ? "true" : "false",
     overlap_mxfp4_scale_path ? "true" : "false",
     use_prmt_mxfp4_exponent ? "true" : "false",
     use_incremental_mxfp4_descriptor ? "true" : "false",
