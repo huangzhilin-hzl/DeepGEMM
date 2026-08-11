@@ -49,8 +49,9 @@ public:
         bool per_tensor_activation_scale;
         MegaMoESM90Config config;
 
-        // Runtime arguments. num_tokens also selects the canonical compile-time
-        // MXFP4 scale-overlap bucket during generated-source construction.
+        // Runtime arguments. For hidden sizes below the Flash shape,
+        // num_tokens also selects the compile-time MXFP4 scale-overlap bucket
+        // during generated-source construction.
         void* y;
         int* cumulative_local_expert_recv_stats;
         int num_tokens;
@@ -88,7 +89,7 @@ public:
 
     static std::string generate_impl(const Args& args) {
         const bool overlap_mxfp4_scale_path =
-            args.hidden > 4096 or
+            args.hidden >= 4096 or
             args.num_tokens <= kSM90MoeMaxLatencyOverlapTokens;
         return fmt::format(R"(
 #include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>

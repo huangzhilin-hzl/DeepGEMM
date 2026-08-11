@@ -99,10 +99,12 @@ static int get_mxfp4_pipeline_smem_size_for_mega_moe_sm90(
 }
 
 // Compact Hopper MXFP4 schedule. One math warpgroup owns fixed expanded-B
-// scratch, with a second ping-pong tile for the Flash latency-overlap path,
-// while A, packed-B, SFA, and SFB use a three-stage producer pipeline. Two
-// logical worker CTAs are launched per physical H20 SM; the exact-kernel
-// occupancy check at launch is the hard safety gate for grid barriers.
+// scratch. Flash reserves a second ping-pong tile for both latency and
+// throughput workloads so the next packed-B stage can be decoded while the
+// current WGMMA group is in flight. A, packed-B, SFA, and SFB use a three-stage
+// producer pipeline. Two logical worker CTAs are launched per physical H20 SM;
+// the exact-kernel occupancy check at launch is the hard safety gate for grid
+// barriers.
 static MegaMoESM90Config select_mxfp4_mega_moe_sm90(
     const Sm90MoeHeuristicInput& input) {
     constexpr int block_m = MegaMoESM90Config::block_m;
@@ -116,8 +118,7 @@ static MegaMoESM90Config select_mxfp4_mega_moe_sm90(
 
     const int num_worker_ctas = 2 * input.launch_num_sms;
     const bool double_buffer_mxfp4_expanded_b =
-        input.hidden == 4096 and
-        input.num_tokens <= kSM90MoeMaxLatencyOverlapTokens;
+        input.hidden == 4096;
     const int smem_size = get_mxfp4_pipeline_smem_size_for_mega_moe_sm90(
         SM90ArchSpec::smem_capacity,
         input.num_experts,
