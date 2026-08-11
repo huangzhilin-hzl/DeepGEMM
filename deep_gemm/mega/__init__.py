@@ -353,8 +353,9 @@ def fp8_mxfp4_mega_moe(y: torch.Tensor,
     ``fp8_scale_mode='per_tensor'`` uses two static dequantization scales for
     the FC1 input and FC2 input respectively. They must be positive, finite,
     and identical on every EP rank. The initial routed activation payload must
-    already be quantized with ``activation_dequant_scales[0]``. Shared experts
-    are not supported by this specialization yet.
+    already be quantized with ``activation_dequant_scales[0]``. When shared
+    experts are enabled, the same two static scales apply to their FC1 and FC2
+    activations as well.
     """
     if not isinstance(sym_buffer, SM90SymmBuffer):
         raise TypeError(
@@ -379,9 +380,6 @@ def fp8_mxfp4_mega_moe(y: torch.Tensor,
             for scale in activation_dequant_scales):
         raise ValueError(
             'activation_dequant_scales must contain two positive finite values')
-    if fp8_scale_mode == 'per_tensor' and num_shared_experts > 0:
-        raise ValueError(
-            'SM90 per-tensor activation scales do not support shared experts yet')
     _validate_processed_mxfp4_kernel_weights(l1_weights, l2_weights)
     num_ranks = sym_buffer.group.size()
     if sym_buffer.num_experts % num_ranks != 0:

@@ -1958,7 +1958,15 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 float scale_a_0_hi, scale_a_1_hi;  // Only used in L2 (per-64 K)
                 const uint32_t stage_row_offset_r0 =
                     warp_idx_in_wg * 16 + lane_idx / 4;
-                if (is_linear1_phase) {
+                if constexpr (kPerTensorActivationScale) {
+                    const float activation_scale = is_linear1_phase ?
+                        l1_activation_dequant_scale :
+                        l2_activation_dequant_scale;
+                    scale_a_0_lo = activation_scale;
+                    scale_a_1_lo = activation_scale;
+                    scale_a_0_hi = activation_scale;
+                    scale_a_1_hi = activation_scale;
+                } else if (is_linear1_phase) {
                     scale_a_0_lo = ptx::ld_shared(
                         smem_sfa[stage_idx] + stage_row_offset_r0);
                     scale_a_1_lo = ptx::ld_shared(
@@ -2041,6 +2049,44 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             final_accum[i*4+3] += scale_a_1_lo * sb * accum[i*4+3];
                         }
                 } else {
+                    if constexpr (kPerTensorActivationScale) {
+                        // A static activation scale is identical for both K64
+                        // halves. Issue the full K128 tile as one WGMMA group
+                        // and promote it once with the per-K128 weight scale.
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                            ptx::warpgroup_fence_operand(accum[i]);
+                        ptx::warpgroup_arrive();
+                        #pragma unroll
+                        for (uint32_t k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
+                            auto desc_a = mma::sm90::make_smem_desc(
+                                smem_a[stage_idx] + k * WGMMA::K, 1);
+                            auto desc_b = mma::sm90::make_smem_desc(
+                                task_smem_b + k * WGMMA::K, 1);
+                            WGMMA::wgmma(desc_a, desc_b, accum, k);
+                        }
+                        ptx::warpgroup_commit_batch();
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                            ptx::warpgroup_fence_operand(accum[i]);
+                        ptx::warpgroup_wait<0>();
+
+                        arrive_task_empty_barrier(stage_idx);
+
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread / 4; ++ i) {
+                            const float l2_sf =
+                                (i < 16u) ? l2_sf_lo : l2_sf_hi;
+                            final_accum[i*4+0] +=
+                                scale_a_0_lo * l2_sf * accum[i*4+0];
+                            final_accum[i*4+1] +=
+                                scale_a_0_lo * l2_sf * accum[i*4+1];
+                            final_accum[i*4+2] +=
+                                scale_a_1_lo * l2_sf * accum[i*4+2];
+                            final_accum[i*4+3] +=
+                                scale_a_1_lo * l2_sf * accum[i*4+3];
+                        }
+                    } else {
                     // L2: split BLOCK_K=128 into two halves (per-64 SFA), each 2 WGMMAs.
                     // First half: K=0..63, SFA = scale_a_*_lo
                     #pragma unroll
@@ -2097,6 +2143,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         final_accum[i*4+1] += scale_a_0_hi * l2_sf * accum[i*4+1];
                         final_accum[i*4+2] += scale_a_1_hi * l2_sf * accum[i*4+2];
                         final_accum[i*4+3] += scale_a_1_hi * l2_sf * accum[i*4+3];
+                    }
                     }
                 }
                 }

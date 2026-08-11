@@ -584,8 +584,6 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--num-experts-override must be positive")
     if args.num_shared_experts < 0:
         parser.error("--num-shared-experts must be non-negative")
-    if args.fp8_scale_mode == "per_tensor" and args.num_shared_experts:
-        parser.error("per_tensor mode does not support shared experts yet")
     if not math.isfinite(args.fc1_activation_dequant_scale) or \
             args.fc1_activation_dequant_scale <= 0:
         parser.error("--fc1-activation-dequant-scale must be positive and finite")

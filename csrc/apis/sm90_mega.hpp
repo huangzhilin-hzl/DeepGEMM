@@ -344,9 +344,6 @@ static void sm90_mega_moe(
                        shared_l2_weights_sf.size(1) == shared_intermediate_hidden / 128);
         DG_HOST_ASSERT(num_topk + 1 <= 32);
     }
-    DG_HOST_ASSERT(not per_tensor_activation_scale or
-                   num_shared_experts == 0);
-
     // Check stats counter
     if (cumulative_local_expert_recv_stats.has_value()) {
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_cuda());

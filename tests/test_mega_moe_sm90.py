@@ -291,16 +291,22 @@ def _reference_mega_moe(
             shared_l1_output, activation_clamp)
 
         shared_width = shared_l1_output.size(1)
-        shared_l1_view = shared_l1_output.view(
-            num_global_tokens, shared_width // 64, 64)
-        shared_l1_scale = (
-            shared_l1_view.abs().amax(dim=-1).clamp(1e-4) / 448.0)
-        shared_l1_quantized = (
-            shared_l1_view / shared_l1_scale.unsqueeze(-1)
-        ).to(torch.float8_e4m3fn).float()
-        shared_l2_input = (
-            shared_l1_quantized * shared_l1_scale.unsqueeze(-1)
-        ).view(num_global_tokens, shared_width)
+        if fp8_scale_mode == 'per_tensor':
+            shared_l2_scale = activation_dequant_scales[1]
+            shared_l2_input = (
+                shared_l1_output / shared_l2_scale
+            ).to(torch.float8_e4m3fn).float() * shared_l2_scale
+        else:
+            shared_l1_view = shared_l1_output.view(
+                num_global_tokens, shared_width // 64, 64)
+            shared_l1_scale = (
+                shared_l1_view.abs().amax(dim=-1).clamp(1e-4) / 448.0)
+            shared_l1_quantized = (
+                shared_l1_view / shared_l1_scale.unsqueeze(-1)
+            ).to(torch.float8_e4m3fn).float()
+            shared_l2_input = (
+                shared_l1_quantized * shared_l1_scale.unsqueeze(-1)
+            ).view(num_global_tokens, shared_width)
 
         shared_l2 = _dequant_block_fp8(
             shared_l2_weight, shared_l2_sf)
@@ -355,7 +361,6 @@ def _run_scenario(
     assert len(activation_dequant_scales) == 2
     assert all(math.isfinite(scale) and scale > 0.0
                for scale in activation_dequant_scales)
-    assert fp8_scale_mode != 'per_tensor' or num_shared_experts == 0
     assert num_topk + int(num_shared_experts > 0) <= 32
     assert repeat_count > 0
     num_local_experts = num_experts // num_ranks
@@ -667,7 +672,17 @@ def _smoke_scenarios(num_ranks: int) -> List[Scenario]:
         ))
         for num_shared_experts in (1, 2)
     ]
-    return routed + shared
+    shared_per_tensor = [
+        (f'smoke.shared_s{num_shared_experts}_per_tensor', dict(
+            base,
+            num_shared_experts=num_shared_experts,
+            repeat_count=2,
+            fp8_scale_mode='per_tensor',
+            activation_dequant_scales=(0.5, 8.0),
+        ))
+        for num_shared_experts in (1, 2)
+    ]
+    return routed + shared + shared_per_tensor
 
 
 def _standard_scenarios(num_ranks: int) -> List[Scenario]:
@@ -777,6 +792,20 @@ def _full_scenarios(
             activation_dequant_scales=(0.5, 8.0),
             require_ring_wrap=True,
         )),
+        ('production.flash_m128_shared_per_tensor', dict(
+            num_max_tokens_per_rank=128,
+            num_tokens=128,
+            hidden=4096,
+            intermediate_hidden=2048,
+            num_experts=32 * num_ranks,
+            num_topk=6,
+            num_shared_experts=1,
+            fast_math=True,
+            activation_clamp=10.0,
+            fp8_scale_mode='per_tensor',
+            activation_dequant_scales=(0.5, 8.0),
+            require_ring_wrap=True,
+        )),
         ('production.pro_m128_per_tensor', dict(
             num_max_tokens_per_rank=128,
             num_tokens=128,
@@ -784,6 +813,19 @@ def _full_scenarios(
             intermediate_hidden=3072,
             num_experts=48 * num_ranks,
             num_topk=6,
+            fast_math=True,
+            activation_clamp=10.0,
+            fp8_scale_mode='per_tensor',
+            activation_dequant_scales=(0.5, 8.0),
+        )),
+        ('production.pro_m128_shared_per_tensor', dict(
+            num_max_tokens_per_rank=128,
+            num_tokens=128,
+            hidden=7168,
+            intermediate_hidden=3072,
+            num_experts=48 * num_ranks,
+            num_topk=6,
+            num_shared_experts=1,
             fast_math=True,
             activation_clamp=10.0,
             fp8_scale_mode='per_tensor',
