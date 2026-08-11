@@ -777,6 +777,18 @@ def _full_scenarios(
             activation_dequant_scales=(0.5, 8.0),
             require_ring_wrap=True,
         )),
+        ('production.pro_m128_per_tensor', dict(
+            num_max_tokens_per_rank=128,
+            num_tokens=128,
+            hidden=7168,
+            intermediate_hidden=3072,
+            num_experts=48 * num_ranks,
+            num_topk=6,
+            fast_math=True,
+            activation_clamp=10.0,
+            fp8_scale_mode='per_tensor',
+            activation_dequant_scales=(0.5, 8.0),
+        )),
         ('production.pro_m256', dict(
             num_max_tokens_per_rank=256,
             num_tokens=256,

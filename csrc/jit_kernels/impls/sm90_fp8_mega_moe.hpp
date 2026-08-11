@@ -97,6 +97,9 @@ public:
         const bool use_incremental_mxfp4_descriptor =
             args.hidden == 4096 and
             args.num_tokens > kSM90MoeMaxLatencyOverlapTokens;
+        const bool defer_topk_weight_to_combine =
+            args.per_tensor_activation_scale and
+            args.hidden > 4096 and args.num_tokens == 128;
         return fmt::format(R"(
 #include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
 
@@ -114,6 +117,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}, {}, {}
     >);
 }};
@@ -125,6 +129,7 @@ static void __instantiate_kernel() {{
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false",
     args.per_tensor_activation_scale ? "true" : "false",
+    defer_topk_weight_to_combine ? "true" : "false",
     overlap_mxfp4_scale_path ? "true" : "false",
     use_prmt_mxfp4_exponent ? "true" : "false",
     use_incremental_mxfp4_descriptor ? "true" : "false",

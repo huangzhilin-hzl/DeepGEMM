@@ -193,6 +193,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     float kActivationClamp, \
     bool kFastMath, \
     bool kPerTensorActivationScale, \
+    bool kDeferTopKWeightToCombine, \
     bool kOverlapMXFP4ScalePath, \
     bool kUsePRMTMXFP4Exponent, \
     bool kUseIncrementalMXFP4Descriptor, \
@@ -272,6 +273,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     kNumMaxTokensPerRank, kHidden, kIntermediateHidden, kNumExperts, kNumTopk, \
     kNumSMs, kNumRanks, \
     kActivationClamp, kFastMath, kPerTensorActivationScale, \
+    kDeferTopKWeightToCombine, \
     kOverlapMXFP4ScalePath, \
     kUsePRMTMXFP4Exponent, \
     kUseIncrementalMXFP4Descriptor, \
@@ -303,6 +305,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr uint32_t kNumExpertsPerRank = kNumExperts / kNumRanks;
     constexpr uint32_t kNumRingBlocks = kNumRingTokens / BLOCK_M;
     constexpr bool kHasSharedExperts = kNumSharedExperts > 0;
+    DG_STATIC_ASSERT(not kDeferTopKWeightToCombine or
+                         kPerTensorActivationScale,
+                     "Deferred top-k weighting requires per-tensor mode");
 
     // =====================================================================
     // Template checks
@@ -2212,7 +2217,13 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
 
 
                 float weight_r0 = 0.0f, weight_r1 = 0.0f;
-                if constexpr (kNumMaxTokensPerRank <= 1024) {
+                if constexpr (kDeferTopKWeightToCombine) {
+                    // L2 is linear. Keep the per-tensor intermediate
+                    // unweighted and fold top-k weighting into combine's
+                    // existing BF16 reduction FMA.
+                    weight_r0 = 1.0f;
+                    weight_r1 = 1.0f;
+                } else if constexpr (kNumMaxTokensPerRank <= 1024) {
                     const int topk_weight_src_lane = static_cast<int>(lane_idx - col_idx);
                     if (col_idx == 0) {
                         weight_r0 = is_shared_phase ? 1.0f :
@@ -2534,6 +2545,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
 
         uint32_t combine_phase = 0;
         uint32_t load_stage_idx = 0;
+        float combine_weight_stage0 = 1.0f;
+        float combine_weight_stage1 = 1.0f;
         for (uint32_t token_idx = sm_idx * kNumEpilogueWarps + epilogue_warp_idx;
              token_idx < num_tokens;
              token_idx += kNumSMs * kNumEpilogueWarps) {
@@ -2554,7 +2567,16 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     if (mask) {
                         const uint32_t slot_idx = __ffs(mask) - 1;
                         mask ^= 1 << slot_idx;
+                        float weight = 1.0f;
                         if (cute::elect_one_sync()) {
+                            if constexpr (kDeferTopKWeightToCombine) {
+                                if (slot_idx < kNumTopk) {
+                                    weight = __ldg(
+                                        input_topk_weights_buffer
+                                            .get_base_ptr<float>() +
+                                        token_idx * kNumTopk + slot_idx);
+                                }
+                            }
                             const auto src_ptr = math::advance_ptr<uint8_t>(
                                 combine_token_buffer.get_rank_buffer(slot_idx)
                                                     .get_data_buffer(token_idx).get_base_ptr(),
@@ -2564,6 +2586,14 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 combine_load_barriers[i], kInputChunkBytes);
                             ptx::mbarrier_arrive_and_set_tx(
                                 combine_load_barriers[i], kInputChunkBytes);
+                        }
+                        if constexpr (kDeferTopKWeightToCombine) {
+                            const float broadcast_weight = __shfl_sync(
+                                0xffffffffu, weight, 0);
+                            if (i == 0)
+                                combine_weight_stage0 = broadcast_weight;
+                            else
+                                combine_weight_stage1 = broadcast_weight;
                         }
                         __syncwarp();
                         return true;
@@ -2582,6 +2612,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 while (do_reduce) {
                     do_reduce = move_mask_and_load(load_stage_idx ^ 1);
                     combine_load_barriers[load_stage_idx]->wait(combine_phase);
+                    const float combine_weight = load_stage_idx == 0 ?
+                        combine_weight_stage0 : combine_weight_stage1;
                     #pragma unroll
                     for (uint32_t j = 0; j < kNumVectorsPerLane; ++ j) {
                         const uint32_t vector_idx = j * 32 + lane_idx;
@@ -2595,11 +2627,31 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             const uint32_t accum_idx =
                                 j * kNumBF16PairsPerVector + l;
                             if constexpr (kFastMath) {
-                                reduced[accum_idx] = __hadd2(
-                                    reduced[accum_idx], bf16_values[l]);
+                                if constexpr (kDeferTopKWeightToCombine) {
+                                    const nv_bfloat162 weight_bf16 =
+                                        __float2bfloat162_rn(
+                                            combine_weight);
+                                    reduced[accum_idx] = __hfma2(
+                                        weight_bf16, bf16_values[l],
+                                        reduced[accum_idx]);
+                                } else {
+                                    reduced[accum_idx] = __hadd2(
+                                        reduced[accum_idx], bf16_values[l]);
+                                }
                             } else {
-                                ptx::accumulate(
-                                    reduced[accum_idx], bf16_values[l]);
+                                if constexpr (kDeferTopKWeightToCombine) {
+                                    const float2 values =
+                                        __bfloat1622float2(bf16_values[l]);
+                                    reduced[accum_idx].x = fmaf(
+                                        combine_weight,
+                                        values.x, reduced[accum_idx].x);
+                                    reduced[accum_idx].y = fmaf(
+                                        combine_weight,
+                                        values.y, reduced[accum_idx].y);
+                                } else {
+                                    ptx::accumulate(
+                                        reduced[accum_idx], bf16_values[l]);
+                                }
                             }
                         }
                     }
