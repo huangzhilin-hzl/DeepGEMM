@@ -313,10 +313,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                          kPerTensorActivationScale,
                      "Deferred top-k weighting requires per-tensor mode");
     DG_STATIC_ASSERT(not kDirectL2Scatter or
-                         (kPerTensorActivationScale and not kHasSharedExperts),
-                     "Direct L2 scatter requires routed-only per-tensor mode");
-    DG_STATIC_ASSERT(not kSwizzleL2CD or not kDirectL2Scatter,
-                     "L2 C/D swizzle is unused by direct L2 scatter");
+                         (kPerTensorActivationScale and
+                          (not kHasSharedExperts or kHidden == 4096)),
+                     "Shared direct L2 scatter is specialized for Flash");
+    DG_STATIC_ASSERT(not kSwizzleL2CD or not kDirectL2Scatter or
+                         kHasSharedExperts,
+                     "L2 C/D swizzle is unused by routed-only direct scatter");
 
     // =====================================================================
     // Template checks
@@ -2455,7 +2457,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 // ---------------- L2 EPILOGUE: BF16 cast + NVLink scatter ----------------
                 constexpr uint32_t kNumRowsPerWarp = WG_BLOCK_M / 8;
 
-                if constexpr (kDirectL2Scatter) {
+                if constexpr (kDirectL2Scatter and not is_shared_phase) {
                     // Per-tensor L2 has no dynamic scale output. Pack each
                     // register pair directly into its remote combine slot,
                     // avoiding the shared-memory round trip used by the

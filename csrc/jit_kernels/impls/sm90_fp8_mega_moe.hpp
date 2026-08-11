@@ -100,16 +100,17 @@ public:
         const bool defer_topk_weight_to_combine =
             args.per_tensor_activation_scale and
             args.hidden > 4096 and args.num_tokens == 128;
-        // Wider L2 shapes amortize direct BF16 scatter by M=256; Flash keeps
-        // the coalesced SMEM path until the throughput regime.
+        // Wider routed-only L2 shapes amortize direct BF16 scatter by M=256;
+        // Flash keeps it for routed tasks in a shared-expert launch once the
+        // throughput regime is reached. Shared L2 itself retains SMEM scatter.
         const bool direct_l2_scatter =
             args.per_tensor_activation_scale and
-            args.num_shared_experts == 0 and
+            (args.num_shared_experts == 0 or args.hidden == 4096) and
             (args.num_tokens > kSM90MoeMaxLatencyOverlapTokens or
              (args.hidden > 4096 and args.num_tokens >= 256));
         constexpr int kL2CDSwizzleMinTokens = 1024;
         const bool swizzle_l2_cd =
-            not direct_l2_scatter and
+            (not direct_l2_scatter or args.num_shared_experts > 0) and
             args.num_tokens >= kL2CDSwizzleMinTokens;
         return fmt::format(R"(
 #include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
