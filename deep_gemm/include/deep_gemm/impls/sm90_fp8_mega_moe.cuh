@@ -1442,15 +1442,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                     packed_row_base;
 
                                 // Reuse the validated two-word LDS lookahead
-                                // for Flash L2. Decoder temporaries die before
-                                // the first QGMMA, unlike rejected next-stage
-                                // overlap, so they do not cross accumulator
-                                // lifetime.
+                                // in every overlap-enabled routed phase.
+                                // Decoder temporaries die before the first
+                                // QGMMA, so they do not cross accumulator
+                                // lifetime like rejected next-stage overlap.
                                 constexpr bool kPipelinePackedLDS =
-                                    kOverlapMXFP4ScalePath and
-                                    (is_linear1_phase or
-                                     (kHidden == 4096 and
-                                      kIntermediateHidden == 2048));
+                                    kOverlapMXFP4ScalePath;
                                 if constexpr (kPipelinePackedLDS) {
                                     const uint32_t first_packed_byte_offset =
                                         packed_row_base +
