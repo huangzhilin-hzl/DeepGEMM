@@ -168,6 +168,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     uint32_t kNumSMs, uint32_t kNumRanks, \
     float kActivationClamp, \
     bool kFastMath, \
+    bool kPerTensorActivationScale, \
     bool kOverlapMXFP4ScalePath, \
     uint32_t kNumRingTokens, \
     uint32_t kNumSFRingTokens, \
@@ -177,6 +178,8 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     void* y, \
     int* cumulative_local_expert_recv_stats, \
     const uint32_t num_tokens, \
+    const float l1_activation_dequant_scale, \
+    const float l2_activation_dequant_scale, \
     const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer, \
     const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts, \
     const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf, \
@@ -203,6 +206,8 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     void* y, \
     int* cumulative_local_expert_recv_stats, \
     const uint32_t num_tokens, \
+    const float l1_activation_dequant_scale, \
+    const float l2_activation_dequant_scale, \
     const layout::SymBuffer<kNumRanks>& sym_buffer, \
     const cute::TmaDescriptor& tensor_map_l1_acts, \
     const cute::TmaDescriptor& tensor_map_l1_acts_sf, \
@@ -226,7 +231,8 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     const float* __restrict__ shared_l2_weights_sf
 
 #define DG_SM90_FP8_MOE_KERNEL_ARGS \
-    y, cumulative_local_expert_recv_stats, num_tokens, sym_buffer, \
+    y, cumulative_local_expert_recv_stats, num_tokens, \
+    l1_activation_dequant_scale, l2_activation_dequant_scale, sym_buffer, \
     tensor_map_l1_acts, tensor_map_l1_acts_sf, tensor_map_l1_weights, \
     l1_mxfp4_secondary, l1_mxfp4_weights_sf, tensor_map_l1_output, tensor_map_l2_acts, \
     tensor_map_l2_acts_sf, tensor_map_l2_weights, l2_mxfp4_secondary, \
@@ -239,7 +245,8 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
 #define DG_SM90_FP8_MOE_CORE_TEMPLATE_ARGS \
     kNumMaxTokensPerRank, kHidden, kIntermediateHidden, kNumExperts, kNumTopk, \
     kNumSMs, kNumRanks, \
-    kActivationClamp, kFastMath, kOverlapMXFP4ScalePath, \
+    kActivationClamp, kFastMath, kPerTensorActivationScale, \
+    kOverlapMXFP4ScalePath, \
     kNumRingTokens, kNumSFRingTokens, kNumSharedExperts
 
 template <DG_SM90_FP8_MOE_TEMPLATE_PARAMS>
@@ -292,19 +299,23 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     // The persistent kernel executes both logical phases.
     if (warp_idx == 0 and cute::elect_one_sync()) {
         cute::prefetch_tma_descriptor(&tensor_map_l1_acts);
-        cute::prefetch_tma_descriptor(&tensor_map_l1_acts_sf);
+        if constexpr (not kPerTensorActivationScale)
+            cute::prefetch_tma_descriptor(&tensor_map_l1_acts_sf);
         cute::prefetch_tma_descriptor(&tensor_map_l1_weights);
         cute::prefetch_tma_descriptor(&tensor_map_l1_output);
         cute::prefetch_tma_descriptor(&tensor_map_l2_acts);
-        cute::prefetch_tma_descriptor(&tensor_map_l2_acts_sf);
+        if constexpr (not kPerTensorActivationScale)
+            cute::prefetch_tma_descriptor(&tensor_map_l2_acts_sf);
         cute::prefetch_tma_descriptor(&tensor_map_l2_weights);
         if constexpr (kHasSharedExperts) {
             cute::prefetch_tma_descriptor(&tensor_map_shared_l1_acts);
-            cute::prefetch_tma_descriptor(&tensor_map_shared_l1_acts_sf);
+            if constexpr (not kPerTensorActivationScale)
+                cute::prefetch_tma_descriptor(&tensor_map_shared_l1_acts_sf);
             cute::prefetch_tma_descriptor(&tensor_map_shared_l1_weights);
             cute::prefetch_tma_descriptor(&tensor_map_shared_l1_output);
             cute::prefetch_tma_descriptor(&tensor_map_shared_l2_acts);
-            cute::prefetch_tma_descriptor(&tensor_map_shared_l2_acts_sf);
+            if constexpr (not kPerTensorActivationScale)
+                cute::prefetch_tma_descriptor(&tensor_map_shared_l2_acts_sf);
             cute::prefetch_tma_descriptor(&tensor_map_shared_l2_weights);
         }
     }
@@ -1016,19 +1027,21 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             }
             __syncwarp();
 
-            // Copy SF: per-128 K floats, written linearly (no UTCCP transpose).
-            constexpr uint32_t kNumSFFloats = kHidden / 128;
-            DG_STATIC_ASSERT(kNumSFFloats > 0 and kHidden % 128 == 0, "Invalid SF");
-            const auto remote_sf_ptr = sym_buffer.map(
-                input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>(),
-                current_rank_in_expert_idx);
-            const auto local_sf_ptr  = l1_sf_buffer.get_base_ptr<float>();
-            #pragma unroll
-            for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFFloats, 32u); ++ i) {
-                const uint32_t j = i * 32 + lane_idx;
-                if (j < kNumSFFloats)
-                    local_sf_ptr[j * kNumSFRingTokens + physical_token_idx] =
-                        remote_sf_ptr[j];
+            if constexpr (not kPerTensorActivationScale) {
+                // Copy SF: per-128 K floats, written linearly (no UTCCP transpose).
+                constexpr uint32_t kNumSFFloats = kHidden / 128;
+                DG_STATIC_ASSERT(kNumSFFloats > 0 and kHidden % 128 == 0, "Invalid SF");
+                const auto remote_sf_ptr = sym_buffer.map(
+                    input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<float>(),
+                    current_rank_in_expert_idx);
+                const auto local_sf_ptr  = l1_sf_buffer.get_base_ptr<float>();
+                #pragma unroll
+                for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFFloats, 32u); ++ i) {
+                    const uint32_t j = i * 32 + lane_idx;
+                    if (j < kNumSFFloats)
+                        local_sf_ptr[j * kNumSFRingTokens + physical_token_idx] =
+                            remote_sf_ptr[j];
+                }
             }
             __syncwarp();
 
@@ -1159,39 +1172,46 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             k_idx + k_tile * kTMATileK, m_idx, 1);
                     }
 
-                    // TMA load SFA with A on the same producer warp.
-                    if (is_linear1_phase) {
-                        // L1 SFA per-128: one vector per BK128 plane.
-                        #pragma unroll
-                        for (uint32_t sf_group = 0;
-                             sf_group < BLOCK_K / kGranK; ++ sf_group) {
-                            tma::copy<BLOCK_M, 1, 0, float>(
-                                tensor_map_sfa_ptr, full_barriers[stage_idx],
-                                smem_sfa[stage_idx] +
-                                    sf_group * kL2SFAHalfStride,
-                                m_idx,
-                                k_block_idx * (BLOCK_K / kGranK) + sf_group,
-                                1);
-                        }
+                    // Static per-tensor activation scales bypass the routed
+                    // SF wire and remove SFA from the A-stage transaction.
+                    if constexpr (kPerTensorActivationScale) {
                         full_barriers[stage_idx]->arrive_and_expect_tx(
-                            SMEM_A_SIZE_PER_STAGE +
-                                (BLOCK_K / kGranK) * BLOCK_M * sizeof(float));
+                            SMEM_A_SIZE_PER_STAGE);
                     } else {
-                        // L2 SFA per-64: one TMA per scale group.
-                        #pragma unroll
-                        for (uint32_t sf_group = 0;
-                             sf_group < kNumL2SFAKGroups; ++ sf_group) {
-                            tma::copy<BLOCK_M, 1, 0, float>(
-                                tensor_map_sfa_ptr, full_barriers[stage_idx],
-                                smem_sfa[stage_idx] +
-                                    sf_group * kL2SFAHalfStride,
-                                m_idx,
-                                k_block_idx * kNumL2SFAKGroups + sf_group,
-                                1);
+                        // TMA load SFA with A on the same producer warp.
+                        if (is_linear1_phase) {
+                            // L1 SFA per-128: one vector per BK128 plane.
+                            #pragma unroll
+                            for (uint32_t sf_group = 0;
+                                 sf_group < BLOCK_K / kGranK; ++ sf_group) {
+                                tma::copy<BLOCK_M, 1, 0, float>(
+                                    tensor_map_sfa_ptr, full_barriers[stage_idx],
+                                    smem_sfa[stage_idx] +
+                                        sf_group * kL2SFAHalfStride,
+                                    m_idx,
+                                    k_block_idx * (BLOCK_K / kGranK) + sf_group,
+                                    1);
+                            }
+                            full_barriers[stage_idx]->arrive_and_expect_tx(
+                                SMEM_A_SIZE_PER_STAGE +
+                                    (BLOCK_K / kGranK) * BLOCK_M * sizeof(float));
+                        } else {
+                            // L2 SFA per-64: one TMA per scale group.
+                            #pragma unroll
+                            for (uint32_t sf_group = 0;
+                                 sf_group < kNumL2SFAKGroups; ++ sf_group) {
+                                tma::copy<BLOCK_M, 1, 0, float>(
+                                    tensor_map_sfa_ptr, full_barriers[stage_idx],
+                                    smem_sfa[stage_idx] +
+                                        sf_group * kL2SFAHalfStride,
+                                    m_idx,
+                                    k_block_idx * kNumL2SFAKGroups + sf_group,
+                                    1);
+                            }
+                            full_barriers[stage_idx]->arrive_and_expect_tx(
+                                SMEM_A_SIZE_PER_STAGE +
+                                    kNumL2SFAKGroups * BLOCK_M * sizeof(float));
                         }
-                        full_barriers[stage_idx]->arrive_and_expect_tx(
-                            SMEM_A_SIZE_PER_STAGE +
-                                kNumL2SFAKGroups * BLOCK_M * sizeof(float));
                     }
                     } else {
                         full_barriers[stage_idx]->arrive();
@@ -1552,7 +1572,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     constexpr bool kEarlyReleaseMXFP4Stage =
                         kPhaseKBlocks <= 16;
                     const auto issue_mxfp4_wgmma = [&]<uint32_t kStartK32,
-                                                       uint32_t kNumWGMMAs>(
+                                                       uint32_t kNumWGMMAs,
+                                                       bool kAccumulate>(
                             const uint32_t pipeline_stage,
                             const uint32_t expanded_slot) {
                         #pragma unroll
@@ -1566,7 +1587,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 smem_a[pipeline_stage] + k32_idx * kWeightGranK, 1);
                             auto desc_b = mma::sm90::make_smem_desc(
                                 smem_b_expanded[expanded_slot] + k32_idx * kWeightGranK, 1);
-                            WGMMA::wgmma(desc_a, desc_b, accum, k != 0);
+                            WGMMA::wgmma(
+                                desc_a, desc_b, accum,
+                                kAccumulate or k != 0);
                         }
                         ptx::warpgroup_commit_batch();
                         #pragma unroll
@@ -1675,6 +1698,71 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     const float mxfp4_secondary = __ldg(
                         (is_linear1_phase ? l1_mxfp4_secondary : l2_mxfp4_secondary) +
                         local_expert_idx);
+                    if constexpr (kPerTensorActivationScale) {
+                        // Weight-relative K32 exponents are already folded
+                        // into the expanded E4M3 tile. A static activation
+                        // scale therefore permits one FP32 accumulator chain
+                        // across the entire K dimension, followed by a single
+                        // activation-secondary promotion.
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                            accum[i] = 0.0f;
+                        for (uint32_t k_block_idx = 0;
+                             k_block_idx < num_k_blocks;
+                             advance_pipeline(k_block_idx)) {
+                            const uint32_t expanded_slot =
+                                kPipelineMXFP4ExpandedB ?
+                                    (k_block_idx & 1u) : 0u;
+                            if constexpr (kPipelineMXFP4ExpandedB) {
+                                if (k_block_idx == 0) {
+                                    full_barriers[stage_idx]->wait(phase);
+                                    prepare_stage_weights(
+                                        stage_idx, expanded_slot);
+                                }
+                            } else {
+                                full_barriers[stage_idx]->wait(phase);
+                                prepare_stage_weights(
+                                    stage_idx, expanded_slot);
+                            }
+
+                            issue_mxfp4_wgmma.template operator()<0, 4, true>(
+                                stage_idx, expanded_slot);
+                            if constexpr (kPipelineMXFP4ExpandedB) {
+                                if (k_block_idx + 1 < num_k_blocks) {
+                                    const uint32_t next_stage =
+                                        stage_idx == kNumStages - 1 ?
+                                            0u : stage_idx + 1u;
+                                    const uint32_t next_phase =
+                                        phase ^ (next_stage == 0u);
+                                    full_barriers[next_stage]->wait(next_phase);
+                                    prepare_stage_weights(
+                                        next_stage, expanded_slot ^ 1u);
+                                }
+                            }
+                            if constexpr (kOverlapMXFP4ScalePath)
+                                ptx::warpgroup_wait<0>();
+                            arrive_task_empty_barrier(stage_idx);
+                        }
+
+                        constexpr float kMaxSecondaryBeforeX64 = 0x1p121f;
+                        const bool compensate_secondary =
+                            mxfp4_secondary <= kMaxSecondaryBeforeX64;
+                        const float activation_scale = is_linear1_phase ?
+                            l1_activation_dequant_scale :
+                            l2_activation_dequant_scale;
+                        const float compensated_secondary =
+                            compensate_secondary ?
+                                mxfp4_secondary * 64.0f : mxfp4_secondary;
+                        const float compensated_activation_scale =
+                            compensate_secondary ?
+                                activation_scale : activation_scale * 64.0f;
+                        const float combined_scale =
+                            compensated_secondary *
+                            compensated_activation_scale;
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                            final_accum[i] = accum[i] * combined_scale;
+                    } else {
                     for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks;
                          advance_pipeline(k_block_idx)) {
                         const uint32_t expanded_slot =
@@ -1693,7 +1781,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         }
 
                         if constexpr (is_linear1_phase) {
-                            issue_mxfp4_wgmma.template operator()<0, 4>(
+                            issue_mxfp4_wgmma.template operator()<0, 4, false>(
                                 stage_idx, expanded_slot);
                             if constexpr (kPipelineMXFP4ExpandedB) {
                                 // Decode the next packed stage into the
@@ -1715,11 +1803,11 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 kEarlyReleaseMXFP4Stage>(
                                 stage_idx, 0, mxfp4_secondary);
                         } else {
-                            issue_mxfp4_wgmma.template operator()<0, 2>(
+                            issue_mxfp4_wgmma.template operator()<0, 2, false>(
                                 stage_idx, expanded_slot);
                             promote_mxfp4.template operator()<false>(
                                 stage_idx, 0, mxfp4_secondary);
-                            issue_mxfp4_wgmma.template operator()<2, 2>(
+                            issue_mxfp4_wgmma.template operator()<2, 2, false>(
                                 stage_idx, expanded_slot);
                             if constexpr (kPipelineMXFP4ExpandedB) {
                                 // L2's first K64 group must be promoted
@@ -1755,6 +1843,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             __bfloat1622float2(mxfp4_final_bf16[i]);
                         final_accum[i * 2] = pair.x;
                         final_accum[i * 2 + 1] = pair.y;
+                    }
                     }
                 }
             };
@@ -1987,7 +2076,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 float swiglu_r0[kNumPairs][2];
                 float swiglu_r1[kNumPairs][2];
 
-                // Per-row amax, one scale for each 64-col L1 output group.
+                // Blockwise mode derives one per-row scale for each 64-col
+                // group. Per-tensor mode uses the static FC2-input scale.
                 float amax_r0[kNumSFGroups] = {};
                 float amax_r1[kNumSFGroups] = {};
 
@@ -2023,9 +2113,11 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     if (valid_r0) {
                         swiglu_r0[p][0] = silu(g_r0_c0) * u_r0_c0;
                         swiglu_r0[p][1] = silu(g_r0_c1) * u_r0_c1;
-                        amax_r0[sf_group] = cute::max(
-                            amax_r0[sf_group],
-                            cute::max(cute::abs(swiglu_r0[p][0]), cute::abs(swiglu_r0[p][1])));
+                        if constexpr (not kPerTensorActivationScale) {
+                            amax_r0[sf_group] = cute::max(
+                                amax_r0[sf_group],
+                                cute::max(cute::abs(swiglu_r0[p][0]), cute::abs(swiglu_r0[p][1])));
+                        }
                     } else {
                         swiglu_r0[p][0] = 0.0f;
                         swiglu_r0[p][1] = 0.0f;
@@ -2033,9 +2125,11 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     if (valid_r1) {
                         swiglu_r1[p][0] = silu(g_r1_c0) * u_r1_c0;
                         swiglu_r1[p][1] = silu(g_r1_c1) * u_r1_c1;
-                        amax_r1[sf_group] = cute::max(
-                            amax_r1[sf_group],
-                            cute::max(cute::abs(swiglu_r1[p][0]), cute::abs(swiglu_r1[p][1])));
+                        if constexpr (not kPerTensorActivationScale) {
+                            amax_r1[sf_group] = cute::max(
+                                amax_r1[sf_group],
+                                cute::max(cute::abs(swiglu_r1[p][0]), cute::abs(swiglu_r1[p][1])));
+                        }
                     } else {
                         swiglu_r1[p][0] = 0.0f;
                         swiglu_r1[p][1] = 0.0f;
@@ -2075,27 +2169,41 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     swiglu_r1[p][0] *= weight_r1;
                     swiglu_r1[p][1] *= weight_r1;
                 }
-                #pragma unroll
-                for (uint32_t g = 0; g < kNumSFGroups; ++ g) {
-                    amax_r0[g] *= cute::abs(weight_r0);
-                    amax_r1[g] *= cute::abs(weight_r1);
-                }
-                #pragma unroll
-                for (uint32_t g = 0; g < kNumSFGroups; ++ g) {
-                    amax_r0[g] = math::warp_reduce<4, false>(amax_r0[g], math::ReduceMax<float>());
-                    amax_r1[g] = math::warp_reduce<4, false>(amax_r1[g], math::ReduceMax<float>());
-                }
-
                 float sf_r0[kNumSFGroups], sf_inv_r0[kNumSFGroups];
                 float sf_r1[kNumSFGroups], sf_inv_r1[kNumSFGroups];
-                #pragma unroll
-                for (uint32_t g = 0; g < kNumSFGroups; ++ g) {
-                    float2 amax_pair = {amax_r0[g], amax_r1[g]};
-                    float2 sf_pair, sf_inv_pair;
-                    sm90_fp8_mega_moe_get_e4m3_sf_and_sf_inv(
-                        amax_pair, sf_pair, sf_inv_pair);
-                    sf_r0[g] = sf_pair.x; sf_inv_r0[g] = sf_inv_pair.x;
-                    sf_r1[g] = sf_pair.y; sf_inv_r1[g] = sf_inv_pair.y;
+                if constexpr (kPerTensorActivationScale) {
+                    const float sf_inv = kFastMath ?
+                        math::fast_rcp(l2_activation_dequant_scale) :
+                        1.0f / l2_activation_dequant_scale;
+                    #pragma unroll
+                    for (uint32_t g = 0; g < kNumSFGroups; ++ g) {
+                        sf_inv_r0[g] = sf_inv;
+                        sf_inv_r1[g] = sf_inv;
+                    }
+                } else {
+                    #pragma unroll
+                    for (uint32_t g = 0; g < kNumSFGroups; ++ g) {
+                        amax_r0[g] *= cute::abs(weight_r0);
+                        amax_r1[g] *= cute::abs(weight_r1);
+                    }
+                    #pragma unroll
+                    for (uint32_t g = 0; g < kNumSFGroups; ++ g) {
+                        amax_r0[g] = math::warp_reduce<4, false>(
+                            amax_r0[g], math::ReduceMax<float>());
+                        amax_r1[g] = math::warp_reduce<4, false>(
+                            amax_r1[g], math::ReduceMax<float>());
+                    }
+                    #pragma unroll
+                    for (uint32_t g = 0; g < kNumSFGroups; ++ g) {
+                        float2 amax_pair = {amax_r0[g], amax_r1[g]};
+                        float2 sf_pair, sf_inv_pair;
+                        sm90_fp8_mega_moe_get_e4m3_sf_and_sf_inv(
+                            amax_pair, sf_pair, sf_inv_pair);
+                        sf_r0[g] = sf_pair.x;
+                        sf_inv_r0[g] = sf_inv_pair.x;
+                        sf_r1[g] = sf_pair.y;
+                        sf_inv_r1[g] = sf_inv_pair.y;
+                    }
                 }
 
                 // Quantize and write to smem_cd_l1 (row-major, no swizzle).
@@ -2124,7 +2232,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         *p1 = r1_pair.__x;
                 }
 
-                // Write L2-activation SF as float, one value per 64 output columns.
+                // Write dynamic L2-activation SF only in blockwise mode.
+                if constexpr (not kPerTensorActivationScale) {
                 if (col_idx == 0) {
                     auto sf_base_ptr = is_shared_phase ?
                         shared_l2_sf_buffer.get_base_ptr<float>() :
@@ -2145,6 +2254,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         if (valid_r1)
                             sf_base_ptr[(base_k_sf_idx + g) * sf_stride + token_r1] = sf_r1[g];
                     }
+                }
                 }
 
                 // Issue TMA store of the entire tile. Padding rows beyond

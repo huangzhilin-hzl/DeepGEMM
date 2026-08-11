@@ -46,6 +46,7 @@ public:
         int num_ring_tokens, num_sf_ring_tokens;
         float activation_clamp;
         bool fast_math;
+        bool per_tensor_activation_scale;
         MegaMoESM90Config config;
 
         // Runtime arguments. num_tokens also selects the canonical compile-time
@@ -53,6 +54,8 @@ public:
         void* y;
         int* cumulative_local_expert_recv_stats;
         int num_tokens;
+        float l1_activation_dequant_scale;
+        float l2_activation_dequant_scale;
         layout::SymBuffer<> sym_buffer_ptrs;
 
         // Tensormaps for activations and weights. The B producer can stage
@@ -101,6 +104,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}, {}, {}
     >);
 }};
@@ -111,6 +115,7 @@ static void __instantiate_kernel() {{
     args.config.num_sms, args.num_ranks,
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false",
+    args.per_tensor_activation_scale ? "true" : "false",
     overlap_mxfp4_scale_path ? "true" : "false",
     args.num_ring_tokens, args.num_sf_ring_tokens, args.num_shared_experts);
     }
@@ -150,6 +155,8 @@ static void __instantiate_kernel() {{
             args.y,
             args.cumulative_local_expert_recv_stats,
             args.num_tokens,
+            args.l1_activation_dequant_scale,
+            args.l2_activation_dequant_scale,
             args.sym_buffer_ptrs,
             args.tensor_map_l1_acts,
             args.tensor_map_l1_acts_sf,
@@ -194,6 +201,9 @@ static void sm90_fp8_mxfp4_mega_moe(
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
     const bool& fast_math,
+    const bool& per_tensor_activation_scale,
+    const float& l1_activation_dequant_scale,
+    const float& l2_activation_dequant_scale,
     const torch::Tensor& l1_mxfp4_secondary,
     const torch::Tensor& l2_mxfp4_secondary
 ) {
@@ -359,10 +369,13 @@ static void sm90_fp8_mxfp4_mega_moe(
         .num_sf_ring_tokens = num_sf_ring_tokens,
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
+        .per_tensor_activation_scale = per_tensor_activation_scale,
         .config = persistent_config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
         .num_tokens = num_tokens,
+        .l1_activation_dequant_scale = l1_activation_dequant_scale,
+        .l2_activation_dequant_scale = l2_activation_dequant_scale,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
         .tensor_map_l1_acts = tensor_map_l1_acts,
         .tensor_map_l1_acts_sf = tensor_map_l1_acts_sf,

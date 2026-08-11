@@ -1,3 +1,4 @@
+import math
 import torch
 import types
 import warnings
@@ -332,7 +333,9 @@ def fp8_mxfp4_mega_moe(y: torch.Tensor,
                        recipe: Tuple[int, int, int] = (1, 1, 32),
                        activation: str = 'swiglu',
                        activation_clamp: Optional[float] = None,
-                       fast_math: bool = True):
+                       fast_math: bool = True,
+                       fp8_scale_mode: str = 'blockwise',
+                       activation_dequant_scales: Tuple[float, float] = (1.0, 1.0)):
     """Run the SM90 Humming-compatible MXFP4 MegaMoE path.
 
     Routed weights must be processed triples
@@ -346,6 +349,12 @@ def fp8_mxfp4_mega_moe(y: torch.Tensor,
     :func:`transform_shared_weights_for_fp8_mxfp4_mega_moe_sm90` and copy the
     input K128 FP32 scales into ``sym_buffer.shared_l1_acts_sf`` before launch.
     ``shared_l1_acts`` itself aliases ``sym_buffer.x``.
+
+    ``fp8_scale_mode='per_tensor'`` uses two static dequantization scales for
+    the FC1 input and FC2 input respectively. They must be positive, finite,
+    and identical on every EP rank. The initial routed activation payload must
+    already be quantized with ``activation_dequant_scales[0]``. Shared experts
+    are not supported by this specialization yet.
     """
     if not isinstance(sym_buffer, SM90SymmBuffer):
         raise TypeError(
@@ -362,6 +371,17 @@ def fp8_mxfp4_mega_moe(y: torch.Tensor,
     if num_shared_experts > 0 and shared_l1_weights is None:
         raise ValueError(
             'an SM90SymmBuffer with shared experts requires both shared weight tuples')
+    if fp8_scale_mode not in ('blockwise', 'per_tensor'):
+        raise ValueError(
+            "fp8_scale_mode must be 'blockwise' or 'per_tensor'")
+    if len(activation_dequant_scales) != 2 or any(
+            not math.isfinite(float(scale)) or float(scale) <= 0.0
+            for scale in activation_dequant_scales):
+        raise ValueError(
+            'activation_dequant_scales must contain two positive finite values')
+    if fp8_scale_mode == 'per_tensor' and num_shared_experts > 0:
+        raise ValueError(
+            'SM90 per-tensor activation scales do not support shared experts yet')
     _validate_processed_mxfp4_kernel_weights(l1_weights, l2_weights)
     num_ranks = sym_buffer.group.size()
     if sym_buffer.num_experts % num_ranks != 0:
@@ -421,7 +441,9 @@ def fp8_mxfp4_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts, sym_buffer.num_topk,
         recipe,
         activation, activation_clamp,
-        fast_math
+        fast_math,
+        fp8_scale_mode,
+        tuple(float(scale) for scale in activation_dequant_scales),
     )
 
 def bf16_mega_moe(y: torch.Tensor,

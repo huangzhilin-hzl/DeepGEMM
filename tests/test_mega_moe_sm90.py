@@ -173,6 +173,8 @@ def _reference_mega_moe(
     hidden: int,
     intermediate_hidden: int,
     activation_clamp: float,
+    fp8_scale_mode: str,
+    activation_dequant_scales: Tuple[float, float],
 ) -> torch.Tensor:
     """Cross-rank PyTorch oracle independent of the CUDA kernel."""
     from deep_gemm.utils.dist import uneven_all_gather
@@ -193,10 +195,13 @@ def _reference_mega_moe(
         topk_weights = uneven_all_gather(topk_weights_local, group=group)
     num_global_tokens = x_fp8.size(0)
 
-    x = (
-        x_fp8.float().view(num_global_tokens, hidden // 128, 128) *
-        x_sf.unsqueeze(-1)
-    ).view(num_global_tokens, hidden)
+    if fp8_scale_mode == 'per_tensor':
+        x = x_fp8.float() * activation_dequant_scales[0]
+    else:
+        x = (
+            x_fp8.float().view(num_global_tokens, hidden // 128, 128) *
+            x_sf.unsqueeze(-1)
+        ).view(num_global_tokens, hidden)
     combine = torch.zeros(
         num_global_tokens,
         num_topk,
@@ -229,14 +234,21 @@ def _reference_mega_moe(
         l1_output *= topk_weights[selected, selected_slots].unsqueeze(-1)
 
         num_selected = selected.numel()
-        l1_view = l1_output.view(num_selected, intermediate_hidden // 64, 64)
-        l1_scale = l1_view.abs().amax(dim=-1).clamp(1e-4) / 448.0
-        l1_quantized = (
-            l1_view / l1_scale.unsqueeze(-1)
-        ).to(torch.float8_e4m3fn).float()
-        l2_input = (
-            l1_quantized * l1_scale.unsqueeze(-1)
-        ).view(num_selected, intermediate_hidden)
+        if fp8_scale_mode == 'per_tensor':
+            l2_scale = activation_dequant_scales[1]
+            l2_input = (
+                l1_output / l2_scale
+            ).to(torch.float8_e4m3fn).float() * l2_scale
+        else:
+            l1_view = l1_output.view(
+                num_selected, intermediate_hidden // 64, 64)
+            l1_scale = l1_view.abs().amax(dim=-1).clamp(1e-4) / 448.0
+            l1_quantized = (
+                l1_view / l1_scale.unsqueeze(-1)
+            ).to(torch.float8_e4m3fn).float()
+            l2_input = (
+                l1_quantized * l1_scale.unsqueeze(-1)
+            ).view(num_selected, intermediate_hidden)
 
         l2_weight = _dequant_mxfp4(
             l2_weight_local[local_expert],
@@ -315,12 +327,21 @@ def _run_scenario(
     activation_clamp = config.get('activation_clamp', 10.0)
     masked_ratio = config.get('masked_ratio', 0.0)
     repeat_count = config.get('repeat_count', 1)
+    fp8_scale_mode = config.get('fp8_scale_mode', 'blockwise')
+    activation_dequant_scales = tuple(
+        float(scale) for scale in
+        config.get('activation_dequant_scales', (1.0, 1.0)))
 
     assert num_tokens <= num_max_tokens
     assert num_experts % num_ranks == 0
     assert num_max_tokens % 128 == 0
     assert hidden % 512 == 0 and intermediate_hidden % 256 == 0
     assert num_shared_experts >= 0
+    assert fp8_scale_mode in ('blockwise', 'per_tensor')
+    assert len(activation_dequant_scales) == 2
+    assert all(math.isfinite(scale) and scale > 0.0
+               for scale in activation_dequant_scales)
+    assert fp8_scale_mode != 'per_tensor' or num_shared_experts == 0
     assert num_topk + int(num_shared_experts > 0) <= 32
     assert repeat_count > 0
     num_local_experts = num_experts // num_ranks
@@ -337,12 +358,22 @@ def _run_scenario(
     else:
         x_bf16 = torch.randn(
             num_tokens, hidden, dtype=torch.bfloat16, device='cuda')
-        x_fp8, x_sf = per_token_cast_to_fp8(
-            x_bf16,
-            use_ue8m0=False,
-            gran_k=128,
-            use_packed_ue8m0=False,
-        )
+        if fp8_scale_mode == 'per_tensor':
+            x_fp8 = (
+                x_bf16.float() / activation_dequant_scales[0]
+            ).to(torch.float8_e4m3fn)
+            x_sf = torch.ones(
+                (num_tokens, hidden // 128),
+                dtype=torch.float32,
+                device='cuda',
+            )
+        else:
+            x_fp8, x_sf = per_token_cast_to_fp8(
+                x_bf16,
+                use_ue8m0=False,
+                gran_k=128,
+                use_packed_ue8m0=False,
+            )
         del x_bf16
 
     l1_bf16 = torch.randn(
@@ -532,6 +563,8 @@ def _run_scenario(
                 activation_clamp=(
                     activation_clamp if math.isfinite(activation_clamp) else None),
                 fast_math=fast_math,
+                fp8_scale_mode=fp8_scale_mode,
+                activation_dequant_scales=activation_dequant_scales,
             )
             torch.cuda.synchronize()
 
@@ -569,6 +602,8 @@ def _run_scenario(
             hidden,
             intermediate_hidden,
             activation_clamp,
+            fp8_scale_mode,
+            activation_dequant_scales,
         )
         diff = 0.0 if output.numel() == 0 else float(calc_diff(output, reference))
         local_failed = torch.tensor(
@@ -597,7 +632,15 @@ def _smoke_scenarios(num_ranks: int) -> List[Scenario]:
         fast_math=True,
         activation_clamp=10.0,
     )
-    routed = [('smoke.routed', dict(base, repeat_count=2))]
+    routed = [
+        ('smoke.routed', dict(base, repeat_count=2)),
+        ('smoke.routed_per_tensor', dict(
+            base,
+            repeat_count=2,
+            fp8_scale_mode='per_tensor',
+            activation_dequant_scales=(0.5, 8.0),
+        )),
+    ]
     shared = [
         (f'smoke.shared_s{num_shared_experts}', dict(
             base,
@@ -703,6 +746,19 @@ def _full_scenarios(
             activation_clamp=10.0,
             require_ring_wrap=True,
         )),
+        ('production.flash_m128_per_tensor', dict(
+            num_max_tokens_per_rank=128,
+            num_tokens=128,
+            hidden=4096,
+            intermediate_hidden=2048,
+            num_experts=32 * num_ranks,
+            num_topk=6,
+            fast_math=True,
+            activation_clamp=10.0,
+            fp8_scale_mode='per_tensor',
+            activation_dequant_scales=(0.5, 8.0),
+            require_ring_wrap=True,
+        )),
         ('production.pro_m256', dict(
             num_max_tokens_per_rank=256,
             num_tokens=256,
@@ -712,6 +768,18 @@ def _full_scenarios(
             num_topk=6,
             fast_math=True,
             activation_clamp=10.0,
+        )),
+        ('production.pro_m256_per_tensor', dict(
+            num_max_tokens_per_rank=256,
+            num_tokens=256,
+            hidden=7168,
+            intermediate_hidden=3072,
+            num_experts=48 * num_ranks,
+            num_topk=6,
+            fast_math=True,
+            activation_clamp=10.0,
+            fp8_scale_mode='per_tensor',
+            activation_dequant_scales=(0.5, 8.0),
         )),
     ]
     rng = random.Random(0xC0FFEE)
