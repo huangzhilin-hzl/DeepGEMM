@@ -280,10 +280,15 @@ static void sm90_fp8_mxfp4_mega_moe(
                                                      tma_block_k, config.block_m,
                                                      static_cast<int>(l1_acts.stride(-2)),
                                                      128);
-    const auto tensor_map_l1_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_acts_sf,
-                                                        sf_stride_tokens, hidden,
-                                                        config.block_m, kGranK,
-                                                        1, 0);
+    // Per-tensor kernels never prefetch or consume activation-SF descriptors.
+    // Reuse an already encoded placeholder instead of paying another CUDA
+    // Driver tensor-map encode on every forward.
+    const auto tensor_map_l1_acts_sf = per_tensor_activation_scale ?
+        tensor_map_l1_acts :
+        make_tma_sf_desc(cute::UMMA::Major::MN, l1_acts_sf,
+                         sf_stride_tokens, hidden,
+                         config.block_m, kGranK,
+                         1, 0);
     const auto tensor_map_l1_weights = make_tma_2d_desc(
         l1_weights,
         hidden / 2,
@@ -309,10 +314,12 @@ static void sm90_fp8_mxfp4_mega_moe(
                                                      tma_block_k, config.block_m,
                                                      static_cast<int>(l2_acts.stride(-2)),
                                                      128);
-    const auto tensor_map_l2_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_acts_sf,
-                                                        sf_stride_tokens, intermediate_hidden,
-                                                        config.block_m, kL2ActsSFGranK,
-                                                        1, 0);
+    const auto tensor_map_l2_acts_sf = per_tensor_activation_scale ?
+        tensor_map_l2_acts :
+        make_tma_sf_desc(cute::UMMA::Major::MN, l2_acts_sf,
+                         sf_stride_tokens, intermediate_hidden,
+                         config.block_m, kL2ActsSFGranK,
+                         1, 0);
     const auto tensor_map_l2_weights = make_tma_2d_desc(
         l2_weights,
         intermediate_hidden / 2,
@@ -332,7 +339,8 @@ static void sm90_fp8_mxfp4_mega_moe(
             tma_block_k, config.block_m,
             static_cast<int>(shared_l1_acts.stride(-2)),
             128) : tensor_map_l1_acts;
-    const auto tensor_map_shared_l1_acts_sf = num_shared_experts > 0 ?
+    const auto tensor_map_shared_l1_acts_sf =
+        num_shared_experts > 0 and not per_tensor_activation_scale ?
         make_tma_sf_desc(
             cute::UMMA::Major::MN, shared_l1_acts_sf,
             static_cast<int>(shared_l1_acts_sf.size(0)), hidden,
@@ -359,7 +367,8 @@ static void sm90_fp8_mxfp4_mega_moe(
             tma_block_k, config.block_m,
             static_cast<int>(shared_l2_acts.stride(-2)),
             128) : tensor_map_l2_acts;
-    const auto tensor_map_shared_l2_acts_sf = num_shared_experts > 0 ?
+    const auto tensor_map_shared_l2_acts_sf =
+        num_shared_experts > 0 and not per_tensor_activation_scale ?
         make_tma_sf_desc(
             cute::UMMA::Major::MN, shared_l2_acts_sf,
             static_cast<int>(shared_l2_acts_sf.size(0)),
