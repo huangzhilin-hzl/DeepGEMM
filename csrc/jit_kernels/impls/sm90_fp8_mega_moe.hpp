@@ -91,6 +91,9 @@ public:
         const bool overlap_mxfp4_scale_path =
             args.hidden >= 4096 or
             args.num_tokens <= kSM90MoeMaxLatencyOverlapTokens;
+        const bool use_prmt_mxfp4_exponent =
+            args.hidden == 4096 and
+            args.num_tokens <= kSM90MoeMaxLatencyOverlapTokens;
         return fmt::format(R"(
 #include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
 
@@ -102,6 +105,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {},
+        {},
         {},
         {},
         {},
@@ -118,6 +122,7 @@ static void __instantiate_kernel() {{
     args.fast_math ? "true" : "false",
     args.per_tensor_activation_scale ? "true" : "false",
     overlap_mxfp4_scale_path ? "true" : "false",
+    use_prmt_mxfp4_exponent ? "true" : "false",
     args.num_ring_tokens, args.num_sf_ring_tokens, args.num_shared_experts);
     }
 

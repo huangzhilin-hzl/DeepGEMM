@@ -78,6 +78,30 @@ CUTLASS_DEVICE uint2 sm90_mxfp4_reordered_signs_e2m1x8_to_e4m3x8_bits(
     return result;
 }
 
+__forceinline__ __device__ uint32_t sm90_extract_u8_prmt(
+    const uint32_t packed, const uint32_t byte_idx) {
+    uint32_t result = 0;
+    switch (byte_idx) {
+        case 0:
+            asm volatile("prmt.b32 %0, %1, 0, 0x4440;"
+                         : "=r"(result) : "r"(packed));
+            break;
+        case 1:
+            asm volatile("prmt.b32 %0, %1, 0, 0x4441;"
+                         : "=r"(result) : "r"(packed));
+            break;
+        case 2:
+            asm volatile("prmt.b32 %0, %1, 0, 0x4442;"
+                         : "=r"(result) : "r"(packed));
+            break;
+        default:
+            asm volatile("prmt.b32 %0, %1, 0, 0x4443;"
+                         : "=r"(result) : "r"(packed));
+            break;
+    }
+    return result;
+}
+
 __forceinline__ __device__ void sm90_fp8_mega_moe_get_e4m3_sf_and_sf_inv(
     const float2& amax, float2& sf, float2& sf_inv) {
     constexpr float kScale = 1.0f / 448.0f;
@@ -170,6 +194,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     bool kFastMath, \
     bool kPerTensorActivationScale, \
     bool kOverlapMXFP4ScalePath, \
+    bool kUsePRMTMXFP4Exponent, \
     uint32_t kNumRingTokens, \
     uint32_t kNumSFRingTokens, \
     uint32_t kNumSharedExperts
@@ -247,6 +272,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     kNumSMs, kNumRanks, \
     kActivationClamp, kFastMath, kPerTensorActivationScale, \
     kOverlapMXFP4ScalePath, \
+    kUsePRMTMXFP4Exponent, \
     kNumRingTokens, kNumSFRingTokens, kNumSharedExperts
 
 template <DG_SM90_FP8_MOE_TEMPLATE_PARAMS>
@@ -1508,9 +1534,15 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                                     packed +
                                                     next_packed_byte_offset));
                                         }
-                                        const uint32_t exponent_offset =
-                                            (decoded_scale_word >>
-                                             (k32_idx * 8u)) & 0xffu;
+                                        const uint32_t exponent_offset = [&]() {
+                                            if constexpr (kUsePRMTMXFP4Exponent) {
+                                                return sm90_extract_u8_prmt(
+                                                    decoded_scale_word, k32_idx);
+                                            } else {
+                                                return (decoded_scale_word >>
+                                                        (k32_idx * 8u)) & 0xffu;
+                                            }
+                                        }();
                                         const uint2 decoded =
                                             sm90_mxfp4_reordered_signs_e2m1x8_to_e4m3x8_bits(
                                                 packed_current,
@@ -1536,9 +1568,15 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                         const uint32_t packed_k =
                                             k32_idx * kPackedWordsPerK32 +
                                             packed_k_in_k32;
-                                        const uint32_t exponent_offset =
-                                            (decoded_scale_word >>
-                                             (k32_idx * 8u)) & 0xffu;
+                                        const uint32_t exponent_offset = [&]() {
+                                            if constexpr (kUsePRMTMXFP4Exponent) {
+                                                return sm90_extract_u8_prmt(
+                                                    decoded_scale_word, k32_idx);
+                                            } else {
+                                                return (decoded_scale_word >>
+                                                        (k32_idx * 8u)) & 0xffu;
+                                            }
+                                        }();
                                         const uint32_t packed_byte_offset =
                                             packed_row_base +
                                             ((packed_k * sizeof(uint32_t)) ^
