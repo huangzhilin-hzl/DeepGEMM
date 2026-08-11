@@ -2390,7 +2390,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
 
                 bool do_reduce = move_mask_and_load(load_stage_idx);
 
-                float2 reduced[kNumVectorsPerLane * kNumBF16PairsPerVector] = {};
+                // Fast mode rounds after each routed contribution so the combine
+                // state stays in packed BF16 registers; strict mode retains FP32.
+                using combine_accum_t = std::conditional_t<
+                    kFastMath, nv_bfloat162, float2>;
+                combine_accum_t reduced[
+                    kNumVectorsPerLane * kNumBF16PairsPerVector] = {};
                 while (do_reduce) {
                     do_reduce = move_mask_and_load(load_stage_idx ^ 1);
                     combine_load_barriers[load_stage_idx]->wait(combine_phase);
@@ -2403,10 +2408,17 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         const auto bf16_values =
                             reinterpret_cast<const nv_bfloat162*>(&packed);
                         #pragma unroll
-                        for (uint32_t l = 0; l < kNumBF16PairsPerVector; ++ l)
-                            ptx::accumulate(
-                                reduced[j * kNumBF16PairsPerVector + l],
-                                bf16_values[l]);
+                        for (uint32_t l = 0; l < kNumBF16PairsPerVector; ++ l) {
+                            const uint32_t accum_idx =
+                                j * kNumBF16PairsPerVector + l;
+                            if constexpr (kFastMath) {
+                                reduced[accum_idx] = __hadd2(
+                                    reduced[accum_idx], bf16_values[l]);
+                            } else {
+                                ptx::accumulate(
+                                    reduced[accum_idx], bf16_values[l]);
+                            }
+                        }
                     }
                     combine_phase ^= load_stage_idx;
                     load_stage_idx ^= 1;
@@ -2417,9 +2429,16 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     uint4 casted;
                     auto casted_bf16 = reinterpret_cast<nv_bfloat162*>(&casted);
                     #pragma unroll
-                    for (uint32_t l = 0; l < kNumBF16PairsPerVector; ++ l)
-                        casted_bf16[l] = __float22bfloat162_rn(
-                            reduced[j * kNumBF16PairsPerVector + l]);
+                    for (uint32_t l = 0; l < kNumBF16PairsPerVector; ++ l) {
+                        const uint32_t accum_idx =
+                            j * kNumBF16PairsPerVector + l;
+                        if constexpr (kFastMath) {
+                            casted_bf16[l] = reduced[accum_idx];
+                        } else {
+                            casted_bf16[l] = __float22bfloat162_rn(
+                                reduced[accum_idx]);
+                        }
+                    }
 
                     if (j == 0) {
                         ptx::tma_store_wait<0>();
