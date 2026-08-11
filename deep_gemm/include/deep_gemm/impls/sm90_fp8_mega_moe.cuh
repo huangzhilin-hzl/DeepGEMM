@@ -194,6 +194,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     bool kFastMath, \
     bool kPerTensorActivationScale, \
     bool kDeferTopKWeightToCombine, \
+    bool kDirectL2Scatter, \
     bool kOverlapMXFP4ScalePath, \
     bool kUsePRMTMXFP4Exponent, \
     bool kUseIncrementalMXFP4Descriptor, \
@@ -274,6 +275,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     kNumSMs, kNumRanks, \
     kActivationClamp, kFastMath, kPerTensorActivationScale, \
     kDeferTopKWeightToCombine, \
+    kDirectL2Scatter, \
     kOverlapMXFP4ScalePath, \
     kUsePRMTMXFP4Exponent, \
     kUseIncrementalMXFP4Descriptor, \
@@ -308,6 +310,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     DG_STATIC_ASSERT(not kDeferTopKWeightToCombine or
                          kPerTensorActivationScale,
                      "Deferred top-k weighting requires per-tensor mode");
+    DG_STATIC_ASSERT(not kDirectL2Scatter or
+                         (kPerTensorActivationScale and not kHasSharedExperts),
+                     "Direct L2 scatter requires routed-only per-tensor mode");
 
     // =====================================================================
     // Template checks
@@ -2391,6 +2396,83 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 // ---------------- L2 EPILOGUE: BF16 cast + NVLink scatter ----------------
                 constexpr uint32_t kNumRowsPerWarp = WG_BLOCK_M / 8;
 
+                if constexpr (kDirectL2Scatter) {
+                    // Per-tensor L2 has no dynamic scale output. Pack each
+                    // register pair directly into its remote combine slot,
+                    // avoiding the shared-memory round trip used by the
+                    // general blockwise path. This mirrors the H20 high-load
+                    // direct-scatter schedule from the SM90 FP8 MegaMoE path.
+                    auto scatter_direct_row = [&](
+                            const uint32_t row_offset,
+                            const bool valid_row,
+                            const uint32_t row_accum_offset) {
+                        if (valid_row) {
+                            uint32_t dst_rank_idx = 0;
+                            uint32_t dst_token_idx = 0;
+                            uint32_t dst_topk_idx = 0;
+                            const uint32_t row_group_base = lane_idx - col_idx;
+                            if (col_idx == 0) {
+                                const auto src_metadata =
+                                    *workspace.get_token_src_metadata_ptr(
+                                        pool_m_idx + row_offset);
+                                dst_rank_idx = src_metadata.rank_idx;
+                                dst_token_idx = src_metadata.token_idx;
+                                dst_topk_idx = src_metadata.topk_idx;
+                            }
+                            const uint32_t row_group_mask =
+                                0xfu << row_group_base;
+                            const int src_lane =
+                                static_cast<int>(row_group_base);
+                            dst_rank_idx = __shfl_sync(
+                                row_group_mask, dst_rank_idx, src_lane);
+                            dst_token_idx = __shfl_sync(
+                                row_group_mask, dst_token_idx, src_lane);
+                            dst_topk_idx = __shfl_sync(
+                                row_group_mask, dst_topk_idx, src_lane);
+
+                            const auto dst_token = combine_token_buffer
+                                .get_rank_buffer(dst_topk_idx)
+                                .get_data_buffer(dst_token_idx);
+                            auto dst_base = math::advance_ptr<uint8_t>(
+                                dst_token.get_base_ptr(),
+                                n_idx * kCombineElementBytes);
+                            auto mapped_dst_base =
+                                sym_buffer.map(dst_base, dst_rank_idx);
+
+                            #pragma unroll
+                            for (uint32_t i = 0;
+                                 i < kAccumPerThread / 8; ++ i) {
+                                const uint32_t chunk_lo = 2 * i;
+                                const uint32_t chunk_hi = 2 * i + 1;
+                                const uint32_t col_lo =
+                                    chunk_lo * 8 + col_idx * 2;
+                                const uint32_t col_hi =
+                                    chunk_hi * 8 + col_idx * 2;
+                                const uint32_t packed_lo =
+                                    math::cast_into_bf16_and_pack(
+                                        final_accum[chunk_lo * 4 +
+                                                    row_accum_offset],
+                                        final_accum[chunk_lo * 4 +
+                                                    row_accum_offset + 1]);
+                                const uint32_t packed_hi =
+                                    math::cast_into_bf16_and_pack(
+                                        final_accum[chunk_hi * 4 +
+                                                    row_accum_offset],
+                                        final_accum[chunk_hi * 4 +
+                                                    row_accum_offset + 1]);
+                                *reinterpret_cast<uint32_t*>(
+                                    mapped_dst_base +
+                                    col_lo * kCombineElementBytes) = packed_lo;
+                                *reinterpret_cast<uint32_t*>(
+                                    mapped_dst_base +
+                                    col_hi * kCombineElementBytes) = packed_hi;
+                            }
+                        }
+                    };
+
+                    scatter_direct_row(row_offset_r0, valid_r0, 0);
+                    scatter_direct_row(row_offset_r1, valid_r1, 2);
+                } else {
                     auto store_l2_pair = [&](const uint32_t& elem_idx,
                                              float value0, float value1) {
                         *reinterpret_cast<uint32_t*>(smem_cd_l2 + elem_idx) =
@@ -2495,6 +2577,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 *reinterpret_cast<uint32_t*>(smem_ptr);
                         }
                     }
+                }
 
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
             }

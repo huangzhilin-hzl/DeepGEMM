@@ -100,6 +100,10 @@ public:
         const bool defer_topk_weight_to_combine =
             args.per_tensor_activation_scale and
             args.hidden > 4096 and args.num_tokens == 128;
+        const bool direct_l2_scatter =
+            args.per_tensor_activation_scale and
+            args.num_shared_experts == 0 and
+            args.num_tokens > kSM90MoeMaxLatencyOverlapTokens;
         return fmt::format(R"(
 #include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
 
@@ -111,6 +115,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {},
+        {},
         {},
         {},
         {},
@@ -130,6 +135,7 @@ static void __instantiate_kernel() {{
     args.fast_math ? "true" : "false",
     args.per_tensor_activation_scale ? "true" : "false",
     defer_topk_weight_to_combine ? "true" : "false",
+    direct_l2_scatter ? "true" : "false",
     overlap_mxfp4_scale_path ? "true" : "false",
     use_prmt_mxfp4_exponent ? "true" : "false",
     use_incremental_mxfp4_descriptor ? "true" : "false",
