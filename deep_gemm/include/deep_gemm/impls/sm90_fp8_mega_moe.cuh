@@ -195,6 +195,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     bool kPerTensorActivationScale, \
     bool kOverlapMXFP4ScalePath, \
     bool kUsePRMTMXFP4Exponent, \
+    bool kUseIncrementalMXFP4Descriptor, \
     uint32_t kNumRingTokens, \
     uint32_t kNumSFRingTokens, \
     uint32_t kNumSharedExperts
@@ -273,6 +274,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     kActivationClamp, kFastMath, kPerTensorActivationScale, \
     kOverlapMXFP4ScalePath, \
     kUsePRMTMXFP4Exponent, \
+    kUseIncrementalMXFP4Descriptor, \
     kNumRingTokens, kNumSFRingTokens, kNumSharedExperts
 
 template <DG_SM90_FP8_MOE_TEMPLATE_PARAMS>
@@ -1629,16 +1631,39 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         for (uint32_t i = 0; i < kAccumPerThread; ++ i)
                             ptx::warpgroup_fence_operand(accum[i]);
                         ptx::warpgroup_arrive();
-                        #pragma unroll
-                        for (uint32_t k = 0; k < kNumWGMMAs; ++ k) {
-                            const uint32_t k32_idx = kStartK32 + k;
-                            auto desc_a = mma::sm90::make_smem_desc(
-                                smem_a[pipeline_stage] + k32_idx * kWeightGranK, 1);
-                            auto desc_b = mma::sm90::make_smem_desc(
-                                smem_b_expanded[expanded_slot] + k32_idx * kWeightGranK, 1);
-                            WGMMA::wgmma(
-                                desc_a, desc_b, accum,
-                                kAccumulate or k != 0);
+                        if constexpr (kUseIncrementalMXFP4Descriptor) {
+                            const auto desc_a_base = mma::sm90::make_smem_desc(
+                                smem_a[pipeline_stage] +
+                                    kStartK32 * kWeightGranK, 1);
+                            const auto desc_b_base = mma::sm90::make_smem_desc(
+                                smem_b_expanded[expanded_slot] +
+                                    kStartK32 * kWeightGranK, 1);
+                            #pragma unroll
+                            for (uint32_t k = 0; k < kNumWGMMAs; ++ k) {
+                                // K32 advances the descriptor's 16-byte start
+                                // address field by two without changing layout.
+                                const cute::GmmaDescriptor desc_a(
+                                    desc_a_base.desc_ + k * 2u);
+                                const cute::GmmaDescriptor desc_b(
+                                    desc_b_base.desc_ + k * 2u);
+                                WGMMA::wgmma(
+                                    desc_a, desc_b, accum,
+                                    kAccumulate or k != 0);
+                            }
+                        } else {
+                            #pragma unroll
+                            for (uint32_t k = 0; k < kNumWGMMAs; ++ k) {
+                                const uint32_t k32_idx = kStartK32 + k;
+                                auto desc_a = mma::sm90::make_smem_desc(
+                                    smem_a[pipeline_stage] +
+                                        k32_idx * kWeightGranK, 1);
+                                auto desc_b = mma::sm90::make_smem_desc(
+                                    smem_b_expanded[expanded_slot] +
+                                        k32_idx * kWeightGranK, 1);
+                                WGMMA::wgmma(
+                                    desc_a, desc_b, accum,
+                                    kAccumulate or k != 0);
+                            }
                         }
                         ptx::warpgroup_commit_batch();
                         #pragma unroll
