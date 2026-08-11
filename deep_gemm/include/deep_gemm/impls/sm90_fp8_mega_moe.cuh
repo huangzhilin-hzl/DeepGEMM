@@ -2290,7 +2290,6 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         cute::tma_store_arrive();
                     }
                     __syncwarp();
-                    ptx::tma_store_wait<0>();
 
                 // Publish L1 only after every ordinary SF store and every
                 // asynchronous TMA output store is globally visible. One
