@@ -2458,11 +2458,15 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 constexpr uint32_t kNumRowsPerWarp = WG_BLOCK_M / 8;
 
                 if constexpr (kDirectL2Scatter and not is_shared_phase) {
-                    // Per-tensor L2 has no dynamic scale output. Pack each
-                    // register pair directly into its remote combine slot,
-                    // avoiding the shared-memory round trip used by the
-                    // general blockwise path. This mirrors the H20 high-load
-                    // direct-scatter schedule from the SM90 FP8 MegaMoE path.
+                    // Per-tensor L2 has no dynamic scale output. Stage each
+                    // row within its owning four-lane group, then let two lanes
+                    // issue adjacent 16-byte stores for every 32-byte segment.
+                    // This keeps the direct path free of a warpgroup barrier
+                    // while avoiding half-empty sectors from scalar scatter.
+                    const auto get_direct_stage_byte_idx = [](
+                            const uint32_t byte_idx) {
+                        return cute::Swizzle<3, 4, 3>::apply(byte_idx);
+                    };
                     auto scatter_direct_row = [&](
                             const uint32_t row_offset,
                             const bool valid_row,
@@ -2500,6 +2504,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             auto mapped_dst_base =
                                 sym_buffer.map(dst_base, dst_rank_idx);
 
+                            // Four lanes collectively publish one complete row.
+                            // B128 swizzle spreads the eight row groups across
+                            // banks while preserving each aligned 16-byte span.
                             #pragma unroll
                             for (uint32_t i = 0;
                                  i < kAccumPerThread / 8; ++ i) {
@@ -2521,12 +2528,43 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                                     row_accum_offset],
                                         final_accum[chunk_hi * 4 +
                                                     row_accum_offset + 1]);
+                                const uint32_t row_elem_base =
+                                    row_offset * WG_BLOCK_N;
+                                const uint32_t lo_byte_idx =
+                                    get_direct_stage_byte_idx(
+                                        (row_elem_base + col_lo) *
+                                        kCombineElementBytes);
+                                const uint32_t hi_byte_idx =
+                                    get_direct_stage_byte_idx(
+                                        (row_elem_base + col_hi) *
+                                        kCombineElementBytes);
                                 *reinterpret_cast<uint32_t*>(
-                                    mapped_dst_base +
-                                    col_lo * kCombineElementBytes) = packed_lo;
+                                    smem_cd_base + lo_byte_idx) = packed_lo;
                                 *reinterpret_cast<uint32_t*>(
-                                    mapped_dst_base +
-                                    col_hi * kCombineElementBytes) = packed_hi;
+                                    smem_cd_base + hi_byte_idx) = packed_hi;
+                            }
+                            __syncwarp(row_group_mask);
+
+                            if (col_idx < 2) {
+                                #pragma unroll
+                                for (uint32_t i = 0;
+                                     i < kAccumPerThread / 8; ++ i) {
+                                    const uint32_t segment_col =
+                                        2 * i * 8 + col_idx * 8;
+                                    const uint32_t row_elem_base =
+                                        row_offset * WG_BLOCK_N;
+                                    const uint32_t stage_byte_idx =
+                                        get_direct_stage_byte_idx(
+                                            (row_elem_base + segment_col) *
+                                            kCombineElementBytes);
+                                    const auto packed =
+                                        *reinterpret_cast<uint4*>(
+                                            smem_cd_base + stage_byte_idx);
+                                    *reinterpret_cast<uint4*>(
+                                        mapped_dst_base +
+                                        segment_col * kCombineElementBytes) =
+                                            packed;
+                                }
                             }
                         }
                     };
