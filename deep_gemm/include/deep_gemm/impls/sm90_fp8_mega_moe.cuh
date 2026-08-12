@@ -193,6 +193,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     float kActivationClamp, \
     bool kFastMath, \
     bool kPerTensorActivationScale, \
+    bool kSmallMSwapAB, \
     bool kDeferTopKWeightToCombine, \
     bool kDirectL2Scatter, \
     bool kSwizzleL2CD, \
@@ -275,6 +276,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     kNumMaxTokensPerRank, kHidden, kIntermediateHidden, kNumExperts, kNumTopk, \
     kNumSMs, kNumRanks, \
     kActivationClamp, kFastMath, kPerTensorActivationScale, \
+    kSmallMSwapAB, \
     kDeferTopKWeightToCombine, \
     kDirectL2Scatter, \
     kSwizzleL2CD, \
@@ -312,6 +314,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     DG_STATIC_ASSERT(not kDeferTopKWeightToCombine or
                          kPerTensorActivationScale,
                      "Deferred top-k weighting requires per-tensor mode");
+    DG_STATIC_ASSERT(not kSmallMSwapAB or kPerTensorActivationScale,
+                     "Small-M swap-AB requires per-tensor activation scales");
     DG_STATIC_ASSERT(not kDirectL2Scatter or
                          (kPerTensorActivationScale and
                           (not kHasSharedExperts or kHidden == 4096)),
@@ -410,6 +414,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr uint32_t WG_BLOCK_N = BLOCK_N;
     constexpr uint32_t L1_OUT_BLOCK_N = BLOCK_N / 2;       // post-SwiGLU tile N
     constexpr uint32_t WG_L1_OUT_BLOCK_N = WG_BLOCK_N / 2; // post-SwiGLU per-WG N
+    constexpr uint32_t kSwapABTokenChunks = BLOCK_M / 8;
+    constexpr uint32_t kSwapABWeightHalves = BLOCK_N / 64;
+    constexpr uint32_t kSwapABHalfAccumPerThread = 64 * 64 / 128;
+    DG_STATIC_ASSERT(BLOCK_M == 64 and BLOCK_N == 128 and
+                         kSwapABWeightHalves == 2,
+                     "Small-M swap-AB requires the fixed Humming tile");
     // Two-CTA MXFP4 is compiled at 128 registers/thread. Keeping both the
     // 64-value WGMMA fragment and a 64-value FP32 persistent sum live creates
     // a short local-memory frame. Retain the cross-promotion sum as 32 packed
@@ -1797,6 +1807,144 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         (is_linear1_phase ? l1_mxfp4_secondary : l2_mxfp4_secondary) +
                         local_expert_idx);
                     if constexpr (kPerTensorActivationScale) {
+                        if constexpr (kSmallMSwapAB) {
+                        // Treat each N64 weight half as WGMMA's M dimension and
+                        // the valid token bucket as N. Both halves accumulate
+                        // directly into disjoint portions of final_accum, so
+                        // expanded weights are decoded only once per K stage.
+                        auto run_swap_ab = [&]<uint32_t N_SWAP>() {
+                            using SwapWGMMA = typename
+                                mma::sm90::FP8MMASelector<N_SWAP>::type;
+                            constexpr uint32_t kSwapAccum =
+                                SwapWGMMA::kNumAccum;
+                            DG_STATIC_ASSERT(kSwapAccum <=
+                                                 kSwapABHalfAccumPerThread,
+                                             "Invalid swap-AB accumulator bucket");
+                            #pragma unroll
+                            for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                                final_accum[i] = 0.0f;
+
+                            for (uint32_t k_block_idx = 0;
+                                 k_block_idx < num_k_blocks;
+                                 advance_pipeline(k_block_idx)) {
+                                const uint32_t expanded_slot =
+                                    kPipelineMXFP4ExpandedB ?
+                                        (k_block_idx & 1u) : 0u;
+                                if constexpr (kPipelineMXFP4ExpandedB) {
+                                    if (k_block_idx == 0) {
+                                        full_barriers[stage_idx]->wait(phase);
+                                        prepare_stage_weights(
+                                            stage_idx, expanded_slot);
+                                    }
+                                } else {
+                                    full_barriers[stage_idx]->wait(phase);
+                                    prepare_stage_weights(
+                                        stage_idx, expanded_slot);
+                                }
+
+                                #pragma unroll
+                                for (uint32_t half = 0;
+                                     half < kSwapABWeightHalves; ++ half) {
+                                    auto* half_accum = final_accum +
+                                        half * kSwapABHalfAccumPerThread;
+                                    #pragma unroll
+                                    for (uint32_t i = 0; i < kSwapAccum; ++ i)
+                                        ptx::warpgroup_fence_operand(
+                                            half_accum[i]);
+                                    ptx::warpgroup_arrive();
+                                    #pragma unroll
+                                    for (uint32_t k32_idx = 0;
+                                         k32_idx < BLOCK_K / SwapWGMMA::K;
+                                         ++ k32_idx) {
+                                        auto desc_a = mma::sm90::make_smem_desc(
+                                            smem_b_expanded[expanded_slot] +
+                                                half * 64u * BLOCK_K +
+                                                k32_idx * SwapWGMMA::K,
+                                            1);
+                                        auto desc_b = mma::sm90::make_smem_desc(
+                                            smem_a[stage_idx] +
+                                                k32_idx * SwapWGMMA::K,
+                                            1);
+                                        SwapWGMMA::wgmma(
+                                            desc_a, desc_b, half_accum,
+                                            k_block_idx != 0 or k32_idx != 0);
+                                    }
+                                    ptx::warpgroup_commit_batch();
+                                    #pragma unroll
+                                    for (uint32_t i = 0; i < kSwapAccum; ++ i)
+                                        ptx::warpgroup_fence_operand(
+                                            half_accum[i]);
+                                }
+
+                                if constexpr (kPipelineMXFP4ExpandedB) {
+                                    if (k_block_idx + 1 < num_k_blocks) {
+                                        const uint32_t next_stage =
+                                            stage_idx == kNumStages - 1 ?
+                                                0u : stage_idx + 1u;
+                                        const uint32_t next_phase =
+                                            phase ^ (next_stage == 0u);
+                                        full_barriers[next_stage]->wait(
+                                            next_phase);
+                                        prepare_stage_weights(
+                                            next_stage, expanded_slot ^ 1u);
+                                    }
+                                }
+                                ptx::warpgroup_wait<0>();
+                                arrive_task_empty_barrier(stage_idx);
+                            }
+                        };
+
+                        const uint32_t n_swap =
+                            math::ceil_div(valid_m, 8u) * 8u;
+                        if constexpr (kIntermediateHidden <= 2048) {
+                            if (n_swap <= 8)
+                                run_swap_ab.template operator()<8>();
+                            else if (n_swap <= 16)
+                                run_swap_ab.template operator()<16>();
+                            else if (n_swap <= 32)
+                                run_swap_ab.template operator()<32>();
+                            else
+                                run_swap_ab.template operator()<64>();
+                        } else {
+                            switch (n_swap) {
+                                case 8:
+                                    run_swap_ab.template operator()<8>(); break;
+                                case 16:
+                                    run_swap_ab.template operator()<16>(); break;
+                                case 24:
+                                    run_swap_ab.template operator()<24>(); break;
+                                case 32:
+                                    run_swap_ab.template operator()<32>(); break;
+                                case 40:
+                                    run_swap_ab.template operator()<40>(); break;
+                                case 48:
+                                    run_swap_ab.template operator()<48>(); break;
+                                case 56:
+                                    run_swap_ab.template operator()<56>(); break;
+                                default:
+                                    run_swap_ab.template operator()<64>(); break;
+                            }
+                        }
+
+                        constexpr float kMaxSecondaryBeforeX64 = 0x1p121f;
+                        const bool compensate_secondary =
+                            mxfp4_secondary <= kMaxSecondaryBeforeX64;
+                        const float activation_scale = is_linear1_phase ?
+                            l1_activation_dequant_scale :
+                            l2_activation_dequant_scale;
+                        const float compensated_secondary =
+                            compensate_secondary ?
+                                mxfp4_secondary * 64.0f : mxfp4_secondary;
+                        const float compensated_activation_scale =
+                            compensate_secondary ?
+                                activation_scale : activation_scale * 64.0f;
+                        const float combined_scale =
+                            compensated_secondary *
+                            compensated_activation_scale;
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kAccumPerThread; ++ i)
+                            final_accum[i] *= combined_scale;
+                        } else {
                         // Weight-relative K32 exponents are already folded
                         // into the expanded E4M3 tile. A static activation
                         // scale therefore permits one FP32 accumulator chain
@@ -1860,6 +2008,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         #pragma unroll
                         for (uint32_t i = 0; i < kAccumPerThread; ++ i)
                             final_accum[i] = accum[i] * combined_scale;
+                        }
                     } else {
                     for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks;
                          advance_pipeline(k_block_idx)) {
@@ -2205,6 +2354,84 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             const bool valid_r1 = row_offset_r1 < valid_m;
 
             if (is_linear1_phase) {
+                auto* smem_cd_l1_wg = smem_cd_l1;
+                if constexpr (kSmallMSwapAB and not is_shared_phase) {
+                    auto silu = [](float x) {
+                        const float e = kFastMath ? __expf(-x) : expf(-x);
+                        const float sig = kFastMath ?
+                            math::fast_rcp(1.0f + e) : 1.0f / (1.0f + e);
+                        return x * sig;
+                    };
+                    auto clamp_gate = [](float& x) {
+                        if constexpr (kActivationClamp !=
+                                      cute::numeric_limits<float>::infinity())
+                            x = cute::min(x, kActivationClamp);
+                    };
+                    auto clamp_up = [](float& x) {
+                        if constexpr (kActivationClamp !=
+                                      cute::numeric_limits<float>::infinity())
+                            x = cute::min(
+                                cute::max(x, -kActivationClamp),
+                                kActivationClamp);
+                    };
+                    const float sf_inv = kFastMath ?
+                        math::fast_rcp(l2_activation_dequant_scale) :
+                        1.0f / l2_activation_dequant_scale;
+
+                    const uint32_t num_swap_token_chunks =
+                        math::ceil_div(valid_m, 8u);
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kSwapABTokenChunks; ++ i) {
+                        if (i < num_swap_token_chunks) {
+                            const uint32_t token_0 = i * 8 + col_idx * 2;
+                            const uint32_t token_1 = token_0 + 1;
+                            #pragma unroll
+                            for (uint32_t half = 0;
+                                 half < kSwapABWeightHalves; ++ half) {
+                                const uint32_t accum_offset =
+                                    half * kSwapABHalfAccumPerThread + i * 4;
+                                const uint32_t out_col =
+                                    half * 32u + warp_idx_in_wg * 8 + row_idx;
+                                if (token_0 < valid_m) {
+                                    float gate = final_accum[accum_offset];
+                                    float up = final_accum[accum_offset + 2];
+                                    clamp_gate(gate);
+                                    clamp_up(up);
+                                    const float weight =
+                                        kDeferTopKWeightToCombine ? 1.0f :
+                                        *l1_topk_weights_buffer
+                                            .get_data_buffer(m_idx + token_0)
+                                            .template get_base_ptr<float>();
+                                    const __nv_fp8_e4m3 q(
+                                        silu(gate) * up * weight * sf_inv);
+                                    reinterpret_cast<uint8_t*>(
+                                        smem_cd_l1_wg)[
+                                            token_0 * L1_OUT_BLOCK_N +
+                                            out_col] =
+                                        *reinterpret_cast<const uint8_t*>(&q);
+                                }
+                                if (token_1 < valid_m) {
+                                    float gate = final_accum[accum_offset + 1];
+                                    float up = final_accum[accum_offset + 3];
+                                    clamp_gate(gate);
+                                    clamp_up(up);
+                                    const float weight =
+                                        kDeferTopKWeightToCombine ? 1.0f :
+                                        *l1_topk_weights_buffer
+                                            .get_data_buffer(m_idx + token_1)
+                                            .template get_base_ptr<float>();
+                                    const __nv_fp8_e4m3 q(
+                                        silu(gate) * up * weight * sf_inv);
+                                    reinterpret_cast<uint8_t*>(
+                                        smem_cd_l1_wg)[
+                                            token_1 * L1_OUT_BLOCK_N +
+                                            out_col] =
+                                        *reinterpret_cast<const uint8_t*>(&q);
+                                }
+                            }
+                        }
+                    }
+                } else {
                 // ---------------- L1 EPILOGUE: SwiGLU + FP8 quantize + TMA store ----------------
                 // Layout in `final_accum`:
                 //   16 chunks of 8 N-cols, each chunk = 4 floats per thread = (r0c0, r0c1, r1c0, r1c1).
@@ -2358,7 +2585,6 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 }
 
                 // Quantize and write to smem_cd_l1 (row-major, no swizzle).
-                auto* smem_cd_l1_wg = smem_cd_l1;
                 #pragma unroll
                 for (uint32_t p = 0; p < kNumPairs; ++ p) {
                     const uint32_t sf_group = p / 8;
@@ -2405,6 +2631,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         if (valid_r1)
                             sf_base_ptr[(base_k_sf_idx + g) * sf_stride + token_r1] = sf_r1[g];
                     }
+                }
                 }
                 }
 
@@ -2585,6 +2812,53 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             smem_cd_base + storage_byte_idx) =
                                 math::cast_into_bf16_and_pack(value0, value1);
                     };
+                    auto store_l2_scalar = [&](const uint32_t& elem_idx,
+                                               float value) {
+                        const uint32_t storage_byte_idx = get_l2_cd_byte_idx(
+                            elem_idx * sizeof(nv_bfloat16));
+                        *reinterpret_cast<nv_bfloat16*>(
+                            smem_cd_base + storage_byte_idx) =
+                                __float2bfloat16_rn(value);
+                    };
+                    if constexpr (kSmallMSwapAB and not is_shared_phase) {
+                        const uint32_t num_swap_token_chunks =
+                            math::ceil_div(valid_m, 8u);
+                        #pragma unroll
+                        for (uint32_t i = 0; i < kSwapABTokenChunks; ++ i) {
+                            if (i < num_swap_token_chunks) {
+                                const uint32_t token_0 =
+                                    i * 8 + col_idx * 2;
+                                const uint32_t token_1 = token_0 + 1;
+                                #pragma unroll
+                                for (uint32_t half = 0;
+                                     half < kSwapABWeightHalves; ++ half) {
+                                    const uint32_t accum_offset =
+                                        half * kSwapABHalfAccumPerThread + i * 4;
+                                    const uint32_t col_offset = half * 64u;
+                                    if (token_0 < valid_m) {
+                                        store_l2_scalar(
+                                            token_0 * WG_BLOCK_N +
+                                                col_offset + r_0,
+                                            final_accum[accum_offset]);
+                                        store_l2_scalar(
+                                            token_0 * WG_BLOCK_N +
+                                                col_offset + r_1,
+                                            final_accum[accum_offset + 2]);
+                                    }
+                                    if (token_1 < valid_m) {
+                                        store_l2_scalar(
+                                            token_1 * WG_BLOCK_N +
+                                                col_offset + r_0,
+                                            final_accum[accum_offset + 1]);
+                                        store_l2_scalar(
+                                            token_1 * WG_BLOCK_N +
+                                                col_offset + r_1,
+                                            final_accum[accum_offset + 3]);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
                     #pragma unroll
                         for (uint32_t i = 0; i < kAccumPerThread / 8; ++ i) {
                             const uint32_t chunk_lo = 2 * i, chunk_hi = 2 * i + 1;
@@ -2613,6 +2887,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                     final_accum[chunk_hi * 4 + 3]);
                             }
                         }
+                    }
 
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx);
 

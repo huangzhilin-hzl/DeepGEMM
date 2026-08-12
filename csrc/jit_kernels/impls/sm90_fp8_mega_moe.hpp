@@ -100,6 +100,9 @@ public:
         const bool defer_topk_weight_to_combine =
             args.per_tensor_activation_scale and
             args.hidden > 4096 and args.num_tokens == 128;
+        const bool small_m_swap_ab =
+            args.per_tensor_activation_scale and
+            args.num_shared_experts == 0 and args.num_tokens <= 128;
         // Wider routed-only L2 shapes amortize direct BF16 scatter by M=256;
         // Flash keeps it for routed tasks in a shared-expert launch once the
         // throughput regime is reached. Shared L2 itself retains SMEM scatter.
@@ -132,6 +135,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}, {}, {}
     >);
 }};
@@ -143,6 +147,7 @@ static void __instantiate_kernel() {{
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false",
     args.per_tensor_activation_scale ? "true" : "false",
+    small_m_swap_ab ? "true" : "false",
     defer_topk_weight_to_combine ? "true" : "false",
     direct_l2_scatter ? "true" : "false",
     swizzle_l2_cd ? "true" : "false",
