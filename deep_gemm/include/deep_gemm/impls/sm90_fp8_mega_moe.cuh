@@ -1850,26 +1850,63 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                     auto* half_accum = final_accum +
                                         half * kSwapABHalfAccumPerThread;
                                     #pragma unroll
-                                    for (uint32_t i = 0; i < kSwapAccum; ++ i)
+                                    for (uint32_t i = 0;
+                                         i < kSwapAccum; ++ i)
                                         ptx::warpgroup_fence_operand(
                                             half_accum[i]);
                                     ptx::warpgroup_arrive();
-                                    #pragma unroll
-                                    for (uint32_t k32_idx = 0;
-                                         k32_idx < BLOCK_K / SwapWGMMA::K;
-                                         ++ k32_idx) {
-                                        auto desc_a = mma::sm90::make_smem_desc(
-                                            smem_b_expanded[expanded_slot] +
-                                                half * 64u * BLOCK_K +
-                                                k32_idx * SwapWGMMA::K,
-                                            1);
-                                        auto desc_b = mma::sm90::make_smem_desc(
-                                            smem_a[stage_idx] +
-                                                k32_idx * SwapWGMMA::K,
-                                            1);
-                                        SwapWGMMA::wgmma(
-                                            desc_a, desc_b, half_accum,
-                                            k_block_idx != 0 or k32_idx != 0);
+                                    // Flash benefits from incrementing the
+                                    // swap-AB descriptors; Pro regresses.
+                                    if constexpr (kHidden == 4096) {
+                                        const auto desc_a_base =
+                                            mma::sm90::make_smem_desc(
+                                                smem_b_expanded[expanded_slot] +
+                                                    half * 64u * BLOCK_K,
+                                                1);
+                                        const auto desc_b_base =
+                                            mma::sm90::make_smem_desc(
+                                                smem_a[stage_idx], 1);
+                                        #pragma unroll
+                                        for (uint32_t k32_idx = 0;
+                                             k32_idx <
+                                                 BLOCK_K / SwapWGMMA::K;
+                                             ++ k32_idx) {
+                                            const cute::GmmaDescriptor desc_a(
+                                                desc_a_base.desc_ +
+                                                    k32_idx * 2u);
+                                            const cute::GmmaDescriptor desc_b(
+                                                desc_b_base.desc_ +
+                                                    k32_idx * 2u);
+                                            SwapWGMMA::wgmma(
+                                                desc_a, desc_b, half_accum,
+                                                k_block_idx != 0 or
+                                                    k32_idx != 0);
+                                        }
+                                    } else {
+                                        #pragma unroll
+                                        for (uint32_t k32_idx = 0;
+                                             k32_idx <
+                                                 BLOCK_K / SwapWGMMA::K;
+                                             ++ k32_idx) {
+                                            auto desc_a =
+                                                mma::sm90::make_smem_desc(
+                                                    smem_b_expanded[
+                                                        expanded_slot] +
+                                                        half * 64u * BLOCK_K +
+                                                        k32_idx *
+                                                            SwapWGMMA::K,
+                                                    1);
+                                            auto desc_b =
+                                                mma::sm90::make_smem_desc(
+                                                    smem_a[stage_idx] +
+                                                        k32_idx *
+                                                            SwapWGMMA::K,
+                                                    1);
+                                            SwapWGMMA::wgmma(
+                                                desc_a, desc_b, half_accum,
+                                                k_block_idx != 0 or
+                                                    k32_idx != 0);
+                                        }
                                     }
                                     ptx::warpgroup_commit_batch();
                                     #pragma unroll
