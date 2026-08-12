@@ -293,7 +293,10 @@ def test_in_kernel_profiler_decodes_ranges_and_reports_truncation(tmp_path):
     mega, package_name = _load_mega_api_for_cpu()
     try:
         profiler = mega.MegaMoeProfiler(capacity=2, rank=0, device='cpu')
-        payload = 1 | (3 << 3) | (4 << 12) | (5 << 22)
+        profiler.configure_workload(
+            num_tokens=8192, num_ranks=8, num_experts=384, num_topk=6,
+            hidden=7168, intermediate_hidden=3072)
+        payload = 1 | (3 << 3) | (4 << 12) | (5 << 28) | (37 << 38)
         profiler.buffer[0, 4, 0, 0] = 3
         profiler.buffer[0, 4, 0, 1] = 7
         profiler.buffer[0, 4, 1, 0] = 1000
@@ -307,6 +310,13 @@ def test_in_kernel_profiler_decodes_ranges_and_reports_truncation(tmp_path):
         assert events[0]['args']['expert'] == 3
         assert events[0]['args']['m_block'] == 4
         assert events[0]['args']['n_block'] == 5
+        assert events[0]['args']['valid_m'] == 37
+        assert events[0]['args']['global_expert'] == 3
+        assert events[0]['args']['m_start'] == 256
+        assert events[0]['args']['m_end'] == 293
+        assert events[0]['args']['n_start'] == 640
+        assert events[0]['args']['n_end'] == 768
+        assert events[0]['args']['shape_k'] == 7168
         assert profiler.summary()['task']['total_us'] == pytest.approx(4.0)
         assert profiler.truncation()['dropped'] == 1
 
@@ -322,40 +332,393 @@ def test_in_kernel_profiler_decodes_ranges_and_reports_truncation(tmp_path):
         trace_path = profiler.export_chrome_trace(tmp_path / 'trace.json')
         trace = __import__('json').loads(trace_path.read_text())
         assert snapshot_calls == 1
-        assert trace['deep_gemm']['format'] == 'mega_moe_in_kernel_v2'
+        assert trace['deep_gemm']['format'] == 'mega_moe_in_kernel_v5'
+        assert trace['deep_gemm']['workload']['hidden'] == 7168
         assert trace['deep_gemm']['truncation']['truncated_tracks'] == 1
+        assert trace['deep_gemm']['truncation']['counts_are_lower_bounds'] is True
+        task_slices = [
+            event for event in trace['traceEvents']
+            if event.get('cat') == 'task'
+        ]
+        assert task_slices[0]['name'].startswith('task L1 E3 M[256,293)')
+        assert task_slices[0]['args']['event_type'] == 'task'
         assert profiler.last_export_metadata['truncation']['dropped'] == 1
 
-        detail_profiler = mega.MegaMoeProfiler(capacity=4, rank=0, device='cpu')
-        combine_payload = 9 | (2 << 16) | (3 << 24)
-        pipeline_payload = 1 | (2 << 3) | (7 << 5) | (9 << 17)
-        detail_profiler.buffer[0, 1, 0, 0] = 4
+        detail_profiler = mega.MegaMoeProfiler(capacity=5, rank=0, device='cpu')
+        detail_profiler.configure_workload(
+            num_tokens=8192, num_ranks=8, num_experts=384, num_topk=6,
+            hidden=7168, intermediate_hidden=3072)
+        combine_payload = (
+            9 | (2 << 32) | (4 << 35) | (3 << 38) | (1 << 44))
+        wgmma_payload = (
+            1 | (2 << 3) | (7 << 5) | (2 << 17) | (2 << 20) |
+            (1 << 23) | (1 << 25))
+        pull_payload = 123 | (2 << 32) | (3 << 37)
+        select_payload = 17 | (45 << 9)
+        detail_profiler.buffer[0, 1, 0, 0] = 5
         detail_profiler.buffer[0, 1, 1, 0] = 100
-        detail_profiler.buffer[0, 1, 1, 1] = 5 | (2 << 8) | (123 << 16)
+        detail_profiler.buffer[0, 1, 1, 1] = (
+            32 | (select_payload << 16))
         detail_profiler.buffer[0, 1, 2, 0] = 200
         detail_profiler.buffer[0, 1, 2, 1] = (
-            26 | (2 << 8) | (combine_payload << 16)
+            32 | (1 << 8) | (select_payload << 16)
         )
         detail_profiler.buffer[0, 1, 3, 0] = 300
-        detail_profiler.buffer[0, 1, 3, 1] = 18 | (2 << 8) | (payload << 16)
+        detail_profiler.buffer[0, 1, 3, 1] = (
+            5 | (2 << 8) | (pull_payload << 16))
         detail_profiler.buffer[0, 1, 4, 0] = 400
         detail_profiler.buffer[0, 1, 4, 1] = (
-            30 | (2 << 8) | (pipeline_payload << 16)
+            26 | (2 << 8) | (combine_payload << 16)
+        )
+        detail_profiler.buffer[0, 1, 5, 0] = 500
+        detail_profiler.buffer[0, 1, 5, 1] = (
+            30 | (2 << 8) | (wgmma_payload << 16)
         )
         detail_events = detail_profiler.events()
-        assert detail_events[0]['args']['token'] == 123
-        assert detail_events[1]['args'] == {
-            'payload': combine_payload,
-            'token': 9,
-            'chunk': 2,
-            'slot': 3,
+        pull_args = detail_events[2]['args']
+        assert pull_args['src_rank'] == 3
+        assert pull_args['src_token'] == 123
+        assert pull_args['src_topk'] == 2
+        assert pull_args['src_route_index'] == 740
+        assert pull_args['dst_rank'] == 0
+        assert pull_args['dst_local_expert'] == 17
+        assert pull_args['dst_global_expert'] == 17
+        assert pull_args['dst_expert_token'] == 45
+        assert pull_args['dst_m'] == 45
+        assert pull_args['payload_overflow'] is False
+        combine_args = detail_events[3]['args']
+        assert combine_args['token'] == 9
+        assert combine_args['chunk'] == 2
+        assert combine_args['num_chunks'] == 4
+        assert combine_args['topk_slot'] == 3
+        assert combine_args['hidden_start'] == 3584
+        assert combine_args['hidden_end'] == 5376
+        assert detail_events[4]['name'] == 'wgmma.wait'
+        assert detail_events[4]['args']['stage'] == 2
+        assert detail_events[4]['args']['k_block'] == 7
+        assert detail_events[4]['args']['k32_start'] == 2
+        assert detail_events[4]['args']['k32_count'] == 2
+        assert detail_events[4]['args']['expanded_slot'] == 1
+        assert detail_events[4]['args']['accumulate'] is True
+        assert detail_events[4]['args']['k_start'] == 960
+        assert detail_events[4]['args']['k_end'] == 1024
+        assert detail_events[0]['name'] == 'dispatch.select'
+        select_args = detail_events[0]['args']
+        assert select_args['dst_rank'] == 0
+        assert select_args['dst_global_expert'] == 17
+        assert select_args['dst_m'] == 45
+    finally:
+        _unload_fake_package(package_name)
+
+
+def test_in_kernel_profiler_inherits_task_geometry_into_wgmma():
+    mega, package_name = _load_mega_api_for_cpu()
+    try:
+        profiler = mega.MegaMoeProfiler(capacity=4, rank=3, device='cpu')
+        profiler.configure_workload(
+            num_tokens=8192, num_ranks=8, num_experts=384, num_topk=6,
+            hidden=7168, intermediate_hidden=3072)
+        task_payload = (
+            2 | (17 << 3) | (2 << 12) | (4 << 28) | (37 << 38))
+        wgmma_payload = (
+            2 | (1 << 3) | (7 << 5) | (2 << 17) | (2 << 20))
+        profiler.buffer[0, 4, 0, 0] = 4
+        profiler.buffer[0, 4, 1, 0] = 100
+        profiler.buffer[0, 4, 1, 1] = 9 | (task_payload << 16)
+        profiler.buffer[0, 4, 2, 0] = 200
+        profiler.buffer[0, 4, 2, 1] = 16 | (wgmma_payload << 16)
+        profiler.buffer[0, 4, 3, 0] = 300
+        profiler.buffer[0, 4, 3, 1] = (
+            16 | (1 << 8) | (wgmma_payload << 16))
+        profiler.buffer[0, 4, 4, 0] = 400
+        profiler.buffer[0, 4, 4, 1] = (
+            9 | (1 << 8) | (task_payload << 16))
+
+        events = profiler.events()
+        issue = events[1]
+        assert issue['name'] == 'wgmma.issue'
+        assert issue['args']['global_expert'] == 161
+        assert issue['args']['m_space'] == 'expert_packed'
+        assert issue['args']['m_start'] == 128
+        assert issue['args']['m_end'] == 165
+        assert issue['args']['n_start'] == 512
+        assert issue['args']['n_end'] == 640
+        assert issue['args']['k_start'] == 960
+        assert issue['args']['k_end'] == 1024
+        assert issue['args']['shape_k'] == 3072
+        assert profiler.summary()['wgmma.issue']['total_us'] == pytest.approx(0.1)
+    finally:
+        _unload_fake_package(package_name)
+
+
+def test_in_kernel_profiler_dispatch_keeps_ep8_hot_expert_m_exact():
+    mega, package_name = _load_mega_api_for_cpu()
+    try:
+        profiler = mega.MegaMoeProfiler(capacity=4, rank=7, device='cpu')
+        profiler.configure_workload(
+            num_tokens=8192, num_ranks=8, num_experts=384, num_topk=6,
+            hidden=7168, intermediate_hidden=3072)
+        select_payload = 17 | (65535 << 9)
+        pull_payload = 8191 | (5 << 32) | (7 << 37)
+        profiler.buffer[0, 1, 0, 0] = 4
+        for record, (timestamp, event, phase, payload) in enumerate((
+            (100, 32, 0, select_payload),
+            (200, 32, 1, select_payload),
+            (300, 5, 0, pull_payload),
+            (400, 5, 1, pull_payload),
+        ), start=1):
+            profiler.buffer[0, 1, record, 0] = timestamp
+            profiler.buffer[0, 1, record, 1] = (
+                event | (phase << 8) | (payload << 16))
+
+        pull = profiler.events()[2]
+        assert pull['args']['coordinates_valid'] is True
+        assert pull['args']['dst_global_expert'] == 353
+        assert pull['args']['dst_m'] == 65535
+        assert pull['args']['src_rank'] == 7
+        assert pull['args']['src_token'] == 8191
+        assert pull['args']['src_topk'] == 5
+        assert pull['display_name'] == (
+            'dispatch.pull r7:t8191:k5 -> E353:M65535')
+    finally:
+        _unload_fake_package(package_name)
+
+
+def test_in_kernel_profiler_dispatch_keeps_full_uint32_token_coordinates():
+    mega, package_name = _load_mega_api_for_cpu()
+    try:
+        profiler = mega.MegaMoeProfiler(capacity=4, rank=7, device='cpu')
+        profiler.configure_workload(
+            num_tokens=100001, num_ranks=8, num_experts=384, num_topk=6,
+            hidden=7168, intermediate_hidden=3072)
+        select_payload = 17 | (1000000 << 9)
+        pull_payload = 100000 | (5 << 32) | (7 << 37)
+        profiler.buffer[0, 1, 0, 0] = 4
+        event_index = mega.MEGA_MOE_EVENT_NAMES.index
+        for record, (timestamp, event, phase, payload) in enumerate((
+            (100, event_index('dispatch.select'), 0, select_payload),
+            (200, event_index('dispatch.select'), 1, select_payload),
+            (300, event_index('dispatch.pull'), 0, pull_payload),
+            (400, event_index('dispatch.pull'), 1, pull_payload),
+        ), start=1):
+            profiler.buffer[0, 1, record, 0] = timestamp
+            profiler.buffer[0, 1, record, 1] = (
+                event | (phase << 8) | (payload << 16))
+
+        pull = profiler.events()[2]
+        assert pull['args']['coordinates_valid'] is True
+        assert pull['args']['dst_m'] == 1000000
+        assert pull['args']['src_token'] == 100000
+        assert pull['display_name'] == (
+            'dispatch.pull r7:t100000:k5 -> E353:M1000000')
+    finally:
+        _unload_fake_package(package_name)
+
+
+def test_in_kernel_profiler_combine_keeps_full_uint32_token_coordinate():
+    mega, package_name = _load_mega_api_for_cpu()
+    try:
+        profiler = mega.MegaMoeProfiler(capacity=1, device='cpu')
+        profiler.configure_workload(
+            num_tokens=100001, num_ranks=1, num_experts=8, num_topk=6,
+            hidden=7168, intermediate_hidden=3072)
+        payload = 100000 | (1 << 32) | (4 << 35) | (5 << 38) | (1 << 44)
+        profiler.buffer[0, 4, 0, 0] = 1
+        profiler.buffer[0, 4, 1, 0] = 100
+        profiler.buffer[0, 4, 1, 1] = (
+            mega.MEGA_MOE_EVENT_NAMES.index('combine.reduce') |
+            (2 << 8) | (payload << 16))
+
+        event = profiler.events()[0]
+        assert event['args']['token'] == 100000
+        assert event['args']['topk_slot'] == 5
+        assert event['args']['hidden_start'] == 1792
+        assert event['args']['hidden_end'] == 3584
+        assert event['display_name'].startswith(
+            'combine.reduce token100000 slot5 H[1792,3584)')
+    finally:
+        _unload_fake_package(package_name)
+
+
+def test_in_kernel_profiler_overflow_never_derives_truncated_coordinates():
+    mega, package_name = _load_mega_api_for_cpu()
+    try:
+        profiler = mega.MegaMoeProfiler(capacity=1, rank=0, device='cpu')
+        profiler.configure_workload(
+            num_tokens=8192, num_ranks=64, num_experts=512, num_topk=8,
+            hidden=7168, intermediate_hidden=3072)
+        overflow_payload = (1 << 47) | 17
+        encoded = 32 | (overflow_payload << 16)
+        if encoded >= 1 << 63:
+            encoded -= 1 << 64
+        profiler.buffer[0, 1, 0, 0] = 1
+        profiler.buffer[0, 1, 1, 0] = 100
+        profiler.buffer[0, 1, 1, 1] = encoded
+
+        args = profiler.events()[0]['args']
+        assert args['payload_overflow'] is True
+        assert args['coordinates_valid'] is False
+        assert args['coordinate_status'] == 'payload_overflow_or_missing_select'
+        assert 'dst_m' not in args
+        assert 'dst_global_expert' not in args
+    finally:
+        _unload_fake_package(package_name)
+
+
+def test_in_kernel_profiler_correlates_scheduler_and_scatter_routes():
+    mega, package_name = _load_mega_api_for_cpu()
+    try:
+        profiler = mega.MegaMoeProfiler(capacity=6, rank=0, device='cpu')
+        profiler.configure_workload(
+            num_tokens=8, num_ranks=8, num_experts=384, num_topk=6,
+            hidden=7168, intermediate_hidden=3072)
+        select_payload = 17 | (16 << 9)
+        pull_payload = 123 | (2 << 32) | (3 << 37)
+        profiler.buffer[0, 1, 0, 0] = 4
+        for record, (event, phase, payload) in enumerate((
+            (32, 0, select_payload), (32, 1, select_payload),
+            (5, 0, pull_payload), (5, 1, pull_payload),
+        ), start=1):
+            profiler.buffer[0, 1, record, 0] = record * 100
+            profiler.buffer[0, 1, record, 1] = (
+                event | (phase << 8) | (payload << 16))
+
+        task_payload = 2 | (17 << 3) | (17 << 38)
+        profiler.buffer[0, 5, 0, 0] = 6
+        for record, (event, phase, payload) in enumerate((
+            (8, 0, 0), (8, 1, 0), (9, 0, task_payload),
+            (22, 0, task_payload), (22, 1, task_payload),
+            (9, 1, task_payload),
+        ), start=1):
+            profiler.buffer[0, 5, record, 0] = 1000 + record * 100
+            profiler.buffer[0, 5, record, 1] = (
+                event | (phase << 8) | (payload << 16))
+
+        events = profiler.events()
+        wait = next(
+            event for event in events
+            if event['name'] == 'scheduler.wait' and event['phase'] == 'B')
+        scatter = next(
+            event for event in events
+            if event['name'] == 'nvlink.scatter' and event['phase'] == 'B')
+        assert wait['args']['next_task'].startswith('L2 E17 M[0,17)')
+        assert wait['display_name'].startswith('scheduler.wait -> L2 E17')
+        assert scatter['args']['scatter_routes_valid'] is True
+        assert scatter['args']['task_m_start'] == 0
+        assert scatter['args']['task_m_end'] == 17
+        assert scatter['args']['scatter_m_start'] == 16
+        assert scatter['args']['scatter_m_end'] == 17
+        assert scatter['args']['scatter_routes'] == 'm16->r3:t123:k2'
+        assert scatter['args']['output_ranks'] == '3'
+        assert scatter['args']['output_tokens'] == '123'
+        assert scatter['args']['output_topk_slots'] == '2'
+        assert '-> ranks[3] routes=1' in scatter['display_name']
+    finally:
+        _unload_fake_package(package_name)
+
+
+def test_in_kernel_profiler_filters_dependencies_and_names_every_event():
+    mega, package_name = _load_mega_api_for_cpu()
+    try:
+        with pytest.raises(ValueError, match='unknown MegaMoE profiler events'):
+            mega.MegaMoeProfiler(
+                capacity=1, device='cpu', event_types=['not.an.event'])
+        profiler = mega.MegaMoeProfiler(
+            capacity=1, device='cpu', event_types=['wgmma.issue'],
+            cta_indices=[0], warp_indices=[4])
+        assert profiler.requested_event_types == ('wgmma.issue',)
+        assert profiler.enabled_event_types == ('kernel', 'task', 'wgmma.issue')
+        expected_mask = (
+            (1 << mega.MEGA_MOE_EVENT_NAMES.index('kernel')) |
+            (1 << mega.MEGA_MOE_EVENT_NAMES.index('task')) |
+            (1 << mega.MEGA_MOE_EVENT_NAMES.index('wgmma.issue'))
+        )
+        assert profiler.event_mask == expected_mask
+        configured_bit = 1 << 63
+        assert int(profiler.buffer[0, 4, 0, 1]) & configured_bit
+        assert int(profiler.buffer[0, 4, 0, 1]) & (configured_bit - 1) == expected_mask
+        assert int(profiler.buffer[0, 0, 0, 1]) & configured_bit
+        assert int(profiler.buffer[0, 0, 0, 1]) & (configured_bit - 1) == 0
+        assert profiler.cta_indices == (0,)
+        assert profiler.warp_indices == (4,)
+        with pytest.raises(ValueError, match=r'cta_indices must be in'):
+            mega.MegaMoeProfiler(
+                capacity=1, device='cpu', cta_indices=[profiler.num_ctas])
+        with pytest.raises(ValueError, match=r'warp_indices must contain'):
+            mega.MegaMoeProfiler(
+                capacity=1, device='cpu', warp_indices=[])
+
+        scatter_profiler = mega.MegaMoeProfiler(
+            capacity=1, device='cpu', event_types=['nvlink.scatter'],
+            cta_indices=[0], warp_indices=[4])
+        event_index = mega.MEGA_MOE_EVENT_NAMES.index
+        route_mask = (
+            (1 << event_index('dispatch.pull')) |
+            (1 << event_index('dispatch.select'))
+        )
+        scatter_mask = (
+            route_mask |
+            (1 << event_index('kernel')) |
+            (1 << event_index('task')) |
+            (1 << event_index('nvlink.scatter'))
+        )
+        low_bits = configured_bit - 1
+        assert int(scatter_profiler.buffer[0, 4, 0, 1]) & low_bits == scatter_mask
+        assert int(scatter_profiler.buffer[-1, 0, 0, 1]) & low_bits == route_mask
+        assert int(scatter_profiler.buffer[-1, 1, 0, 1]) & low_bits == route_mask
+        assert int(scatter_profiler.buffer[-1, 4, 0, 1]) & low_bits == 0
+        assert scatter_profiler.track_dependencies == ({
+            'reason': 'nvlink.scatter_route_join',
+            'event_types': ('dispatch.select', 'dispatch.pull'),
+            'cta_indices': 'all',
+            'warp_indices': (0, 1),
+        },)
+
+        args = {
+            'coordinates_valid': True, 'phase': 'linear1',
+            'expert_kind': 'routed', 'global_expert': 3, 'local_expert': 3,
+            'm_start': 0, 'm_end': 8, 'n_start': 128, 'n_end': 256,
+            'k_start': 0, 'k_end': 128, 'stage': 1, 'expanded_slot': 0,
+            'activation_sf_group': 0, 'output_n_start': 64,
+            'output_n_end': 128, 'num_tokens': 8, 'num_experts': 8,
+            'hidden': 7168, 'token_count': 8, 'route_count': 48,
+            'dst_rank_route_counts': 'R0:48',
+            'workload_scope': 'publish_expert_counts',
+            'dst_rank_expert_counts': 'R0:8', 'participants': 2,
+            'participating_ranks': 8, 'next_task': 'L1 E3 M[0,8)',
+            'src_rank': 0, 'src_token': 1, 'src_topk': 2,
+            'dst_global_expert': 3, 'dst_m': 0, 'barrier': 'compute_stage_full',
+            'output_ranks': '0', 'scatter_route_count': 8,
+            'token_start': 0, 'token_stride': 8, 'token': 1,
+            'topk_slot': 2, 'hidden_start': 0, 'hidden_end': 3584,
         }
-        assert detail_events[2]['name'] == 'epilogue.l1'
-        assert detail_events[2]['args']['phase'] == 'linear1'
-        assert detail_events[2]['args']['expert'] == 3
-        assert detail_events[3]['name'] == 'wgmma.wait'
-        assert detail_events[3]['args']['stage'] == 2
-        assert detail_events[3]['args']['k_block'] == 7
+        for name in mega.MEGA_MOE_EVENT_NAMES:
+            event = {
+                'name': name, 'role': 'math_epilogue.0',
+                'cta': 0, 'warp': 4, 'args': dict(args),
+            }
+            assert profiler._display_name(event) != name
+    finally:
+        _unload_fake_package(package_name)
+
+
+def test_in_kernel_profiler_does_not_call_truncated_wait_end_of_stream():
+    mega, package_name = _load_mega_api_for_cpu()
+    try:
+        profiler = mega.MegaMoeProfiler(capacity=2, device='cpu')
+        profiler.buffer[0, 4, 0, 0] = 3
+        for record, phase in enumerate((0, 1), start=1):
+            profiler.buffer[0, 4, record, 0] = record * 100
+            profiler.buffer[0, 4, record, 1] = 8 | (phase << 8)
+
+        waits = profiler.events()
+        assert len(waits) == 2
+        assert all(
+            event['args']['next_task'] == 'unknown_profiler_truncated'
+            for event in waits)
+        assert all(
+            event['args']['next_task_status'] == 'profiler_truncated'
+            for event in waits)
     finally:
         _unload_fake_package(package_name)
 
@@ -371,10 +734,12 @@ def test_in_kernel_profiler_paths_alignment_and_merge(tmp_path):
         for rank, (timestamp, host_range) in enumerate((
                 (1000, (10000, 14000)),
                 (2000, (11000, 15000)))):
-            profiler = mega.MegaMoeProfiler(capacity=1, rank=rank, device='cpu')
-            profiler.buffer[0, 0, 0, 0] = 1
+            profiler = mega.MegaMoeProfiler(capacity=2, rank=rank, device='cpu')
+            profiler.buffer[0, 0, 0, 0] = 3 if rank == 1 else 2
             profiler.buffer[0, 0, 1, 0] = timestamp
-            profiler.buffer[0, 0, 1, 1] = 2 << 8
+            profiler.buffer[0, 0, 1, 1] = 0
+            profiler.buffer[0, 0, 2, 0] = timestamp + 1000
+            profiler.buffer[0, 0, 2, 1] = 1 << 8
             path = mega.mega_moe_rank_trace_path(trace_template, rank, 2)
             profiler.export_chrome_trace(
                 path, host_time_range_ns=host_range)
@@ -391,11 +756,39 @@ def test_in_kernel_profiler_paths_alignment_and_merge(tmp_path):
         merged = __import__('json').loads(merged_path.read_text())
         timed_events = [
             event for event in merged['traceEvents'] if 'ts' in event]
-        assert [event['pid'] for event in timed_events] == [0, 1]
-        assert [event['ts'] for event in timed_events] == [0.0, 1.0]
-        assert merged['deep_gemm']['format'] == 'mega_moe_in_kernel_merged_v2'
+        assert [event['pid'] for event in timed_events] == [0, 0, 1, 1]
+        assert [event['ts'] for event in timed_events] == [0.0, 1.0, 1.0, 2.0]
+        assert merged['deep_gemm']['format'] == 'mega_moe_in_kernel_merged_v5'
         assert merged['deep_gemm']['num_ranks'] == 2
-        assert merged['deep_gemm']['max_uncertainty_ns'] == 2000
+        assert merged['deep_gemm']['max_uncertainty_ns'] == 1500
+        assert merged['deep_gemm']['truncation'] == {
+            'attempted': 5,
+            'retained': 4,
+            'dropped': 1,
+            'truncated_tracks': 1,
+            'counts_are_lower_bounds': True,
+        }
+    finally:
+        _unload_fake_package(package_name)
+
+
+def test_in_kernel_profiler_marks_incomplete_kernel_alignment_unreliable(tmp_path):
+    mega, package_name = _load_mega_api_for_cpu()
+    try:
+        profiler = mega.MegaMoeProfiler(capacity=1, device='cpu')
+        profiler.buffer[0, 4, 0, 0] = 2
+        profiler.buffer[0, 4, 1, 0] = 1000
+        profiler.buffer[0, 4, 1, 1] = 0
+        path = profiler.export_chrome_trace(
+            tmp_path / 'incomplete.json', host_time_range_ns=(10000, 20000))
+        trace = __import__('json').loads(path.read_text())
+        alignment = trace['deep_gemm']['clock_alignment']
+        assert alignment['mode'] == (
+            'host_monotonic_midpoint_incomplete_kernel')
+        assert alignment['kernel_interval_complete'] is False
+        assert alignment['uncertainty_ns'] == 5000
+        with pytest.raises(ValueError, match='complete kernel intervals'):
+            mega.merge_mega_moe_chrome_traces([path, path], tmp_path / 'bad.json')
     finally:
         _unload_fake_package(package_name)
 

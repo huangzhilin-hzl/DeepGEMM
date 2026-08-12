@@ -245,8 +245,78 @@ mapped to the host monotonic clock using the midpoint of its launch/synchronize
 bracket, and rank 0 also writes a merged trace with `merged` substituted for
 `{rank}`. The `clock_alignment.uncertainty_ns` metadata quantifies the mapping's
 host-side uncertainty; use Nsight Systems when tighter cross-GPU alignment is
-required. Increase `--in-kernel-trace-capacity` if the exported metadata reports
-dropped events.
+required. Merge requires a complete retained `kernel` Begin/End interval on
+every rank. A truncated interval is marked
+`host_monotonic_midpoint_incomplete_kernel` and is never silently merged.
+Increase `--in-kernel-trace-capacity` if the exported metadata reports dropped
+events.
+
+Trace format v5 stores a 48-bit payload in the unused upper bits of the existing
+two-word event record, so richer workload metadata does not increase the
+profiler buffer. Every Perfetto slice has a workload-specific title rather than
+only an event type. For example, a WGMMA slice is named with its phase, global
+expert, M/N tile, exact K interval, pipeline stage, and expanded-B slot. The
+stable event type remains available as the trace category and `event_type` arg.
+Each CTA/warp track carries its current `task` context forward to nested events,
+and `scheduler.wait` is annotated with the Task it ultimately acquired.
+
+Routed GEMM M uses the `expert_packed` coordinate space, not the source rank's
+original token index. A `dispatch.select` range records the exact destination
+expert/M, and the following `dispatch.pull` inherits that destination while
+recording `(src_rank, src_token, src_topk)`. This maps the source route to
+`(dst_rank, dst_global_expert, dst_m)` without duplicating fields in the 48-bit
+payload. The destination M field retains the full uint32 workspace coordinate,
+covering the 64-rank by 8192-token hotspot without imposing that benchmark size
+as an API limit; source token IDs are also stored as uint32. `nvlink.scatter` events
+are joined against these pull records and expose every output rank/token/top-k
+destination for the 16-row stripe owned by that math warp. If any payload does
+overflow, `coordinates_valid=false` prevents masked fields from being presented
+as exact coordinates.
+
+For high-load traces, select only the event families being investigated. Task
+and dispatch correlation dependencies are enabled automatically:
+
+```bash
+python tests/bench_mega_moe_sm90.py \
+  --num-processes 1 --no-dist \
+  --model-config pro --batches 8192 --num-experts-override 8 \
+  --profile-only --in-kernel-trace /tmp/megamoe.json \
+  --in-kernel-trace-events wgmma.issue wgmma.wait pipeline.wait \
+  --in-kernel-trace-ctas 0 --in-kernel-trace-warps 4
+```
+
+The CTA/warp selectors disable unselected device tracks before any
+`%globaltimer` read. Warp indices `0-3` are producer roles and `4-7` are the
+four math/epilogue roles, so selecting one math warp is useful for inspecting a
+single WGMMA pipeline without producing hundreds of thousands of duplicate
+tile events. Filtered traces always retain `kernel` begin/end records for clock
+alignment. A filtered `nvlink.scatter` trace also retains only
+`dispatch.select/pull` on producer warps 0/1 across all CTAs so route joins stay
+complete; these additions are listed in `track_dependencies` metadata.
+
+When a track reaches capacity, it writes one truncation sentinel and stops
+reading `%globaltimer`; `attempted` and `dropped` are lower bounds whenever
+`counts_are_lower_bounds=true`.
+
+| Event ranges | Workload details visible in Perfetto |
+| --- | --- |
+| `kernel`, `setup` | Rank, CTA/warp role, token/rank/expert/top-k counts, H/I dimensions, and the 64x128x128 GEMM tile shape. |
+| `dispatch.count`, `dispatch.pack` | Exact local token/route counts plus global-expert and destination-rank distributions for the CTA/warp's persistent partition. |
+| `grid_barrier`, `dispatch.put`, `dispatch.nvlink`, `dispatch.cleanup` | Grid participant count, the exact expert/rank subset published by CTA0 or `sync_only`, cross-rank barrier participants, and cleanup generation scope. |
+| `dispatch.select` | Destination rank, local/global expert, exact uint32 expert-packed M, coordinate validity, and overflow status. |
+| `dispatch.pull` | Exact source rank/original token/top-k route and exact destination rank/local/global expert/expert-packed M. |
+| `scheduler.wait` | The exact phase/expert/M/N Task returned by the wait, or `end_of_stream`. |
+| `task`, `l1_dependency.wait` | Phase, routed/shared expert identity, valid M rows, M/N tile, N/K matrix shape, and logical coordinate spaces. |
+| `tma.activation`, `tma.activation_scale`, `tma.weight`, `weight_scale.load`, `pipeline.wait` | Inherited task M/N/expert context plus pipeline stage, K block, and K128 range. |
+| `mxfp4.decode` | Inherited task coordinates, packed K128 block, pipeline stage, and expanded-B slot. |
+| `wgmma.issue`, `wgmma.wait` | Inherited task expert/M/N plus exact K32 start/count and resulting global K interval, stage, expanded-B slot, and accumulate mode. |
+| `scale.promote` | Task M/N/expert context and the exact activation scale-factor K group being promoted. |
+| `epilogue.l1`, `swiglu.quantize`, `tma.store_l1` | L1 task M tile, gate/up-interleaved N tile, and corresponding post-SwiGLU output-N interval. |
+| `epilogue.l2`, `nvlink.scatter` | L2 task M/N tile plus each math warp's exact 16-row stripe and resolved per-row output rank/token/top-k destinations. |
+| `combine.nvlink`, `combine` | Cross-rank combine barrier plus each CTA/warp's local output-token start/stride and full hidden width. |
+| `combine.tma_issue`, `combine.tma_wait`, `combine.reduce` | Exact uint32 original output token, top-k/shared slot, hidden chunk index/count, and exact hidden interval. |
+| `combine.tma_store` | Exact uint32 original output token and output hidden chunk interval. |
+
 Instrumentation uses a separate JIT specialization; normal calls that do not
 pass a `MegaMoeProfiler` compile out all device-side event operations.
 

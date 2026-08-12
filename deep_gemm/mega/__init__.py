@@ -24,6 +24,7 @@ except Exception as exception:
 
 from .. import _C
 from .profiler import (
+    MEGA_MOE_EVENT_NAMES as MEGA_MOE_EVENT_NAMES,
     MegaMoeProfiler,
     create_mega_moe_profiler as create_mega_moe_profiler,
     mega_moe_rank_trace_path as mega_moe_rank_trace_path,
@@ -446,6 +447,18 @@ def fp8_mxfp4_mega_moe(y: torch.Tensor,
                 f'and {expected_shared_l2_shape}, got '
                 f'{tuple(shared_l1_weights[0].shape)} and '
                 f'{tuple(shared_l2_weights[0].shape)}')
+    if profiler is not None:
+        topk_idx = getattr(sym_buffer, 'topk_idx', None)
+        profiler.configure_workload(
+            num_tokens=y.size(0),
+            num_ranks=num_ranks,
+            num_experts=sym_buffer.num_experts,
+            num_topk=sym_buffer.num_topk,
+            hidden=sym_buffer.hidden,
+            intermediate_hidden=sym_buffer.intermediate_hidden,
+            num_shared_experts=num_shared_experts,
+            topk_idx=None if topk_idx is None else topk_idx[:y.size(0)],
+        )
     try:
         op = _C.fp8_mxfp4_mega_moe
     except AttributeError as exception:

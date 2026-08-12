@@ -364,7 +364,10 @@ static void sm90_mega_moe(
                        buffer.size(0) == 2 * device_runtime->get_num_sms() and
                        buffer.size(1) == kNumKernelWarps and
                        buffer.size(2) >= 2 and buffer.size(3) == 2);
-        buffer.zero_();
+        // The Python profiler has already reset the buffer and armed each
+        // track's header word 1 with its event mask. Every launched warp resets
+        // its own count and placement, so clearing here would only erase that
+        // launch configuration.
     }
 
     // Check buffer bytes

@@ -290,6 +290,9 @@ def _benchmark_case(
             deep_gemm.create_mega_moe_profiler(
                 capacity=args.in_kernel_trace_capacity,
                 rank=rank_idx,
+                event_types=args.in_kernel_trace_events,
+                cta_indices=args.in_kernel_trace_ctas,
+                warp_indices=args.in_kernel_trace_warps,
             )
             if args.in_kernel_trace is not None
             else None
@@ -348,6 +351,9 @@ def _benchmark_case(
             "activation_clamp": args.activation_clamp,
             "masked_ratio": args.masked_ratio,
             "seed": args.seed,
+            "in_kernel_trace_events": args.in_kernel_trace_events,
+            "in_kernel_trace_ctas": args.in_kernel_trace_ctas,
+            "in_kernel_trace_warps": args.in_kernel_trace_warps,
         }
 
         if args.profile_only:
@@ -632,6 +638,29 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=4096,
         help="maximum retained events per CTA/warp track",
+    )
+    parser.add_argument(
+        "--in-kernel-trace-events",
+        nargs="+",
+        default=None,
+        help=(
+            "event types to retain; dependencies such as task and dispatch.select "
+            "are enabled automatically (default: all events)"
+        ),
+    )
+    parser.add_argument(
+        "--in-kernel-trace-ctas",
+        nargs="+",
+        type=int,
+        default=None,
+        help="CTA indices to retain (default: every persistent CTA)",
+    )
+    parser.add_argument(
+        "--in-kernel-trace-warps",
+        nargs="+",
+        type=int,
+        default=None,
+        help="warp indices to retain, 0-7 (default: every warp)",
     )
     args = parser.parse_args()
 
