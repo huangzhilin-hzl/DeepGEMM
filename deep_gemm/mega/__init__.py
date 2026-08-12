@@ -23,6 +23,13 @@ except Exception as exception:
     print(f'Failed to load mega kernels, please check your PyTorch version: {exception}')
 
 from .. import _C
+from .profiler import (
+    MegaMoeProfiler,
+    create_mega_moe_profiler as create_mega_moe_profiler,
+    mega_moe_rank_trace_path as mega_moe_rank_trace_path,
+    mega_moe_merged_trace_path as mega_moe_merged_trace_path,
+    merge_mega_moe_chrome_traces as merge_mega_moe_chrome_traces,
+)
 
 
 class SymmBuffer:
@@ -335,7 +342,8 @@ def fp8_mxfp4_mega_moe(y: torch.Tensor,
                        activation_clamp: Optional[float] = None,
                        fast_math: bool = True,
                        fp8_scale_mode: str = 'blockwise',
-                       activation_dequant_scales: Tuple[float, float] = (1.0, 1.0)):
+                       activation_dequant_scales: Tuple[float, float] = (1.0, 1.0),
+                       profiler: Optional[MegaMoeProfiler] = None):
     """Run the SM90 Humming-compatible MXFP4 MegaMoE path.
 
     Routed weights must be processed triples
@@ -380,6 +388,23 @@ def fp8_mxfp4_mega_moe(y: torch.Tensor,
             for scale in activation_dequant_scales):
         raise ValueError(
             'activation_dequant_scales must contain two positive finite values')
+    if profiler is not None:
+        if not isinstance(profiler, MegaMoeProfiler):
+            raise TypeError('profiler must be a MegaMoeProfiler or None')
+        if profiler.rank != sym_buffer.group.rank():
+            raise ValueError(
+                f'profiler rank {profiler.rank} does not match process-group '
+                f'rank {sym_buffer.group.rank()}')
+        if profiler.buffer.device != y.device:
+            raise ValueError(
+                f'profiler device {profiler.buffer.device} does not match '
+                f'output device {y.device}')
+        expected_num_ctas = 2 * int(_C.get_num_sms())
+        if profiler.num_ctas != expected_num_ctas:
+            raise ValueError(
+                'profiler CTA count no longer matches the configured SM count; '
+                'create the profiler after calling set_num_sms')
+        profiler.reset()
     _validate_processed_mxfp4_kernel_weights(l1_weights, l2_weights)
     num_ranks = sym_buffer.group.size()
     if sym_buffer.num_experts % num_ranks != 0:
@@ -442,6 +467,7 @@ def fp8_mxfp4_mega_moe(y: torch.Tensor,
         fast_math,
         fp8_scale_mode,
         tuple(float(scale) for scale in activation_dequant_scales),
+        None if profiler is None else profiler.buffer,
     )
 
 def bf16_mega_moe(y: torch.Tensor,

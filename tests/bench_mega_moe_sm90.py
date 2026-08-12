@@ -16,6 +16,7 @@ import os
 import random
 import statistics
 import sys
+import time
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -285,6 +286,14 @@ def _benchmark_case(
         cumulative_recv_stats = torch.zeros(
             num_local_experts, dtype=torch.int32, device="cuda"
         )
+        in_kernel_profiler = (
+            deep_gemm.create_mega_moe_profiler(
+                capacity=args.in_kernel_trace_capacity,
+                rank=rank_idx,
+            )
+            if args.in_kernel_trace is not None
+            else None
+        )
 
         if num_shared_experts > 0:
             assert buffer.shared_l1_acts_sf is not None
@@ -316,6 +325,7 @@ def _benchmark_case(
                     args.fc1_activation_dequant_scale,
                     args.fc2_activation_dequant_scale,
                 ),
+                profiler=in_kernel_profiler,
             )
             return output
 
@@ -343,9 +353,47 @@ def _benchmark_case(
         if args.profile_only:
             if rank_idx == 0:
                 _emit_json("PROFILE_CASE_JSON", case_metadata)
+            _barrier(group)
+            host_begin_ns = time.monotonic_ns()
             run_kernel()
             torch.cuda.synchronize()
+            host_end_ns = time.monotonic_ns()
+            if in_kernel_profiler is not None:
+                trace_path = deep_gemm.mega_moe_rank_trace_path(
+                    args.in_kernel_trace, rank_idx, num_ranks)
+                in_kernel_profiler.export_chrome_trace(
+                    trace_path,
+                    host_time_range_ns=(host_begin_ns, host_end_ns)
+                    if num_ranks > 1
+                    else None,
+                )
+                export_metadata = in_kernel_profiler.last_export_metadata
+                _emit_json(
+                    "IN_KERNEL_TRACE_JSON",
+                    {
+                        "rank": rank_idx,
+                        "path": os.path.abspath(trace_path),
+                        "clock_alignment": export_metadata["clock_alignment"],
+                        **export_metadata["truncation"],
+                    },
+                )
             _barrier(group)
+            if in_kernel_profiler is not None and num_ranks > 1:
+                if rank_idx == 0:
+                    rank_paths = [
+                        deep_gemm.mega_moe_rank_trace_path(
+                            args.in_kernel_trace, rank, num_ranks)
+                        for rank in range(num_ranks)
+                    ]
+                    merged_path = deep_gemm.mega_moe_merged_trace_path(
+                        args.in_kernel_trace, num_ranks)
+                    deep_gemm.merge_mega_moe_chrome_traces(
+                        rank_paths, merged_path)
+                    _emit_json(
+                        "IN_KERNEL_MERGED_TRACE_JSON",
+                        {"path": os.path.abspath(merged_path)},
+                    )
+                _barrier(group)
             return
 
         for _ in range(args.num_warmups):
@@ -570,6 +618,21 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="launch exactly one selected case without Kineto timing",
     )
+    parser.add_argument(
+        "--in-kernel-trace",
+        type=str,
+        default=None,
+        help=(
+            "export the instrumented MegaMoE warp timeline as Chrome trace JSON; "
+            "use {rank} in the path for multi-rank runs"
+        ),
+    )
+    parser.add_argument(
+        "--in-kernel-trace-capacity",
+        type=int,
+        default=4096,
+        help="maximum retained events per CTA/warp track",
+    )
     args = parser.parse_args()
 
     if args.num_processes <= 0:
@@ -602,6 +665,10 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--masked-ratio must be between 0 and 1")
     if args.profile_only and (len(args.model_config) != 1 or len(args.batches) != 1):
         parser.error("--profile-only requires exactly one --model-config and one batch")
+    if args.in_kernel_trace is not None and not args.profile_only:
+        parser.error("--in-kernel-trace requires --profile-only")
+    if args.in_kernel_trace_capacity <= 0:
+        parser.error("--in-kernel-trace-capacity must be positive")
     if not args.profile_only and int(os.environ.get("DG_USE_NVIDIA_TOOLS", 0)):
         parser.error(
             "DG_USE_NVIDIA_TOOLS disables Kineto timing; use --profile-only "

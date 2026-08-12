@@ -224,6 +224,32 @@ oracle smoke test with:
 python tests/test_mega_moe_sm90.py --num-processes 8 --suite smoke
 ```
 
+The SM90 persistent kernel also supports IKET-style in-kernel event tracing.
+The profiler records the eight warp roles separately and includes dispatch,
+scheduler waits, TMA producers, MXFP4 decode, WGMMA issue/completion waits,
+scale promotion, L1/L2 epilogues, NVLink scatter, and combine TMA
+issue/wait/reduction. Generate a Chrome trace JSON and open it directly in
+[Perfetto](https://ui.perfetto.dev/):
+
+```bash
+python tests/bench_mega_moe_sm90.py \
+  --num-processes 1 --no-dist \
+  --model-config flash --batches 128 \
+  --num-experts-override 8 \
+  --profile-only \
+  --in-kernel-trace /tmp/megamoe.json
+```
+
+For multi-rank profiling, put `{rank}` in the output path. Each rank trace is
+mapped to the host monotonic clock using the midpoint of its launch/synchronize
+bracket, and rank 0 also writes a merged trace with `merged` substituted for
+`{rank}`. The `clock_alignment.uncertainty_ns` metadata quantifies the mapping's
+host-side uncertainty; use Nsight Systems when tighter cross-GPU alignment is
+required. Increase `--in-kernel-trace-capacity` if the exported metadata reports
+dropped events.
+Instrumentation uses a separate JIT specialization; normal calls that do not
+pass a `MegaMoeProfiler` compile out all device-side event operations.
+
 #### Utilities
 
 The library provides some utility functions besides the above kernels:

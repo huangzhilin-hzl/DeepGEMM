@@ -47,6 +47,7 @@ public:
         float activation_clamp;
         bool fast_math;
         bool per_tensor_activation_scale;
+        bool enable_profiler;
         MegaMoESM90Config config;
 
         // Runtime arguments. num_tokens also selects compile-time MXFP4
@@ -58,6 +59,8 @@ public:
         float l1_activation_dequant_scale;
         float l2_activation_dequant_scale;
         layout::SymBuffer<> sym_buffer_ptrs;
+        uint64_t* profiler_buffer;
+        uint32_t profiler_capacity;
 
         // Tensormaps for activations and weights. The B producer can stage
         // MXFP4 relative-scale bytes with ordinary global/shared instructions
@@ -132,7 +135,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
-        {}, {}, {}
+        {}, {}, {}, {}
     >);
 }};
 )",
@@ -149,7 +152,8 @@ static void __instantiate_kernel() {{
     overlap_mxfp4_scale_path ? "true" : "false",
     use_prmt_mxfp4_exponent ? "true" : "false",
     use_incremental_mxfp4_descriptor ? "true" : "false",
-    args.num_ring_tokens, args.num_sf_ring_tokens, args.num_shared_experts);
+    args.num_ring_tokens, args.num_sf_ring_tokens, args.num_shared_experts,
+    args.enable_profiler ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -209,7 +213,9 @@ static void __instantiate_kernel() {{
             args.tensor_map_shared_l2_acts,
             args.tensor_map_shared_l2_acts_sf,
             args.tensor_map_shared_l2_weights,
-            args.shared_l2_weights_sf
+            args.shared_l2_weights_sf,
+            args.profiler_buffer,
+            args.profiler_capacity
         ));
     }
 };
@@ -237,7 +243,8 @@ static void sm90_fp8_mxfp4_mega_moe(
     const float& l1_activation_dequant_scale,
     const float& l2_activation_dequant_scale,
     const torch::Tensor& l1_mxfp4_secondary,
-    const torch::Tensor& l2_mxfp4_secondary
+    const torch::Tensor& l2_mxfp4_secondary,
+    const std::optional<torch::Tensor>& profiler_buffer
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -245,6 +252,11 @@ static void sm90_fp8_mxfp4_mega_moe(
     const auto num_sf_ring_tokens = static_cast<int>(l1_acts_sf.size(0));
     const auto shared_intermediate_hidden =
         intermediate_hidden * num_shared_experts;
+    const bool enable_profiler = profiler_buffer.has_value();
+    auto* profiler_buffer_ptr = enable_profiler ?
+        reinterpret_cast<uint64_t*>(profiler_buffer->data_ptr<int64_t>()) : nullptr;
+    const uint32_t profiler_capacity = enable_profiler ?
+        static_cast<uint32_t>(profiler_buffer->size(2) - 1) : 0u;
     DG_HOST_ASSERT(num_shared_experts >= 0);
     DG_HOST_ASSERT(num_shared_experts == 0 or
                    (shared_l1_acts.defined() and shared_l1_acts_sf.defined() and
@@ -411,6 +423,7 @@ static void sm90_fp8_mxfp4_mega_moe(
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
         .per_tensor_activation_scale = per_tensor_activation_scale,
+        .enable_profiler = enable_profiler,
         .config = persistent_config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
@@ -418,6 +431,8 @@ static void sm90_fp8_mxfp4_mega_moe(
         .l1_activation_dequant_scale = l1_activation_dequant_scale,
         .l2_activation_dequant_scale = l2_activation_dequant_scale,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
+        .profiler_buffer = profiler_buffer_ptr,
+        .profiler_capacity = profiler_capacity,
         .tensor_map_l1_acts = tensor_map_l1_acts,
         .tensor_map_l1_acts_sf = tensor_map_l1_acts_sf,
         .tensor_map_l1_weights = tensor_map_l1_weights,

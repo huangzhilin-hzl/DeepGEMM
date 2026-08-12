@@ -197,7 +197,8 @@ static void sm90_mega_moe(
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math,
     const std::string& fp8_scale_mode,
-    const std::tuple<float, float>& activation_dequant_scales
+    const std::tuple<float, float>& activation_dequant_scales,
+    const std::optional<torch::Tensor>& profiler_buffer
 ) {
     const auto [l1_weights, l1_mxfp4_weights_sf, l1_mxfp4_secondary] = l1_weights_tuple;
     const auto [l2_weights, l2_mxfp4_weights_sf, l2_mxfp4_secondary] = l2_weights_tuple;
@@ -353,6 +354,18 @@ static void sm90_mega_moe(
                        num_experts_per_rank);
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_contiguous());
     }
+    if (profiler_buffer.has_value()) {
+        constexpr int kNumKernelWarps = 8;
+        const auto& buffer = profiler_buffer.value();
+        DG_HOST_ASSERT(buffer.is_cuda() and buffer.device() == y.device());
+        DG_HOST_ASSERT(buffer.scalar_type() == torch::kInt64 and
+                       buffer.is_contiguous());
+        DG_HOST_ASSERT(buffer.dim() == 4 and
+                       buffer.size(0) == 2 * device_runtime->get_num_sms() and
+                       buffer.size(1) == kNumKernelWarps and
+                       buffer.size(2) >= 2 and buffer.size(3) == 2);
+        buffer.zero_();
+    }
 
     // Check buffer bytes
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
@@ -405,7 +418,8 @@ static void sm90_mega_moe(
                             per_tensor_activation_scale,
                             l1_activation_dequant_scale,
                             l2_activation_dequant_scale,
-                            l1_mxfp4_secondary, l2_mxfp4_secondary);
+                            l1_mxfp4_secondary, l2_mxfp4_secondary,
+                            profiler_buffer);
 
     if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();
@@ -427,7 +441,8 @@ static void fp8_mxfp4_mega_moe(
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math,
     const std::string& fp8_scale_mode,
-    const std::tuple<float, float>& activation_dequant_scales) {
+    const std::tuple<float, float>& activation_dequant_scales,
+    const std::optional<torch::Tensor>& profiler_buffer) {
     sm90_mega_moe(
         y, l1_weights_tuple, l2_weights_tuple,
         shared_l1_weights_tuple_opt, shared_l2_weights_tuple_opt,
@@ -435,7 +450,7 @@ static void fp8_mxfp4_mega_moe(
         sym_buffer, sym_buffer_ptrs, rank_idx,
         num_max_tokens_per_rank, num_experts, num_topk,
         recipe, activation, activation_clamp_opt, fast_math,
-        fp8_scale_mode, activation_dequant_scales);
+        fp8_scale_mode, activation_dequant_scales, profiler_buffer);
 }
 
 static void register_sm90_apis(pybind11::module_& m) {

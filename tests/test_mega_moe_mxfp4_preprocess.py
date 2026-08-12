@@ -38,7 +38,7 @@ def _load_mega_api_for_cpu():
     package_name = '_deep_gemm_sm90_api_contract'
     package = types.ModuleType(package_name)
     package.__path__ = [str(_MODULE_PATH.parents[1])]
-    package._C = types.SimpleNamespace()
+    package._C = types.SimpleNamespace(get_num_sms=lambda: 1)
     utils = types.ModuleType(f'{package_name}.utils')
     utils.__path__ = [str(_MODULE_PATH.parents[1] / 'utils')]
     math_module = types.ModuleType(f'{package_name}.utils.math')
@@ -289,6 +289,154 @@ def test_explicit_wrapper_rejects_the_sm100_buffer_abi_before_launch():
         _unload_fake_package(package_name)
 
 
+def test_in_kernel_profiler_decodes_ranges_and_reports_truncation(tmp_path):
+    mega, package_name = _load_mega_api_for_cpu()
+    try:
+        profiler = mega.MegaMoeProfiler(capacity=2, rank=0, device='cpu')
+        payload = 1 | (3 << 3) | (4 << 12) | (5 << 22)
+        profiler.buffer[0, 4, 0, 0] = 3
+        profiler.buffer[0, 4, 0, 1] = 7
+        profiler.buffer[0, 4, 1, 0] = 1000
+        profiler.buffer[0, 4, 1, 1] = 9 | (payload << 16)
+        profiler.buffer[0, 4, 2, 0] = 5000
+        profiler.buffer[0, 4, 2, 1] = 9 | (1 << 8) | (payload << 16)
+
+        events = profiler.events()
+        assert [event['phase'] for event in events] == ['B', 'E']
+        assert events[0]['args']['phase'] == 'linear1'
+        assert events[0]['args']['expert'] == 3
+        assert events[0]['args']['m_block'] == 4
+        assert events[0]['args']['n_block'] == 5
+        assert profiler.summary()['task']['total_us'] == pytest.approx(4.0)
+        assert profiler.truncation()['dropped'] == 1
+
+        snapshot_calls = 0
+        original_snapshot = profiler._snapshot
+
+        def counted_snapshot():
+            nonlocal snapshot_calls
+            snapshot_calls += 1
+            return original_snapshot()
+
+        profiler._snapshot = counted_snapshot
+        trace_path = profiler.export_chrome_trace(tmp_path / 'trace.json')
+        trace = __import__('json').loads(trace_path.read_text())
+        assert snapshot_calls == 1
+        assert trace['deep_gemm']['format'] == 'mega_moe_in_kernel_v2'
+        assert trace['deep_gemm']['truncation']['truncated_tracks'] == 1
+        assert profiler.last_export_metadata['truncation']['dropped'] == 1
+
+        detail_profiler = mega.MegaMoeProfiler(capacity=4, rank=0, device='cpu')
+        combine_payload = 9 | (2 << 16) | (3 << 24)
+        pipeline_payload = 1 | (2 << 3) | (7 << 5) | (9 << 17)
+        detail_profiler.buffer[0, 1, 0, 0] = 4
+        detail_profiler.buffer[0, 1, 1, 0] = 100
+        detail_profiler.buffer[0, 1, 1, 1] = 5 | (2 << 8) | (123 << 16)
+        detail_profiler.buffer[0, 1, 2, 0] = 200
+        detail_profiler.buffer[0, 1, 2, 1] = (
+            26 | (2 << 8) | (combine_payload << 16)
+        )
+        detail_profiler.buffer[0, 1, 3, 0] = 300
+        detail_profiler.buffer[0, 1, 3, 1] = 18 | (2 << 8) | (payload << 16)
+        detail_profiler.buffer[0, 1, 4, 0] = 400
+        detail_profiler.buffer[0, 1, 4, 1] = (
+            30 | (2 << 8) | (pipeline_payload << 16)
+        )
+        detail_events = detail_profiler.events()
+        assert detail_events[0]['args']['token'] == 123
+        assert detail_events[1]['args'] == {
+            'payload': combine_payload,
+            'token': 9,
+            'chunk': 2,
+            'slot': 3,
+        }
+        assert detail_events[2]['name'] == 'epilogue.l1'
+        assert detail_events[2]['args']['phase'] == 'linear1'
+        assert detail_events[2]['args']['expert'] == 3
+        assert detail_events[3]['name'] == 'wgmma.wait'
+        assert detail_events[3]['args']['stage'] == 2
+        assert detail_events[3]['args']['k_block'] == 7
+    finally:
+        _unload_fake_package(package_name)
+
+
+def test_in_kernel_profiler_paths_alignment_and_merge(tmp_path):
+    mega, package_name = _load_mega_api_for_cpu()
+    try:
+        with pytest.raises(ValueError, match='capacity must be positive'):
+            mega.MegaMoeProfiler(capacity=0, device='cpu')
+
+        trace_template = tmp_path / 'trace.{rank}.json'
+        paths = []
+        for rank, (timestamp, host_range) in enumerate((
+                (1000, (10000, 14000)),
+                (2000, (11000, 15000)))):
+            profiler = mega.MegaMoeProfiler(capacity=1, rank=rank, device='cpu')
+            profiler.buffer[0, 0, 0, 0] = 1
+            profiler.buffer[0, 0, 1, 0] = timestamp
+            profiler.buffer[0, 0, 1, 1] = 2 << 8
+            path = mega.mega_moe_rank_trace_path(trace_template, rank, 2)
+            profiler.export_chrome_trace(
+                path, host_time_range_ns=host_range)
+            paths.append(path)
+
+        assert paths == [
+            tmp_path / 'trace.0.json', tmp_path / 'trace.1.json']
+        assert mega.mega_moe_rank_trace_path(
+            tmp_path / 'plain', 1, 2) == tmp_path / 'plain.rank1.json'
+        assert mega.mega_moe_merged_trace_path(
+            tmp_path / 'plain', 2) == tmp_path / 'plain.json'
+        merged_path = mega.mega_moe_merged_trace_path(trace_template, 2)
+        mega.merge_mega_moe_chrome_traces(paths, merged_path)
+        merged = __import__('json').loads(merged_path.read_text())
+        timed_events = [
+            event for event in merged['traceEvents'] if 'ts' in event]
+        assert [event['pid'] for event in timed_events] == [0, 1]
+        assert [event['ts'] for event in timed_events] == [0.0, 1.0]
+        assert merged['deep_gemm']['format'] == 'mega_moe_in_kernel_merged_v2'
+        assert merged['deep_gemm']['num_ranks'] == 2
+        assert merged['deep_gemm']['max_uncertainty_ns'] == 2000
+    finally:
+        _unload_fake_package(package_name)
+
+
+def test_in_kernel_profiler_validates_rank_device_and_sm_configuration():
+    mega, package_name = _load_mega_api_for_cpu()
+
+    class FakeGroup:
+        @staticmethod
+        def size():
+            return 1
+
+        @staticmethod
+        def rank():
+            return 0
+
+    buffer = mega.SM90SymmBuffer.__new__(mega.SM90SymmBuffer)
+    buffer.group = FakeGroup()
+    buffer.num_shared_experts = 0
+    y = torch.empty(1)
+    try:
+        wrong_rank = mega.MegaMoeProfiler(capacity=1, rank=1, device='cpu')
+        with pytest.raises(ValueError, match='does not match process-group rank'):
+            mega.fp8_mxfp4_mega_moe(y, (), (), buffer, profiler=wrong_rank)
+
+        wrong_device = mega.MegaMoeProfiler(capacity=1, rank=0, device='cpu')
+        wrong_device.buffer = torch.empty(
+            wrong_device.buffer.shape, dtype=torch.int64, device='meta')
+        with pytest.raises(ValueError, match='does not match output device'):
+            mega.fp8_mxfp4_mega_moe(y, (), (), buffer, profiler=wrong_device)
+
+        wrong_num_ctas = mega.MegaMoeProfiler(
+            capacity=1, rank=0, device='cpu')
+        wrong_num_ctas.num_ctas += 1
+        with pytest.raises(ValueError, match='configured SM count'):
+            mega.fp8_mxfp4_mega_moe(
+                y, (), (), buffer, profiler=wrong_num_ctas)
+    finally:
+        _unload_fake_package(package_name)
+
+
 def test_explicit_wrapper_rejects_wrong_local_expert_shard_before_launch():
     mega, package_name = _load_mega_api_for_cpu()
 
@@ -340,29 +488,33 @@ def test_explicit_wrapper_forwards_only_processed_triples():
         mega.transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
             checkpoint_l1, checkpoint_l2))
     mega._C = types.SimpleNamespace(
+        get_num_sms=lambda: 1,
         fp8_mxfp4_mega_moe=lambda *args: calls.append(args))
-    y = object()
+    y = torch.empty(1)
+    profiler = mega.MegaMoeProfiler(capacity=1, rank=0, device='cpu')
     try:
         mega.fp8_mxfp4_mega_moe(
             y, processed_l1, processed_l2, buffer,
             recipe=(1, 1, 32), activation='swiglu',
             activation_clamp=10.0, fast_math=False,
             fp8_scale_mode='per_tensor',
-            activation_dequant_scales=(0.5, 0.25))
+            activation_dequant_scales=(0.5, 0.25),
+            profiler=profiler)
     finally:
         _unload_fake_package(package_name)
 
     assert len(calls) == 1
     args = calls[0]
-    assert len(args) == 18
+    assert len(args) == 19
     assert args[0] is y
     assert args[1] is processed_l1 and len(args[1]) == 3
     assert args[2] is processed_l2 and len(args[2]) == 3
     assert args[3] is None and args[4] is None
     assert args[7] == [0x1234]
     assert args[12] == (1, 1, 32)
-    assert args[13:] == (
+    assert args[13:-1] == (
         'swiglu', 10.0, False, 'per_tensor', (0.5, 0.25))
+    assert args[-1] is profiler.buffer
 
 
 def test_sm90_buffer_uses_dedicated_alignment_and_twelve_view_abi():

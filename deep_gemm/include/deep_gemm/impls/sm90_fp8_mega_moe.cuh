@@ -16,6 +16,7 @@
 #include <cute/swizzle.hpp>
 
 #include <deep_gemm/common/math.cuh>
+#include <deep_gemm/common/profiler.cuh>
 #include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/comm/barrier.cuh>
@@ -201,7 +202,8 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     bool kUseIncrementalMXFP4Descriptor, \
     uint32_t kNumRingTokens, \
     uint32_t kNumSFRingTokens, \
-    uint32_t kNumSharedExperts
+    uint32_t kNumSharedExperts, \
+    bool kEnableProfiler
 
 #define DG_SM90_FP8_MOE_KERNEL_ARGS_DECL \
     void* y, \
@@ -229,7 +231,9 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_acts, \
     const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_acts_sf, \
     const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights, \
-    const float* __restrict__ shared_l2_weights_sf
+    const float* __restrict__ shared_l2_weights_sf, \
+    uint64_t* profiler_buffer, \
+    const uint32_t profiler_capacity
 
 #define DG_SM90_FP8_MOE_CORE_ARGS_DECL \
     void* y, \
@@ -257,7 +261,9 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     const cute::TmaDescriptor& tensor_map_shared_l2_acts, \
     const cute::TmaDescriptor& tensor_map_shared_l2_acts_sf, \
     const cute::TmaDescriptor& tensor_map_shared_l2_weights, \
-    const float* __restrict__ shared_l2_weights_sf
+    const float* __restrict__ shared_l2_weights_sf, \
+    uint64_t* profiler_buffer, \
+    const uint32_t profiler_capacity
 
 #define DG_SM90_FP8_MOE_KERNEL_ARGS \
     y, cumulative_local_expert_recv_stats, num_tokens, \
@@ -269,7 +275,8 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     tensor_map_shared_l1_acts_sf, tensor_map_shared_l1_weights, \
     shared_l1_weights_sf, tensor_map_shared_l1_output, \
     tensor_map_shared_l2_acts, tensor_map_shared_l2_acts_sf, \
-    tensor_map_shared_l2_weights, shared_l2_weights_sf
+    tensor_map_shared_l2_weights, shared_l2_weights_sf, \
+    profiler_buffer, profiler_capacity
 
 #define DG_SM90_FP8_MOE_CORE_TEMPLATE_ARGS \
     kNumMaxTokensPerRank, kHidden, kIntermediateHidden, kNumExperts, kNumTopk, \
@@ -281,7 +288,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     kOverlapMXFP4ScalePath, \
     kUsePRMTMXFP4Exponent, \
     kUseIncrementalMXFP4Descriptor, \
-    kNumRingTokens, kNumSFRingTokens, kNumSharedExperts
+    kNumRingTokens, kNumSFRingTokens, kNumSharedExperts, kEnableProfiler
 
 template <DG_SM90_FP8_MOE_TEMPLATE_PARAMS>
 CUTLASS_DEVICE void
@@ -339,6 +346,10 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     const uint32_t thread_idx = threadIdx.x;
     const uint32_t warp_idx   = cutlass::canonical_warp_idx_sync();
     const uint32_t lane_idx   = ptx::get_lane_idx();
+    auto profiler = profile::WarpProfiler<kEnableProfiler>(
+        profiler_buffer, profiler_capacity, sm_idx, warp_idx, lane_idx);
+    profiler.begin(profile::MegaMoeEvent::Kernel);
+    profiler.begin(profile::MegaMoeEvent::Setup);
 
     // The persistent kernel executes both logical phases.
     if (warp_idx == 0 and cute::elect_one_sync()) {
@@ -804,8 +815,14 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
 
     const auto for_each_selected_block = [&](auto&& func) {
         task_info_t task_info;
-        while (scheduler.get_next_task(task_info))
+        while (true) {
+            profiler.begin(profile::MegaMoeEvent::SchedulerWait);
+            const bool has_task = scheduler.get_next_task(task_info);
+            profiler.end(profile::MegaMoeEvent::SchedulerWait);
+            if (not has_task)
+                break;
             invoke_persistent_task(task_info, func);
+        }
     };
 
     const auto produce_selected_blocks = [&](auto&& func) {
@@ -871,6 +888,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
     else
         cutlass::arch::warpgroup_reg_alloc<kNumEpilogueRegisters>();
+    profiler.end(profile::MegaMoeEvent::Setup);
 
     // =====================================================================
     // ROLE 1: DISPATCH WARPS
@@ -900,6 +918,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         };
 
         // Count tokens per expert
+        profiler.begin(profile::MegaMoeEvent::DispatchCount);
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
             atomicAdd_block(smem_expert_count + expert_idx, 1);
         });
@@ -913,8 +932,10 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 ptx::atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+        profiler.end(profile::MegaMoeEvent::DispatchCount);
 
         // Write source token-topk indices to remote ranks
+        profiler.begin(profile::MegaMoeEvent::DispatchPack);
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
             const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
             const auto dst_slot_idx = atomicAdd_block(smem_expert_count + expert_idx, 1);
@@ -922,12 +943,16 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
             *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
         });
+        profiler.end(profile::MegaMoeEvent::DispatchPack);
 
+        profiler.begin(profile::MegaMoeEvent::GridBarrier);
         sm90_grid_sync<kNumSMs, kDispatchGridSyncIndex>(
             workspace, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
         );
+        profiler.end(profile::MegaMoeEvent::GridBarrier);
 
+        profiler.begin(profile::MegaMoeEvent::DispatchPut);
         if (sm_idx == 0) {
             #pragma unroll
             for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
@@ -943,12 +968,15 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             }
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+        profiler.end(profile::MegaMoeEvent::DispatchPut);
 
+        profiler.begin(profile::MegaMoeEvent::DispatchNvlink);
         sm90_nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                             kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
             false, true);
+        profiler.end(profile::MegaMoeEvent::DispatchNvlink);
 
         // Shared L1 does not depend on routed dispatch. Let dispatch pull
         // routed tokens while the math warpgroup computes shared L1 instead
@@ -983,6 +1011,10 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             }
             if (current_expert_idx >= kNumExpertsPerRank)
                 break;
+
+            profiler.begin(
+                profile::MegaMoeEvent::DispatchPull,
+                static_cast<uint32_t>(token_idx));
 
             if (old_expert_idx != current_expert_idx) {
                 old_expert_idx = current_expert_idx;
@@ -1122,6 +1154,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     is_last_token ? BLOCK_M - token_idx_in_block : 1u);
             }
             __syncwarp();
+            profiler.end(
+                profile::MegaMoeEvent::DispatchPull,
+                static_cast<uint32_t>(token_idx));
         }
 
         // Pair with the epilogue after all L2 writes and combine loads are
@@ -1129,6 +1164,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         ptx::sync_unaligned(
             kNumDispatchThreads + kNumEpilogueThreads,
             kDispatchWithEpilogueBarrierIdx);
+        profiler.begin(profile::MegaMoeEvent::DispatchCleanup);
         cleanup_workspace();
         sm90_nvlink_barrier<
             kNumRanks, kNumSMs, kNumDispatchThreads,
@@ -1139,6 +1175,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         kNumDispatchThreads, kDispatchBarrierIdx);
                 },
                 true, false);
+        profiler.end(profile::MegaMoeEvent::DispatchCleanup);
+        profiler.end(profile::MegaMoeEvent::Kernel);
         return;
 
     // =====================================================================
@@ -1160,6 +1198,11 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             constexpr bool is_shared_phase =
                 BlockPhaseTag::value == sched::BlockPhase::SharedLinear1 or
                 BlockPhaseTag::value == sched::BlockPhase::SharedLinear2;
+            constexpr uint32_t block_phase_value =
+                static_cast<uint32_t>(BlockPhaseTag::value);
+            const uint32_t task_payload = profile::encode_task_payload(
+                block_phase_value, local_expert_idx, m_block_idx, n_block_idx);
+            profiler.begin(profile::MegaMoeEvent::Task, task_payload);
             sync_task_storage_alias(is_shared_phase);
             scheduler.release_task_info();
             const auto tensor_map_a_ptr = is_shared_phase ?
@@ -1180,6 +1223,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
 
             // Wait for the pool to be ready. Cluster peers can be dummy CTAs for
             // the tail M unit when an expert has an odd number of M blocks.
+            profiler.begin(
+                profile::MegaMoeEvent::L1DependencyWait, task_payload);
             if (has_valid_m) {
                 if constexpr (BlockPhaseTag::value == sched::BlockPhase::Linear1) {
                     const auto ptr =
@@ -1203,9 +1248,20 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     while (ptx::ld_acq(ptr) != kNumSharedL1BlockNs) {}
                 }
             }
+            profiler.end(
+                profile::MegaMoeEvent::L1DependencyWait, task_payload);
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                const uint32_t pipeline_payload =
+                    profile::encode_pipeline_payload(
+                        block_phase_value, stage_idx, k_block_idx);
+                profiler.begin(
+                    profile::MegaMoeEvent::PipelineWait, pipeline_payload);
                 empty_barriers[stage_idx]->wait(phase ^ 1);
+                profiler.end(
+                    profile::MegaMoeEvent::PipelineWait, pipeline_payload);
 
+                profiler.begin(
+                    profile::MegaMoeEvent::TmaActivation, pipeline_payload);
                 if (cute::elect_one_sync()) {
                     if (has_valid_m) {
                     const uint32_t m_idx = block_idx * BLOCK_M;
@@ -1228,6 +1284,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         full_barriers[stage_idx]->arrive_and_expect_tx(
                             SMEM_A_SIZE_PER_STAGE);
                     } else {
+                        profiler.begin(
+                            profile::MegaMoeEvent::TmaActivationScale,
+                            pipeline_payload);
                         // TMA load SFA with A on the same producer warp.
                         if (is_linear1_phase) {
                             // L1 SFA per-128: one vector per BK128 plane.
@@ -1262,13 +1321,19 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 SMEM_A_SIZE_PER_STAGE +
                                     kNumL2SFAKGroups * BLOCK_M * sizeof(float));
                         }
+                        profiler.end(
+                            profile::MegaMoeEvent::TmaActivationScale,
+                            pipeline_payload);
                     }
                     } else {
                         full_barriers[stage_idx]->arrive();
                     }
                 }
                 __syncwarp();
+                profiler.end(
+                    profile::MegaMoeEvent::TmaActivation, pipeline_payload);
             }
+            profiler.end(profile::MegaMoeEvent::Task, task_payload);
         });
 
     } else if (warp_idx == kNumDispatchWarps + 1) {
@@ -1287,6 +1352,11 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             constexpr bool is_shared_phase =
                 BlockPhaseTag::value == sched::BlockPhase::SharedLinear1 or
                 BlockPhaseTag::value == sched::BlockPhase::SharedLinear2;
+            constexpr uint32_t block_phase_value =
+                static_cast<uint32_t>(BlockPhaseTag::value);
+            const uint32_t task_payload = profile::encode_task_payload(
+                block_phase_value, local_expert_idx, m_block_idx, n_block_idx);
+            profiler.begin(profile::MegaMoeEvent::Task, task_payload);
             sync_task_storage_alias(is_shared_phase);
             constexpr bool use_mxfp4_task = not is_shared_phase;
             const auto tensor_map_b_ptr = is_shared_phase ?
@@ -1310,11 +1380,20 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 kL1MXFP4WeightSFPerExpert : kL2MXFP4WeightSFPerExpert;
 
             for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
+                const uint32_t pipeline_payload =
+                    profile::encode_pipeline_payload(
+                        block_phase_value, stage_idx, k_block_idx);
+                profiler.begin(
+                    profile::MegaMoeEvent::PipelineWait, pipeline_payload);
                 empty_barriers[stage_idx]->wait(phase ^ 1);
                 if constexpr (is_shared_phase)
                     shared_b_empty_barriers[shared_b_stage_idx].wait(
                         shared_b_phase ^ 1);
+                profiler.end(
+                    profile::MegaMoeEvent::PipelineWait, pipeline_payload);
 
+                profiler.begin(
+                    profile::MegaMoeEvent::TmaWeight, pipeline_payload);
                 const bool elected = cute::elect_one_sync();
                 const uint32_t local_n_idx = n_block_idx * BLOCK_N;
                 if (elected) {
@@ -1355,6 +1434,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 }
 
                 if constexpr (use_mxfp4_task) {
+                    profiler.begin(
+                        profile::MegaMoeEvent::LoadWeightScale,
+                        pipeline_payload);
                     // A natural-layout TMA box would have only four contiguous
                     // bytes per row, below Hopper's 16-byte requirement. Use
                     // the B producer warp to issue four strided row groups and
@@ -1385,6 +1467,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             scale_word);
                     }
                     __syncwarp();
+                    profiler.end(
+                        profile::MegaMoeEvent::LoadWeightScale,
+                        pipeline_payload);
                 }
 
                 if (elected) {
@@ -1395,7 +1480,10 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 __syncwarp();
                 if constexpr (is_shared_phase)
                     advance_shared_b_pipeline();
+                profiler.end(
+                    profile::MegaMoeEvent::TmaWeight, pipeline_payload);
             }
+            profiler.end(profile::MegaMoeEvent::Task, task_payload);
         };
         produce_selected_blocks(load_b_task);
 
@@ -1440,6 +1528,11 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             constexpr bool is_shared_phase =
                 BlockPhaseTag::value == sched::BlockPhase::SharedLinear1 or
                 BlockPhaseTag::value == sched::BlockPhase::SharedLinear2;
+            constexpr uint32_t block_phase_value =
+                static_cast<uint32_t>(BlockPhaseTag::value);
+            const uint32_t task_payload = profile::encode_task_payload(
+                block_phase_value, local_expert_idx, m_block_idx, n_block_idx);
+            profiler.begin(profile::MegaMoeEvent::Task, task_payload);
             sync_task_storage_alias(is_shared_phase);
             scheduler.release_task_info();
             const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
@@ -1478,9 +1571,35 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         mxfp4_final_bf16[i] =
                             __float2bfloat162_rn(0.0f);
 
+                    const auto wait_pipeline_stage = [&](
+                            const uint32_t pipeline_stage,
+                            const uint32_t barrier_phase,
+                            const uint32_t k_block_idx,
+                            const uint32_t auxiliary = 0) {
+                        const uint32_t pipeline_payload =
+                            profile::encode_pipeline_payload(
+                                block_phase_value, pipeline_stage,
+                                k_block_idx, auxiliary);
+                        profiler.begin(
+                            profile::MegaMoeEvent::PipelineWait,
+                            pipeline_payload);
+                        full_barriers[pipeline_stage]->wait(barrier_phase);
+                        profiler.end(
+                            profile::MegaMoeEvent::PipelineWait,
+                            pipeline_payload);
+                    };
+
                     const auto prepare_stage_weights = [&](
                             const uint32_t pipeline_stage,
-                            const uint32_t expanded_slot) {
+                            const uint32_t expanded_slot,
+                            const uint32_t k_block_idx) {
+                        const uint32_t pipeline_payload =
+                            profile::encode_pipeline_payload(
+                                block_phase_value, pipeline_stage, k_block_idx,
+                                expanded_slot);
+                        profiler.begin(
+                            profile::MegaMoeEvent::MXFP4Decode,
+                            pipeline_payload);
                         const auto* packed = smem_b_packed[pipeline_stage];
                         auto* expanded = reinterpret_cast<uint8_t*>(
                             smem_b_expanded[expanded_slot]);
@@ -1634,6 +1753,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         cutlass::arch::fence_view_async_shared();
                         ptx::sync_aligned(
                             kWGThreads, kEpilogueWGBarrierStartIdx);
+                        profiler.end(
+                            profile::MegaMoeEvent::MXFP4Decode,
+                            pipeline_payload);
                     };
 
                     // Producer-staged SF uses source-order release for short
@@ -1650,7 +1772,15 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                                        uint32_t kNumWGMMAs,
                                                        bool kAccumulate>(
                             const uint32_t pipeline_stage,
-                            const uint32_t expanded_slot) {
+                            const uint32_t expanded_slot,
+                            const uint32_t k_block_idx) {
+                        const uint32_t pipeline_payload =
+                            profile::encode_pipeline_payload(
+                                block_phase_value, pipeline_stage, k_block_idx,
+                                expanded_slot | (kStartK32 << 8));
+                        profiler.begin(
+                            profile::MegaMoeEvent::Wgmma,
+                            pipeline_payload);
                         #pragma unroll
                         for (uint32_t i = 0; i < kAccumPerThread; ++ i)
                             ptx::warpgroup_fence_operand(accum[i]);
@@ -1693,14 +1823,32 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         #pragma unroll
                         for (uint32_t i = 0; i < kAccumPerThread; ++ i)
                             ptx::warpgroup_fence_operand(accum[i]);
-                        if constexpr (not kOverlapMXFP4ScalePath)
+                        profiler.end(
+                            profile::MegaMoeEvent::Wgmma,
+                            pipeline_payload);
+                        if constexpr (not kOverlapMXFP4ScalePath) {
+                            profiler.begin(
+                                profile::MegaMoeEvent::WgmmaWait,
+                                pipeline_payload);
                             ptx::warpgroup_wait<0>();
+                            profiler.end(
+                                profile::MegaMoeEvent::WgmmaWait,
+                                pipeline_payload);
+                        }
                     };
 
                     const auto promote_mxfp4 = [&]<bool kReleaseStage>(
                             const uint32_t pipeline_stage,
+                            const uint32_t k_block_idx,
                             const uint32_t activation_sf_group,
                             const float secondary) {
+                        const uint32_t pipeline_payload =
+                            profile::encode_pipeline_payload(
+                                block_phase_value, pipeline_stage, k_block_idx,
+                                activation_sf_group);
+                        profiler.begin(
+                            profile::MegaMoeEvent::ScalePromote,
+                            pipeline_payload);
                         // Rematerialize the cheap row offset at the SFA load.
                         // Keeping it live across decode/WGMMA spills it to the
                         // local stack once per stage on the 128-register build.
@@ -1741,8 +1889,21 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 __float2bfloat162_rn(combined_scale_0);
                             const nv_bfloat162 combined_scale_bf16_1 =
                                 __float2bfloat162_rn(combined_scale_1);
-                            if constexpr (kOverlapMXFP4ScalePath)
+                            if constexpr (kOverlapMXFP4ScalePath) {
+                                profiler.end(
+                                    profile::MegaMoeEvent::ScalePromote,
+                                    pipeline_payload);
+                                profiler.begin(
+                                    profile::MegaMoeEvent::WgmmaWait,
+                                    pipeline_payload);
                                 ptx::warpgroup_wait<0>();
+                                profiler.end(
+                                    profile::MegaMoeEvent::WgmmaWait,
+                                    pipeline_payload);
+                                profiler.begin(
+                                    profile::MegaMoeEvent::ScalePromote,
+                                    pipeline_payload);
+                            }
                             // The final wait ends every shared-memory access
                             // to this stage. Release it before register-only
                             // accumulator promotion so the producer can start
@@ -1765,8 +1926,21 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                     mxfp4_final_bf16[i * 2 + 1]);
                             }
                         } else {
-                            if constexpr (kOverlapMXFP4ScalePath)
+                            if constexpr (kOverlapMXFP4ScalePath) {
+                                profiler.end(
+                                    profile::MegaMoeEvent::ScalePromote,
+                                    pipeline_payload);
+                                profiler.begin(
+                                    profile::MegaMoeEvent::WgmmaWait,
+                                    pipeline_payload);
                                 ptx::warpgroup_wait<0>();
+                                profiler.end(
+                                    profile::MegaMoeEvent::WgmmaWait,
+                                    pipeline_payload);
+                                profiler.begin(
+                                    profile::MegaMoeEvent::ScalePromote,
+                                    pipeline_payload);
+                            }
                             if constexpr (kReleaseStage) {
                                 if constexpr (kOverlapMXFP4ScalePath)
                                     arrive_task_empty_barrier(pipeline_stage);
@@ -1791,6 +1965,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                              accum[i * 4 + 3], persistent_1.y));
                             }
                         }
+                        profiler.end(
+                            profile::MegaMoeEvent::ScalePromote,
+                            pipeline_payload);
                     };
 
                     const float mxfp4_secondary = __ldg(
@@ -1813,18 +1990,20 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                     (k_block_idx & 1u) : 0u;
                             if constexpr (kPipelineMXFP4ExpandedB) {
                                 if (k_block_idx == 0) {
-                                    full_barriers[stage_idx]->wait(phase);
+                                    wait_pipeline_stage(
+                                        stage_idx, phase, k_block_idx);
                                     prepare_stage_weights(
-                                        stage_idx, expanded_slot);
+                                        stage_idx, expanded_slot, k_block_idx);
                                 }
                             } else {
-                                full_barriers[stage_idx]->wait(phase);
+                                wait_pipeline_stage(
+                                    stage_idx, phase, k_block_idx);
                                 prepare_stage_weights(
-                                    stage_idx, expanded_slot);
+                                    stage_idx, expanded_slot, k_block_idx);
                             }
 
                             issue_mxfp4_wgmma.template operator()<0, 4, true>(
-                                stage_idx, expanded_slot);
+                                stage_idx, expanded_slot, k_block_idx);
                             if constexpr (kPipelineMXFP4ExpandedB) {
                                 if (k_block_idx + 1 < num_k_blocks) {
                                     const uint32_t next_stage =
@@ -1832,13 +2011,27 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                             0u : stage_idx + 1u;
                                     const uint32_t next_phase =
                                         phase ^ (next_stage == 0u);
-                                    full_barriers[next_stage]->wait(next_phase);
+                                    wait_pipeline_stage(
+                                        next_stage, next_phase,
+                                        k_block_idx + 1);
                                     prepare_stage_weights(
-                                        next_stage, expanded_slot ^ 1u);
+                                        next_stage, expanded_slot ^ 1u,
+                                        k_block_idx + 1);
                                 }
                             }
-                            if constexpr (kOverlapMXFP4ScalePath)
+                            if constexpr (kOverlapMXFP4ScalePath) {
+                                const uint32_t wait_payload =
+                                    profile::encode_pipeline_payload(
+                                        block_phase_value, stage_idx,
+                                        k_block_idx, expanded_slot);
+                                profiler.begin(
+                                    profile::MegaMoeEvent::WgmmaWait,
+                                    wait_payload);
                                 ptx::warpgroup_wait<0>();
+                                profiler.end(
+                                    profile::MegaMoeEvent::WgmmaWait,
+                                    wait_payload);
+                            }
                             arrive_task_empty_barrier(stage_idx);
                         }
 
@@ -1870,17 +2063,21 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             // Stage zero is the prologue. Later expanded tiles
                             // were decoded during the previous WGMMA flight.
                             if (k_block_idx == 0) {
-                                full_barriers[stage_idx]->wait(phase);
-                                prepare_stage_weights(stage_idx, expanded_slot);
+                                wait_pipeline_stage(
+                                    stage_idx, phase, k_block_idx);
+                                prepare_stage_weights(
+                                    stage_idx, expanded_slot, k_block_idx);
                             }
                         } else {
-                            full_barriers[stage_idx]->wait(phase);
-                            prepare_stage_weights(stage_idx, expanded_slot);
+                            wait_pipeline_stage(
+                                stage_idx, phase, k_block_idx);
+                            prepare_stage_weights(
+                                stage_idx, expanded_slot, k_block_idx);
                         }
 
                         if constexpr (is_linear1_phase) {
                             issue_mxfp4_wgmma.template operator()<0, 4, false>(
-                                stage_idx, expanded_slot);
+                                stage_idx, expanded_slot, k_block_idx);
                             if constexpr (kPipelineMXFP4ExpandedB) {
                                 // Decode the next packed stage into the
                                 // other expanded slot while this WGMMA
@@ -1891,22 +2088,26 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                             0u : stage_idx + 1u;
                                     const uint32_t next_phase =
                                         phase ^ (next_stage == 0u);
-                                    full_barriers[next_stage]->wait(
-                                        next_phase);
+                                    wait_pipeline_stage(
+                                        next_stage, next_phase,
+                                        k_block_idx + 1);
                                     prepare_stage_weights(
-                                        next_stage, expanded_slot ^ 1u);
+                                        next_stage, expanded_slot ^ 1u,
+                                        k_block_idx + 1);
                                 }
                             }
                             promote_mxfp4.template operator()<
                                 kEarlyReleaseMXFP4Stage>(
-                                stage_idx, 0, mxfp4_secondary);
+                                stage_idx, k_block_idx, 0,
+                                mxfp4_secondary);
                         } else {
                             issue_mxfp4_wgmma.template operator()<0, 2, false>(
-                                stage_idx, expanded_slot);
+                                stage_idx, expanded_slot, k_block_idx);
                             promote_mxfp4.template operator()<false>(
-                                stage_idx, 0, mxfp4_secondary);
+                                stage_idx, k_block_idx, 0,
+                                mxfp4_secondary);
                             issue_mxfp4_wgmma.template operator()<2, 2, false>(
-                                stage_idx, expanded_slot);
+                                stage_idx, expanded_slot, k_block_idx);
                             if constexpr (kPipelineMXFP4ExpandedB) {
                                 // L2's first K64 group must be promoted
                                 // before the second group can reuse the
@@ -1918,15 +2119,18 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                             0u : stage_idx + 1u;
                                     const uint32_t next_phase =
                                         phase ^ (next_stage == 0u);
-                                    full_barriers[next_stage]->wait(
-                                        next_phase);
+                                    wait_pipeline_stage(
+                                        next_stage, next_phase,
+                                        k_block_idx + 1);
                                     prepare_stage_weights(
-                                        next_stage, expanded_slot ^ 1u);
+                                        next_stage, expanded_slot ^ 1u,
+                                        k_block_idx + 1);
                                 }
                             }
                             promote_mxfp4.template operator()<
                                 kEarlyReleaseMXFP4Stage>(
-                                stage_idx, 1, mxfp4_secondary);
+                                stage_idx, k_block_idx, 1,
+                                mxfp4_secondary);
                         }
                         if constexpr (kEarlyReleaseMXFP4Stage) {
                             if constexpr (not kOverlapMXFP4ScalePath)
@@ -1961,9 +2165,18 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     (kHidden / 128) * kL2SFKBlocks;
                 for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks;
                      advance_pipeline(k_block_idx)) {
+                const uint32_t pipeline_payload =
+                    profile::encode_pipeline_payload(
+                        block_phase_value, stage_idx, k_block_idx);
                 float gate_sf = 0.0f, up_sf = 0.0f;
                 float l2_sf_lo = 0.0f, l2_sf_hi = 0.0f;
+                profiler.begin(
+                    profile::MegaMoeEvent::PipelineWait, pipeline_payload);
                 full_barriers[stage_idx]->wait(phase);
+                profiler.end(
+                    profile::MegaMoeEvent::PipelineWait, pipeline_payload);
+                profiler.begin(
+                    profile::MegaMoeEvent::Wgmma, pipeline_payload);
                 const auto task_smem_b = is_shared_phase ?
                     smem_shared_b[shared_b_stage_idx] : smem_b[stage_idx];
 
@@ -2160,6 +2373,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     }
                     }
                 }
+                profiler.end(
+                    profile::MegaMoeEvent::Wgmma, pipeline_payload);
                 }
             };
 
@@ -2171,11 +2386,15 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             if constexpr (BlockPhaseTag::value == sched::BlockPhase::Linear1) {
                 // L1 may only overwrite an intermediate slot after every L2 N
                 // task from the previous generation has consumed it.
+                profiler.begin(
+                    profile::MegaMoeEvent::L1DependencyWait, task_payload);
                 const auto empty_ptr =
                     workspace.get_l2_empty_count_ptr(ring_block_idx);
                 const uint32_t empty_target = (L2_SHAPE_N / BLOCK_N) *
                     (pool_block_idx / kNumRingBlocks);
                 while (ptx::ld_acq(empty_ptr) != empty_target) {}
+                profiler.end(
+                    profile::MegaMoeEvent::L1DependencyWait, task_payload);
             }
             if constexpr (BlockPhaseTag::value == sched::BlockPhase::Linear2) {
                 // Every math thread has completed all A loads before this
@@ -2192,6 +2411,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             if (valid_m == 0) {
                 ptx::sync_aligned(
                     kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                profiler.end(profile::MegaMoeEvent::Task, task_payload);
                 return;
             }
 
@@ -2205,6 +2425,10 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             const bool valid_r1 = row_offset_r1 < valid_m;
 
             if (is_linear1_phase) {
+                profiler.begin(
+                    profile::MegaMoeEvent::EpilogueL1, task_payload);
+                profiler.begin(
+                    profile::MegaMoeEvent::SwigluQuantize, task_payload);
                 // ---------------- L1 EPILOGUE: SwiGLU + FP8 quantize + TMA store ----------------
                 // Layout in `final_accum`:
                 //   16 chunks of 8 N-cols, each chunk = 4 floats per thread = (r0c0, r0c1, r1c0, r1c1).
@@ -2408,6 +2632,11 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 }
                 }
 
+                profiler.end(
+                    profile::MegaMoeEvent::SwigluQuantize, task_payload);
+                profiler.begin(
+                    profile::MegaMoeEvent::TmaStoreL1, task_payload);
+
                 // Issue TMA store of the entire tile. Padding rows beyond
                 // `valid_m` are written with stale/garbage FP8 to the L1-output
                 // pool buffer, but they are never consumed downstream: the L2
@@ -2453,7 +2682,15 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     }
                 }
                 __syncwarp();
+                profiler.end(
+                    profile::MegaMoeEvent::TmaStoreL1, task_payload);
+                profiler.end(
+                    profile::MegaMoeEvent::EpilogueL1, task_payload);
             } else {
+                profiler.begin(
+                    profile::MegaMoeEvent::EpilogueL2, task_payload);
+                profiler.begin(
+                    profile::MegaMoeEvent::NvlinkScatter, task_payload);
                 // ---------------- L2 EPILOGUE: BF16 cast + NVLink scatter ----------------
                 constexpr uint32_t kNumRowsPerWarp = WG_BLOCK_M / 8;
 
@@ -2694,12 +2931,18 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 }
 
                     ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                profiler.end(
+                    profile::MegaMoeEvent::NvlinkScatter, task_payload);
+                profiler.end(
+                    profile::MegaMoeEvent::EpilogueL2, task_payload);
             }
+            profiler.end(profile::MegaMoeEvent::Task, task_payload);
         });
 
         // ---------------- COMBINE ----------------
         // NVLink barrier first: signals remote ranks that this rank's GEMM
         // outputs (NVLink scatter targets) are fully written.
+        profiler.begin(profile::MegaMoeEvent::CombineNvlink);
         sm90_nvlink_barrier<kNumRanks, kNumSMs, kNumEpilogueThreads,
                             kEpilogueGridSyncIndex, kBeforeCombineReduceBarrierTag>(
             workspace, sym_buffer, sm_idx, epilogue_thread_idx,
@@ -2708,6 +2951,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         // Sync with dispatch (paired with dispatch's pre-cleanup sync) so that
         // dispatch may now safely clean workspace state.
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+        profiler.end(profile::MegaMoeEvent::CombineNvlink);
+        profiler.begin(profile::MegaMoeEvent::Combine);
 
         constexpr uint32_t kNumChunks = kCombineNumChunks;
         constexpr uint32_t kInputChunkBytes = kCombineInputChunkBytes;
@@ -2756,14 +3001,23 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
 
             for (uint32_t chunk = 0; chunk < kNumChunks; ++ chunk) {
+                const uint32_t combine_payload =
+                    (token_idx & 0xffffu) | ((chunk & 0xffffu) << 16);
                 const uint32_t input_chunk_byte_offset = chunk * kInputChunkBytes;
                 const uint32_t output_chunk_byte_offset = chunk * kOutputChunkBytes;
 
                 uint32_t mask = total_mask;
+                uint32_t combine_load_payload[2] = {};
                 const auto move_mask_and_load = [&](const uint32_t& i) {
                     if (mask) {
                         const uint32_t slot_idx = __ffs(mask) - 1;
                         mask ^= 1 << slot_idx;
+                        const uint32_t load_payload =
+                            combine_payload | ((slot_idx & 0xffu) << 24);
+                        combine_load_payload[i] = load_payload;
+                        profiler.begin(
+                            profile::MegaMoeEvent::CombineTmaLoad,
+                            load_payload);
                         float weight = 1.0f;
                         if (cute::elect_one_sync()) {
                             if constexpr (kDeferTopKWeightToCombine) {
@@ -2793,6 +3047,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 combine_weight_stage1 = broadcast_weight;
                         }
                         __syncwarp();
+                        profiler.end(
+                            profile::MegaMoeEvent::CombineTmaLoad,
+                            load_payload);
                         return true;
                     }
                     return false;
@@ -2808,9 +3065,19 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     kNumVectorsPerLane * kNumBF16PairsPerVector] = {};
                 while (do_reduce) {
                     do_reduce = move_mask_and_load(load_stage_idx ^ 1);
+                    const uint32_t load_payload =
+                        combine_load_payload[load_stage_idx];
+                    profiler.begin(
+                        profile::MegaMoeEvent::CombineTmaWait,
+                        load_payload);
                     combine_load_barriers[load_stage_idx]->wait(combine_phase);
+                    profiler.end(
+                        profile::MegaMoeEvent::CombineTmaWait,
+                        load_payload);
                     const float combine_weight = load_stage_idx == 0 ?
                         combine_weight_stage0 : combine_weight_stage1;
+                    profiler.begin(
+                        profile::MegaMoeEvent::CombineReduce, load_payload);
                     #pragma unroll
                     for (uint32_t j = 0; j < kNumVectorsPerLane; ++ j) {
                         const uint32_t vector_idx = j * 32 + lane_idx;
@@ -2852,6 +3119,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             }
                         }
                     }
+                    profiler.end(
+                        profile::MegaMoeEvent::CombineReduce, load_payload);
                     combine_phase ^= load_stage_idx;
                     load_stage_idx ^= 1;
                 }
@@ -2881,6 +3150,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 }
                 __syncwarp();
 
+                profiler.begin(
+                    profile::MegaMoeEvent::CombineTmaStore, combine_payload);
                 if (cute::elect_one_sync()) {
                     cute::tma_store_fence();
                     ptx::tma_store_1d(
@@ -2892,9 +3163,13 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     cute::tma_store_arrive();
                 }
                 __syncwarp();
+                profiler.end(
+                    profile::MegaMoeEvent::CombineTmaStore, combine_payload);
             }
         }
+        profiler.end(profile::MegaMoeEvent::Combine);
     }
+    profiler.end(profile::MegaMoeEvent::Kernel);
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)
         DG_DEVICE_ASSERT(false and "This kernel only supports sm_90");

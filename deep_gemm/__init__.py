@@ -86,6 +86,11 @@ except ImportError:
 from .mega import (
     SymmBuffer,
     SM90SymmBuffer,
+    MegaMoeProfiler,
+    create_mega_moe_profiler,
+    mega_moe_rank_trace_path,
+    mega_moe_merged_trace_path,
+    merge_mega_moe_chrome_traces,
     get_symm_buffer_for_mega_moe,
     get_symm_buffer_for_sm90_mega_moe,
     transform_weights_for_mega_moe,
