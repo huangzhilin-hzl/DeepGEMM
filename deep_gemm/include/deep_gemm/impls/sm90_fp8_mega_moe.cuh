@@ -316,6 +316,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                      "Deferred top-k weighting requires per-tensor mode");
     DG_STATIC_ASSERT(not kSmallMSwapAB or kPerTensorActivationScale,
                      "Small-M swap-AB requires per-tensor activation scales");
+    DG_STATIC_ASSERT(not kSmallMSwapAB or not kDirectL2Scatter,
+                     "Swap-AB requires the remapped SMEM L2 epilogue");
     DG_STATIC_ASSERT(not kDirectL2Scatter or
                          (kPerTensorActivationScale and
                           (not kHasSharedExperts or kHidden == 4096)),
