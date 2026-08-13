@@ -106,6 +106,9 @@ public:
             args.num_shared_experts == 0 and
             (args.num_tokens <= 128 or
              (args.hidden == 7168 and args.num_tokens <= 256));
+        const bool merge_swap_ab_wgmma_group =
+            small_m_swap_ab and args.hidden == 4096 and
+            args.num_tokens == 128;
         // Wider routed-only L2 shapes amortize direct BF16 scatter by M=256;
         // Flash keeps it for routed tasks in a shared-expert launch once the
         // throughput regime is reached. Shared L2 itself retains SMEM scatter.
@@ -120,6 +123,7 @@ public:
             (not direct_l2_scatter or args.num_shared_experts > 0) and
             args.num_tokens >= kL2CDSwizzleMinTokens;
         return fmt::format(R"(
+{}
 #include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
 
 using namespace deep_gemm;
@@ -144,6 +148,8 @@ static void __instantiate_kernel() {{
     >);
 }};
 )",
+    merge_swap_ab_wgmma_group ?
+        "#define DG_SM90_MERGE_SWAP_AB_WGMMA_GROUP 1" : "",
     args.num_max_tokens_per_rank,
     args.hidden, args.intermediate_hidden,
     args.num_experts, args.num_topk,

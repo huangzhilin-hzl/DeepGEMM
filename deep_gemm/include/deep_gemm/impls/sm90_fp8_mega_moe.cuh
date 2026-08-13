@@ -1844,6 +1844,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                         stage_idx, expanded_slot);
                                 }
 
+#if defined(DG_SM90_MERGE_SWAP_AB_WGMMA_GROUP)
                                 #pragma unroll
                                 for (uint32_t half = 0;
                                      half < kSwapABWeightHalves; ++ half) {
@@ -1854,7 +1855,22 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                          i < kSwapAccum; ++ i)
                                         ptx::warpgroup_fence_operand(
                                             half_accum[i]);
+                                }
+                                ptx::warpgroup_arrive();
+#endif
+                                #pragma unroll
+                                for (uint32_t half = 0;
+                                     half < kSwapABWeightHalves; ++ half) {
+                                    auto* half_accum = final_accum +
+                                        half * kSwapABHalfAccumPerThread;
+#if !defined(DG_SM90_MERGE_SWAP_AB_WGMMA_GROUP)
+                                    #pragma unroll
+                                    for (uint32_t i = 0;
+                                         i < kSwapAccum; ++ i)
+                                        ptx::warpgroup_fence_operand(
+                                            half_accum[i]);
                                     ptx::warpgroup_arrive();
+#endif
                                     // Flash benefits from incrementing the
                                     // swap-AB descriptors; Pro regresses.
                                     if constexpr (kHidden == 4096) {
@@ -1908,12 +1924,28 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                                     k32_idx != 0);
                                         }
                                     }
+#if !defined(DG_SM90_MERGE_SWAP_AB_WGMMA_GROUP)
                                     ptx::warpgroup_commit_batch();
                                     #pragma unroll
                                     for (uint32_t i = 0; i < kSwapAccum; ++ i)
                                         ptx::warpgroup_fence_operand(
                                             half_accum[i]);
+#endif
                                 }
+#if defined(DG_SM90_MERGE_SWAP_AB_WGMMA_GROUP)
+                                ptx::warpgroup_commit_batch();
+                                #pragma unroll
+                                for (uint32_t half = 0;
+                                     half < kSwapABWeightHalves; ++ half) {
+                                    auto* half_accum = final_accum +
+                                        half * kSwapABHalfAccumPerThread;
+                                    #pragma unroll
+                                    for (uint32_t i = 0;
+                                         i < kSwapAccum; ++ i)
+                                        ptx::warpgroup_fence_operand(
+                                            half_accum[i]);
+                                }
+#endif
 
                                 if constexpr (kPipelineMXFP4ExpandedB) {
                                     if (k_block_idx + 1 < num_k_blocks) {
