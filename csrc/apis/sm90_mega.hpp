@@ -1,7 +1,6 @@
 #pragma once
 
 #include <algorithm>
-#include <cmath>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -195,9 +194,7 @@ static void sm90_mega_moe(
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math,
-    const std::string& fp8_scale_mode,
-    const std::tuple<float, float>& activation_dequant_scales
+    const bool& fast_math
 ) {
     const auto [l1_weights, l1_mxfp4_weights_sf, l1_mxfp4_secondary] = l1_weights_tuple;
     const auto [l2_weights, l2_mxfp4_weights_sf, l2_mxfp4_secondary] = l2_weights_tuple;
@@ -226,17 +223,6 @@ static void sm90_mega_moe(
     const auto activation_clamp =
         activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
     DG_HOST_ASSERT(activation_clamp >= 0);
-    DG_HOST_ASSERT(fp8_scale_mode == "blockwise" or
-                   fp8_scale_mode == "per_tensor");
-    const bool per_tensor_activation_scale =
-        fp8_scale_mode == "per_tensor";
-    const auto [l1_activation_dequant_scale,
-                l2_activation_dequant_scale] =
-        activation_dequant_scales;
-    DG_HOST_ASSERT(std::isfinite(l1_activation_dequant_scale) and
-                   l1_activation_dequant_scale > 0.0f);
-    DG_HOST_ASSERT(std::isfinite(l2_activation_dequant_scale) and
-                   l2_activation_dequant_scale > 0.0f);
 
     // Tensor checks: preprocessed Humming MXFP4 uses int8 packed E2M1
     // [E, N, K/2], an opaque contiguous uint8 relative-UE8M0 payload with
@@ -344,6 +330,7 @@ static void sm90_mega_moe(
                        shared_l2_weights_sf.size(1) == shared_intermediate_hidden / 128);
         DG_HOST_ASSERT(num_topk + 1 <= 32);
     }
+
     // Check stats counter
     if (cumulative_local_expert_recv_stats.has_value()) {
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_cuda());
@@ -402,9 +389,6 @@ static void sm90_mega_moe(
                             num_tokens, num_topk,
                             hidden, intermediate_hidden,
                             activation_clamp, fast_math,
-                            per_tensor_activation_scale,
-                            l1_activation_dequant_scale,
-                            l2_activation_dequant_scale,
                             l1_mxfp4_secondary, l2_mxfp4_secondary);
 
     if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
@@ -425,17 +409,14 @@ static void fp8_mxfp4_mega_moe(
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math,
-    const std::string& fp8_scale_mode,
-    const std::tuple<float, float>& activation_dequant_scales) {
+    const bool& fast_math) {
     sm90_mega_moe(
         y, l1_weights_tuple, l2_weights_tuple,
         shared_l1_weights_tuple_opt, shared_l2_weights_tuple_opt,
         cumulative_local_expert_recv_stats,
         sym_buffer, sym_buffer_ptrs, rank_idx,
         num_max_tokens_per_rank, num_experts, num_topk,
-        recipe, activation, activation_clamp_opt, fast_math,
-        fp8_scale_mode, activation_dequant_scales);
+        recipe, activation, activation_clamp_opt, fast_math);
 }
 
 static void register_sm90_apis(pybind11::module_& m) {

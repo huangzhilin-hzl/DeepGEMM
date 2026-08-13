@@ -346,23 +346,20 @@ def test_explicit_wrapper_forwards_only_processed_triples():
         mega.fp8_mxfp4_mega_moe(
             y, processed_l1, processed_l2, buffer,
             recipe=(1, 1, 32), activation='swiglu',
-            activation_clamp=10.0, fast_math=False,
-            fp8_scale_mode='per_tensor',
-            activation_dequant_scales=(0.5, 0.25))
+            activation_clamp=10.0, fast_math=False)
     finally:
         _unload_fake_package(package_name)
 
     assert len(calls) == 1
     args = calls[0]
-    assert len(args) == 18
+    assert len(args) == 16
     assert args[0] is y
     assert args[1] is processed_l1 and len(args[1]) == 3
     assert args[2] is processed_l2 and len(args[2]) == 3
     assert args[3] is None and args[4] is None
     assert args[7] == [0x1234]
     assert args[12] == (1, 1, 32)
-    assert args[13:] == (
-        'swiglu', 10.0, False, 'per_tensor', (0.5, 0.25))
+    assert args[13:] == ('swiglu', 10.0, False)
 
 
 def test_sm90_buffer_uses_dedicated_alignment_and_twelve_view_abi():

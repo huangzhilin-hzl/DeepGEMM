@@ -183,24 +183,12 @@ def _benchmark_case(
 
     try:
         x_bf16 = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
-        if args.fp8_scale_mode == "per_tensor":
-            x_fp8 = (
-                x_bf16.float() / args.fc1_activation_dequant_scale
-            ).to(torch.float8_e4m3fn)
-            # The current buffer ABI retains the blockwise SF plane. The
-            # per-tensor specialization skips both dispatch and TMA reads.
-            x_scale = torch.ones(
-                (num_tokens, hidden // 128),
-                dtype=torch.float32,
-                device="cuda",
-            )
-        else:
-            x_fp8, x_scale = per_token_cast_to_fp8(
-                x_bf16,
-                use_ue8m0=False,
-                gran_k=128,
-                use_packed_ue8m0=False,
-            )
+        x_fp8, x_scale = per_token_cast_to_fp8(
+            x_bf16,
+            use_ue8m0=False,
+            gran_k=128,
+            use_packed_ue8m0=False,
+        )
         del x_bf16
 
         l1_bf16 = (
@@ -311,11 +299,6 @@ def _benchmark_case(
                     else None
                 ),
                 fast_math=bool(args.fast_math),
-                fp8_scale_mode=args.fp8_scale_mode,
-                activation_dequant_scales=(
-                    args.fc1_activation_dequant_scale,
-                    args.fc2_activation_dequant_scale,
-                ),
             )
             return output
 
@@ -332,9 +315,6 @@ def _benchmark_case(
             "num_shared_experts": num_shared_experts,
             "num_max_tokens_per_rank": buffer.num_max_tokens_per_rank,
             "fast_math": args.fast_math,
-            "fp8_scale_mode": args.fp8_scale_mode,
-            "fc1_activation_dequant_scale": args.fc1_activation_dequant_scale,
-            "fc2_activation_dequant_scale": args.fc2_activation_dequant_scale,
             "activation_clamp": args.activation_clamp,
             "masked_ratio": args.masked_ratio,
             "seed": args.seed,
@@ -475,7 +455,6 @@ def _benchmark_worker(
             "profile_only": args.profile_only,
             "flush_l2": bool(args.flush_l2),
             "cache_mode": _cache_mode(args.flush_l2),
-            "fp8_scale_mode": args.fp8_scale_mode,
         }
         if rank_idx == 0:
             _emit_json("BENCH_PLAN_JSON", plan)
@@ -533,15 +512,6 @@ def _parse_args() -> argparse.Namespace:
         help="override model expert count, primarily for single-rank profiling",
     )
     parser.add_argument("--num-shared-experts", type=int, default=0)
-    parser.add_argument(
-        "--fp8-scale-mode",
-        choices=("blockwise", "per_tensor"),
-        default="blockwise",
-    )
-    parser.add_argument(
-        "--fc1-activation-dequant-scale", type=float, default=1.0)
-    parser.add_argument(
-        "--fc2-activation-dequant-scale", type=float, default=1.0)
     parser.add_argument("--num-warmups", type=int, default=1)
     parser.add_argument("--small-repeats", type=int, default=50)
     parser.add_argument("--large-repeats", type=int, default=3)
@@ -584,12 +554,6 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--num-experts-override must be positive")
     if args.num_shared_experts < 0:
         parser.error("--num-shared-experts must be non-negative")
-    if not math.isfinite(args.fc1_activation_dequant_scale) or \
-            args.fc1_activation_dequant_scale <= 0:
-        parser.error("--fc1-activation-dequant-scale must be positive and finite")
-    if not math.isfinite(args.fc2_activation_dequant_scale) or \
-            args.fc2_activation_dequant_scale <= 0:
-        parser.error("--fc2-activation-dequant-scale must be positive and finite")
     if args.num_warmups <= 0:
         parser.error("--num-warmups must be positive")
     if args.small_repeats <= 0 or args.large_repeats <= 0:

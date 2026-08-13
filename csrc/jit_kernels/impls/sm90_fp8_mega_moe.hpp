@@ -46,7 +46,6 @@ public:
         int num_ring_tokens, num_sf_ring_tokens;
         float activation_clamp;
         bool fast_math;
-        bool per_tensor_activation_scale;
         MegaMoESM90Config config;
 
         // Runtime arguments. num_tokens also selects compile-time MXFP4
@@ -55,8 +54,6 @@ public:
         void* y;
         int* cumulative_local_expert_recv_stats;
         int num_tokens;
-        float l1_activation_dequant_scale;
-        float l2_activation_dequant_scale;
         layout::SymBuffer<> sym_buffer_ptrs;
 
         // Tensormaps for activations and weights. The B producer can stage
@@ -97,40 +94,10 @@ public:
         const bool use_incremental_mxfp4_descriptor =
             args.hidden == 4096 and
             args.num_tokens > kSM90MoeMaxLatencyOverlapTokens;
-        const bool defer_topk_weight_to_combine =
-            args.per_tensor_activation_scale and
-            args.hidden > 4096 and args.num_tokens == 128;
-        // M=256 benefits the Pro shape, while the Flash shape regresses.
-        const bool small_m_swap_ab =
-            args.per_tensor_activation_scale and
-            args.num_shared_experts == 0 and
-            (args.num_tokens <= 128 or
-             (args.hidden == 7168 and args.num_tokens <= 256));
-        const bool merge_swap_ab_wgmma_group =
-            small_m_swap_ab and args.hidden == 4096 and
-            args.num_tokens == 128;
-        const bool direct_swap_ab_l2_scatter =
-            merge_swap_ab_wgmma_group;
-        const bool sparse_dispatch_completion =
-            small_m_swap_ab and args.hidden == 4096 and
-            args.num_tokens == 64;
-        // Wider routed-only L2 shapes amortize direct BF16 scatter by M=256;
-        // Flash keeps it for routed tasks in a shared-expert launch once the
-        // throughput regime is reached. Shared L2 itself retains SMEM scatter.
-        const bool direct_l2_scatter =
-            args.per_tensor_activation_scale and
-            not small_m_swap_ab and
-            (args.num_shared_experts == 0 or args.hidden == 4096) and
-            (args.num_tokens > kSM90MoeMaxLatencyOverlapTokens or
-             (args.hidden > 4096 and args.num_tokens >= 256));
         constexpr int kL2CDSwizzleMinTokens = 1024;
         const bool swizzle_l2_cd =
-            (not direct_l2_scatter or args.num_shared_experts > 0) and
             args.num_tokens >= kL2CDSwizzleMinTokens;
         return fmt::format(R"(
-{}
-{}
-{}
 #include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
 
 using namespace deep_gemm;
@@ -147,30 +114,16 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
-        {},
-        {},
-        {},
-        {},
         {}, {}, {}
     >);
 }};
 )",
-    merge_swap_ab_wgmma_group ?
-        "#define DG_SM90_MERGE_SWAP_AB_WGMMA_GROUP 1" : "",
-    direct_swap_ab_l2_scatter ?
-        "#define DG_SM90_DIRECT_SWAP_AB_L2_SCATTER 1" : "",
-    sparse_dispatch_completion ?
-        "#define DG_SM90_SPARSE_DISPATCH_COMPLETION 1" : "",
     args.num_max_tokens_per_rank,
     args.hidden, args.intermediate_hidden,
     args.num_experts, args.num_topk,
     args.config.num_sms, args.num_ranks,
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false",
-    args.per_tensor_activation_scale ? "true" : "false",
-    small_m_swap_ab ? "true" : "false",
-    defer_topk_weight_to_combine ? "true" : "false",
-    direct_l2_scatter ? "true" : "false",
     swizzle_l2_cd ? "true" : "false",
     overlap_mxfp4_scale_path ? "true" : "false",
     use_prmt_mxfp4_exponent ? "true" : "false",
@@ -213,8 +166,6 @@ static void __instantiate_kernel() {{
             args.y,
             args.cumulative_local_expert_recv_stats,
             args.num_tokens,
-            args.l1_activation_dequant_scale,
-            args.l2_activation_dequant_scale,
             args.sym_buffer_ptrs,
             args.tensor_map_l1_acts,
             args.tensor_map_l1_acts_sf,
@@ -259,9 +210,6 @@ static void sm90_fp8_mxfp4_mega_moe(
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
     const bool& fast_math,
-    const bool& per_tensor_activation_scale,
-    const float& l1_activation_dequant_scale,
-    const float& l2_activation_dequant_scale,
     const torch::Tensor& l1_mxfp4_secondary,
     const torch::Tensor& l2_mxfp4_secondary
 ) {
@@ -307,15 +255,10 @@ static void sm90_fp8_mxfp4_mega_moe(
                                                      tma_block_k, config.block_m,
                                                      static_cast<int>(l1_acts.stride(-2)),
                                                      128);
-    // Per-tensor kernels never prefetch or consume activation-SF descriptors.
-    // Reuse an already encoded placeholder instead of paying another CUDA
-    // Driver tensor-map encode on every forward.
-    const auto tensor_map_l1_acts_sf = per_tensor_activation_scale ?
-        tensor_map_l1_acts :
-        make_tma_sf_desc(cute::UMMA::Major::MN, l1_acts_sf,
-                         sf_stride_tokens, hidden,
-                         config.block_m, kGranK,
-                         1, 0);
+    const auto tensor_map_l1_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_acts_sf,
+                                                        sf_stride_tokens, hidden,
+                                                        config.block_m, kGranK,
+                                                        1, 0);
     const auto tensor_map_l1_weights = make_tma_2d_desc(
         l1_weights,
         hidden / 2,
@@ -341,12 +284,10 @@ static void sm90_fp8_mxfp4_mega_moe(
                                                      tma_block_k, config.block_m,
                                                      static_cast<int>(l2_acts.stride(-2)),
                                                      128);
-    const auto tensor_map_l2_acts_sf = per_tensor_activation_scale ?
-        tensor_map_l2_acts :
-        make_tma_sf_desc(cute::UMMA::Major::MN, l2_acts_sf,
-                         sf_stride_tokens, intermediate_hidden,
-                         config.block_m, kL2ActsSFGranK,
-                         1, 0);
+    const auto tensor_map_l2_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_acts_sf,
+                                                        sf_stride_tokens, intermediate_hidden,
+                                                        config.block_m, kL2ActsSFGranK,
+                                                        1, 0);
     const auto tensor_map_l2_weights = make_tma_2d_desc(
         l2_weights,
         intermediate_hidden / 2,
@@ -366,8 +307,7 @@ static void sm90_fp8_mxfp4_mega_moe(
             tma_block_k, config.block_m,
             static_cast<int>(shared_l1_acts.stride(-2)),
             128) : tensor_map_l1_acts;
-    const auto tensor_map_shared_l1_acts_sf =
-        num_shared_experts > 0 and not per_tensor_activation_scale ?
+    const auto tensor_map_shared_l1_acts_sf = num_shared_experts > 0 ?
         make_tma_sf_desc(
             cute::UMMA::Major::MN, shared_l1_acts_sf,
             static_cast<int>(shared_l1_acts_sf.size(0)), hidden,
@@ -394,8 +334,7 @@ static void sm90_fp8_mxfp4_mega_moe(
             tma_block_k, config.block_m,
             static_cast<int>(shared_l2_acts.stride(-2)),
             128) : tensor_map_l2_acts;
-    const auto tensor_map_shared_l2_acts_sf =
-        num_shared_experts > 0 and not per_tensor_activation_scale ?
+    const auto tensor_map_shared_l2_acts_sf = num_shared_experts > 0 ?
         make_tma_sf_desc(
             cute::UMMA::Major::MN, shared_l2_acts_sf,
             static_cast<int>(shared_l2_acts_sf.size(0)),
@@ -436,13 +375,10 @@ static void sm90_fp8_mxfp4_mega_moe(
         .num_sf_ring_tokens = num_sf_ring_tokens,
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
-        .per_tensor_activation_scale = per_tensor_activation_scale,
         .config = persistent_config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
         .num_tokens = num_tokens,
-        .l1_activation_dequant_scale = l1_activation_dequant_scale,
-        .l2_activation_dequant_scale = l2_activation_dequant_scale,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
         .tensor_map_l1_acts = tensor_map_l1_acts,
         .tensor_map_l1_acts_sf = tensor_map_l1_acts_sf,
