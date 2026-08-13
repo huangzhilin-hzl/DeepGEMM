@@ -757,6 +757,18 @@ def _full_scenarios(
     stress_count: int,
 ) -> List[Scenario]:
     scenarios: List[Scenario] = [
+        ('production.flash_m64_per_tensor', dict(
+            num_max_tokens_per_rank=8192,
+            num_tokens=64,
+            hidden=4096,
+            intermediate_hidden=2048,
+            num_experts=32 * num_ranks,
+            num_topk=6,
+            fast_math=True,
+            activation_clamp=10.0,
+            fp8_scale_mode='per_tensor',
+            activation_dequant_scales=(0.5, 8.0),
+        )),
         ('ring_wrap.h2048', dict(
             num_max_tokens_per_rank=128,
             num_tokens=128,
