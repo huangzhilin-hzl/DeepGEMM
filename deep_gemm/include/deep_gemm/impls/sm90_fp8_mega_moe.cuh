@@ -931,18 +931,48 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 *sym_buffer.map(
                     workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
                     dst_rank_idx) = expert_status & 0xffffffff;
+#if not defined(DG_SM90_SPARSE_DISPATCH_COMPLETION)
                 ptx::atomic_add_sys(
                     sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
                     expert_status);
+#endif
             }
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
+#if defined(DG_SM90_SPARSE_DISPATCH_COMPLETION)
+        sm90_nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+                            kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
+            workspace, sym_buffer, sm_idx, thread_idx,
+            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+            false, false);
+
+        if (sm_idx == 0) {
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+            for (uint32_t local_expert_idx = thread_idx;
+                 local_expert_idx < kNumExpertsPerRank;
+                 local_expert_idx += kNumDispatchThreads) {
+                uint32_t num_recv_tokens = 0;
+                #pragma unroll
+                for (uint32_t rank_idx = 0; rank_idx < kNumRanks; ++ rank_idx)
+                    num_recv_tokens += static_cast<uint32_t>(
+                        *workspace.get_expert_recv_count_ptr(
+                            rank_idx, local_expert_idx));
+                *workspace.get_expert_recv_count_sum_ptr(local_expert_idx) =
+                    (static_cast<uint64_t>(kNumSMs * kNumRanks) << 32) |
+                    num_recv_tokens;
+            }
+        }
+        sm90_grid_sync<kNumSMs, kDispatchGridSyncIndex>(
+            workspace, sm_idx, thread_idx,
+            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); });
+#else
         sm90_nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                             kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
             false, true);
+#endif
 
         // Shared L1 does not depend on routed dispatch. Let dispatch pull
         // routed tokens while the math warpgroup computes shared L1 instead
