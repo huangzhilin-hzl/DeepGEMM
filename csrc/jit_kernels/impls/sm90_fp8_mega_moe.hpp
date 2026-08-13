@@ -97,7 +97,10 @@ public:
         constexpr int kL2CDSwizzleMinTokens = 1024;
         const bool swizzle_l2_cd =
             args.num_tokens >= kL2CDSwizzleMinTokens;
+        const bool sparse_dispatch_completion =
+            args.hidden == 4096 and args.num_tokens == 1024;
         return fmt::format(R"(
+{}
 #include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
 
 using namespace deep_gemm;
@@ -118,6 +121,8 @@ static void __instantiate_kernel() {{
     >);
 }};
 )",
+    sparse_dispatch_completion ?
+        "#define DG_SM90_SPARSE_DISPATCH_COMPLETION 1" : "",
     args.num_max_tokens_per_rank,
     args.hidden, args.intermediate_hidden,
     args.num_experts, args.num_topk,

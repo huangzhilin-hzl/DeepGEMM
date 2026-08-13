@@ -883,9 +883,18 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         // Stake out per-expert SM offsets via global atomic
         #pragma unroll
         for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
-            const uint64_t send_value = (1ull << 32) | static_cast<uint64_t>(smem_expert_count[i]);
-            smem_expert_count[i] = static_cast<uint32_t>(
-                ptx::atomic_add(workspace.get_expert_send_count_ptr(i), send_value));
+            const uint32_t local_count = smem_expert_count[i];
+#if defined(DG_SM90_SPARSE_DISPATCH_COMPLETION)
+            if (local_count != 0) {
+#endif
+                const uint64_t send_value =
+                    (1ull << 32) | static_cast<uint64_t>(local_count);
+                smem_expert_count[i] = static_cast<uint32_t>(
+                    ptx::atomic_add(
+                        workspace.get_expert_send_count_ptr(i), send_value));
+#if defined(DG_SM90_SPARSE_DISPATCH_COMPLETION)
+            }
+#endif
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
@@ -908,7 +917,17 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
                 const auto dst_rank_idx = i / kNumExpertsPerRank;
                 const auto dst_local_expert_idx = i % kNumExpertsPerRank;
-                const auto expert_status = *workspace.get_expert_send_count_ptr(i);
+                const auto raw_expert_status =
+                    *workspace.get_expert_send_count_ptr(i);
+#if defined(DG_SM90_SPARSE_DISPATCH_COMPLETION)
+                // The grid barrier proves every CTA has completed its token
+                // writes, so publish the equivalent all-CTA completion count.
+                const uint64_t expert_status =
+                    (static_cast<uint64_t>(kNumSMs) << 32) |
+                    static_cast<uint32_t>(raw_expert_status);
+#else
+                const uint64_t expert_status = raw_expert_status;
+#endif
                 *sym_buffer.map(
                     workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
                     dst_rank_idx) = expert_status & 0xffffffff;
