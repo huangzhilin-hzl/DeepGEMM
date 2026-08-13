@@ -90,7 +90,7 @@ public:
             args.num_tokens <= kSM90MoeMaxLatencyOverlapTokens;
         const bool use_prmt_mxfp4_exponent =
             args.hidden == 4096 and
-            args.num_tokens <= kSM90MoeMaxLatencyOverlapTokens;
+            args.num_tokens < 1024;
         const bool use_incremental_mxfp4_descriptor =
             args.hidden == 4096 and
             args.num_tokens > kSM90MoeMaxLatencyOverlapTokens;

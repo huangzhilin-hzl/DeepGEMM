@@ -721,6 +721,16 @@ def _full_scenarios(
             activation_clamp=10.0,
             require_ring_wrap=True,
         )),
+        ('production.flash_m1024', dict(
+            num_max_tokens_per_rank=1024,
+            num_tokens=1024,
+            hidden=4096,
+            intermediate_hidden=2048,
+            num_experts=32 * num_ranks,
+            num_topk=6,
+            fast_math=True,
+            activation_clamp=10.0,
+        )),
         ('production.pro_m256', dict(
             num_max_tokens_per_rank=256,
             num_tokens=256,
