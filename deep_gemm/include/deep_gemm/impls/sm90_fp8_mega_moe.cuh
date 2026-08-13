@@ -2755,6 +2755,89 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 // ---------------- L2 EPILOGUE: BF16 cast + NVLink scatter ----------------
                 constexpr uint32_t kNumRowsPerWarp = WG_BLOCK_M / 8;
 
+#if defined(DG_SM90_DIRECT_SWAP_AB_L2_SCATTER)
+                if constexpr (kSmallMSwapAB and not is_shared_phase) {
+                    // Swap-AB leaves tokens across lanes and output columns in
+                    // registers. Each warp stages only its own 32-column slice,
+                    // transposes it in SMEM, then publishes contiguous 16-byte
+                    // spans without a cross-warp barrier.
+                    auto store_staged_scalar = [&](const uint32_t row,
+                                                   const uint32_t col,
+                                                   const float value) {
+                        reinterpret_cast<nv_bfloat16*>(smem_cd_base)[
+                            row * WG_BLOCK_N + col] =
+                                __float2bfloat16_rn(value);
+                    };
+                    const uint32_t num_swap_token_chunks =
+                        math::ceil_div(valid_m, 8u);
+                    #pragma unroll
+                    for (uint32_t i = 0; i < kSwapABTokenChunks; ++ i) {
+                        if (i < num_swap_token_chunks) {
+                            const uint32_t token_0 = i * 8 + col_idx * 2;
+                            const uint32_t token_1 = token_0 + 1;
+                            #pragma unroll
+                            for (uint32_t half = 0;
+                                 half < kSwapABWeightHalves; ++ half) {
+                                const uint32_t accum_offset =
+                                    half * kSwapABHalfAccumPerThread + i * 4;
+                                const uint32_t col_offset = half * 64u;
+                                if (token_0 < valid_m) {
+                                    store_staged_scalar(
+                                        token_0, col_offset + r_0,
+                                        final_accum[accum_offset]);
+                                    store_staged_scalar(
+                                        token_0, col_offset + r_1,
+                                        final_accum[accum_offset + 2]);
+                                }
+                                if (token_1 < valid_m) {
+                                    store_staged_scalar(
+                                        token_1, col_offset + r_0,
+                                        final_accum[accum_offset + 1]);
+                                    store_staged_scalar(
+                                        token_1, col_offset + r_1,
+                                        final_accum[accum_offset + 3]);
+                                }
+                            }
+                        }
+                    }
+                    __syncwarp();
+
+                    auto scatter_staged_row = [&](const uint32_t row) {
+                        if (row < valid_m) {
+                            const auto src_metadata =
+                                *workspace.get_token_src_metadata_ptr(
+                                    pool_m_idx + row);
+                            const auto dst_token = combine_token_buffer
+                                .get_rank_buffer(src_metadata.topk_idx)
+                                .get_data_buffer(src_metadata.token_idx);
+                            auto dst_base = math::advance_ptr<uint8_t>(
+                                dst_token.get_base_ptr(),
+                                n_idx * kCombineElementBytes);
+                            auto mapped_dst_base = sym_buffer.map(
+                                dst_base, src_metadata.rank_idx);
+
+                            #pragma unroll
+                            for (uint32_t half = 0;
+                                 half < kSwapABWeightHalves; ++ half) {
+                                const uint32_t col =
+                                    half * 64u + warp_idx_in_wg * 16u;
+                                const auto stage_ptr =
+                                    reinterpret_cast<const uint4*>(
+                                        reinterpret_cast<const nv_bfloat16*>(
+                                            smem_cd_base) +
+                                        row * WG_BLOCK_N + col);
+                                auto dst_ptr = reinterpret_cast<uint4*>(
+                                    mapped_dst_base +
+                                    col * kCombineElementBytes);
+                                dst_ptr[0] = stage_ptr[0];
+                                dst_ptr[1] = stage_ptr[1];
+                            }
+                        }
+                    };
+                    scatter_staged_row(lane_idx);
+                    scatter_staged_row(lane_idx + 32u);
+                } else
+#endif
                 if constexpr (kDirectL2Scatter and not is_shared_phase) {
                     // Per-tensor L2 has no dynamic scale output. Stage each
                     // row within its owning four-lane group, then let two lanes
