@@ -1003,7 +1003,16 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         uint32_t expert_pool_block_offset = 0;
 
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
-        for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
+#if defined(DG_SM90_SPARSE_DISPATCH_COMPLETION)
+        // Give each warp an adjacent token pair. The second token usually
+        // shares a pool block with the first and can reuse its acquire.
+        uint32_t token_idx = (sm_idx * kNumDispatchWarps + warp_idx) * 2;
+        uint32_t token_idx_in_pair = 0;
+        uint32_t ready_pool_block_idx = 0xffffffffu;
+#else
+        uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx;
+#endif
+        while (true) {
             int old_expert_idx = current_expert_idx;
             while (token_idx >= expert_end_idx) {
                 if (++ current_expert_idx >= kNumExpertsPerRank)
@@ -1086,16 +1095,23 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             const uint32_t empty_target =
                 (pool_block_idx / kNumRingBlocks) * kNumL1BlockNs;
             if (empty_target > 0) {
-                const auto empty_ptr =
-                    workspace.get_l1_empty_count_ptr(ring_block_idx);
-                while (ptx::ld_acq(empty_ptr) < empty_target) {
-                    // For one-block Pro dispatch, avoid hammering the counter
-                    // while the wider GEMM tile retires the previous slot.
-                    if constexpr (kNumRanks > 1 and kHidden > 4096) {
-                        if (num_tokens <= BLOCK_M)
-                            __nanosleep(64);
+#if defined(DG_SM90_SPARSE_DISPATCH_COMPLETION)
+                if (ready_pool_block_idx != pool_block_idx) {
+#endif
+                    const auto empty_ptr =
+                        workspace.get_l1_empty_count_ptr(ring_block_idx);
+                    while (ptx::ld_acq(empty_ptr) < empty_target) {
+                        // For one-block Pro dispatch, avoid hammering the counter
+                        // while the wider GEMM tile retires the previous slot.
+                        if constexpr (kNumRanks > 1 and kHidden > 4096) {
+                            if (num_tokens <= BLOCK_M)
+                                __nanosleep(64);
+                        }
                     }
+#if defined(DG_SM90_SPARSE_DISPATCH_COMPLETION)
+                    ready_pool_block_idx = pool_block_idx;
                 }
+#endif
             }
 
             // TMA pull token data into SMEM
@@ -1153,6 +1169,18 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     is_last_token ? BLOCK_M - token_idx_in_block : 1u);
             }
             __syncwarp();
+
+#if defined(DG_SM90_SPARSE_DISPATCH_COMPLETION)
+            if (token_idx_in_pair == 0) {
+                ++ token_idx;
+                token_idx_in_pair = 1;
+            } else {
+                token_idx += kNumGlobalWarps * 2 - 1;
+                token_idx_in_pair = 0;
+            }
+#else
+            token_idx += kNumGlobalWarps;
+#endif
         }
 
         // Pair with the epilogue after all L2 writes and combine loads are
