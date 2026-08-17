@@ -2469,3 +2469,90 @@ points but does not close their remaining PR383 gap. The next scheduler
 experiment should generalize the direct lookup to Pro's two experts per lane,
 then independently select M8 and M128; further Flash work should target the
 dispatch/token-pull critical path rather than another grid barrier.
+
+## Rejected experiment R30: two-group direct scheduler lookup for Pro
+
+DSV4 Pro has 48 local experts, so R30 concatenated two nonempty-lane masks and
+used a direct `__fns` owner lookup when every expert fit one M64 block. A
+multi-block expert still fell back to the general scheduler. Eight-rank
+correctness passed Pro M8/M64/M128 at `0.000726/0.001234/0.001379`, including
+the M64/M128 physical ring wraps.
+
+The 20-observation R29/R30/R29 screen rejected all three points because none
+improved against both controls:
+
+| Pro point | first R29 us | R30 us | change | second R29 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| M8 | 874.742 | 874.512 | -0.03% | 855.096 | +2.27% |
+| M64 | 1243.500 | 1227.000 | -1.33% | 1223.500 | +0.29% |
+| M128 | 1438.500 | 1429.500 | -0.63% | 1418.500 | +0.78% |
+
+The extra second-group ballots and selection offset the avoided prefix sums.
+R30 was fully reverted. Evidence is under
+`/app/deepgemm-auto-results/iter51-pro-two-group-scheduler-screen`, with a
+matching local export below the profile-artifact root.
+
+## Rejected experiment R31: packed-BF16 epilogue for Pro M128
+
+R23 made Pro M128's swap-AB path viable after the original packed-BF16 sweep,
+so R31 retested the current mature packed epilogue at exactly M128. Correctness
+passed at `diff=0.000700`, but a 20-observation R29/R31/R29 screen measured
+`1455.5/1476.0/1444.0 us`. The candidate regressed by `+1.41%/+2.22%` and was
+reverted. The current M128 cost is not the temporary FP32 expansion targeted
+by this specialization. Evidence is under
+`/app/deepgemm-auto-results/iter52-pro-m128-packed-bf16-screen`.
+
+## R32: retest PRMT exponent extraction for paired Pro M8 decode
+
+### Reason and direction
+
+R19 rejected Pro M8 PRMT extraction by 0.30% while the decoder still assigned
+one lane to each packed word. R20 later replaced that body with paired-word
+decode and shared exponent lookup. R32 therefore retests the selector on the
+current dependency structure and changes only routed DSV4 Pro M8. Existing
+Pro M16/M32/M64 and Flash selectors are unchanged.
+
+### Correctness and formal result
+
+Eight-rank `production.pro_m8` passes at `diff=0.000725`. The formal
+R29/R32/R29 run uses ten warmups, 50 observations, 20 launches per observation,
+cold L2, and maximum-rank medians:
+
+| Pro point | first R29 us | R32 us | change | second R29 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| M8 | 855.248 | 853.010 | -0.26% | 856.727 | -0.43% |
+
+The gain is small but agrees in both orders and reverses the old R19 result on
+the pre-paired decoder, so the exact M8 selector is retained.
+
+### NCU and NSYS analysis
+
+One-rank NCU uses 48 experts to preserve Pro's two-experts-per-lane layout:
+
+| NCU metric | R29 | R32 | change |
+| --- | ---: | ---: | ---: |
+| executed warp instructions | 205,054,873 | 202,922,321 | -1.04% |
+| executed thread instructions | 6,435,852,130 | 6,367,716,576 | -1.06% |
+| global-load sectors | 17,103,543 | 17,103,214 | -0.002% |
+| global atomic sectors | 6,408 | 6,408 | unchanged |
+| local load/store sectors | 0/0 | 0/0 | unchanged |
+| NCU kernel duration us | 809.568 | 801.952 | -0.94% |
+
+Both cubins retain 107 registers, zero stack, and zero local allocation. The
+instruction reduction with unchanged memory traffic matches the intended
+shift/mask-to-PRMT substitution.
+
+The eight-rank NSYS single launch was 1257.436 us for R29 and 1261.627 us for
+R32 (`+0.33%`), opposite to both 50-observation controls and isolated NCU. It
+is retained as one-kernel/156-CTA topology evidence, not as the acceptance
+score.
+
+Formal and profiler artifacts are under
+`/app/deepgemm-auto-results/iter53-pro-m8-prmt-retest-formal` and
+`iter54-pro-m8-prmt-retest-profiles`; local exports use matching names below
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts`.
+
+The terminal goal is still not complete. R32 recovers only about 0.3% at Pro
+M8; the next authoritative full matrix must measure the combined R29/R32
+branch against a fresh same-epoch PR383 run before another structural
+dispatch or mainloop change.

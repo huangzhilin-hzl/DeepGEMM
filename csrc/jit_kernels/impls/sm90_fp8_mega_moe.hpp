@@ -91,7 +91,8 @@ public:
         const bool use_prmt_mxfp4_exponent =
             (args.hidden == 4096 and args.num_tokens < 1024) or
             (args.hidden == 7168 and
-             (args.num_tokens == 16 or
+             (args.num_tokens == 8 or
+              args.num_tokens == 16 or
               args.num_tokens == 32 or
               args.num_tokens == 64));
         const bool use_incremental_mxfp4_descriptor =
