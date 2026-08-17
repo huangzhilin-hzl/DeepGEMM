@@ -1833,3 +1833,81 @@ remaining optimization budget is dominated by Flash M8-M64 and Pro M128. R22
 first applies the proven monolithic paired decoder to Pro; if M128 remains
 unchanged, the next diagnosis must separate its schedule/dispatch fixed cost
 from MXFP4 expansion cost.
+
+## Rejected experiment R22: monolithic paired decoder for Pro
+
+### Reason and direction
+
+R21's Flash decoder placed two packed words and lookup construction in one PTX
+block. R22 temporarily selected that helper for Pro as well, replacing R20's
+two inlined eight-value decode calls. The intent was to shorten lookup and
+temporary live ranges without changing task scheduling, shared-memory layout,
+or the Flash kernel.
+
+Eight-rank physical-ring-wrap correctness passed for Pro M32 and M128 at
+`0.000715` and `0.000709`. The representative Pro kernel retained
+`REG=128, STACK=0, LOCAL=0`, but static SASS fell by only eight IMADs and one
+PRMT. A 20-observation R21/R22/R21 screen produced:
+
+| Pro point | R21 first us | R22 us | change | R21 second us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| M8 | 911.311 | 876.437 | -3.83% | 881.001 | -0.52% |
+| M16 | 1132.000 | 1134.000 | +0.18% | 1135.000 | -0.09% |
+| M32 | 1186.500 | 1175.000 | -0.97% | 1174.000 | +0.09% |
+| M64 | 1227.000 | 1215.000 | -0.98% | 1228.500 | -1.10% |
+| M128 | 1665.000 | 1619.500 | -2.73% | 1638.000 | -1.13% |
+
+The screen's geometric improvement was `-1.68%` against the first control but
+only `-0.55%` against the second. Formal 50-observation checks then showed M8
+regressing by `+0.50%/+1.59%`, while M128 improved by `-1.49%/-0.61%`.
+Across the five small-M points the reverse-order screen was effectively neutral
+at `-0.03%`. The source experiment was reverted and not committed.
+
+Artifacts are under
+`/app/deepgemm-auto-results/iter29-pro-monolithic-pair`; the local export is
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter29-pro-monolithic-pair`.
+
+## R23: extend the current Pro swap-AB path to M128
+
+### Reason and direction
+
+R22 showed that decode-call structure was not the source of Pro M128's 33%
+gap. The sharp runtime step instead coincided exactly with the host selector:
+M64 used the sparse-expert swap-AB kernel, while M128 switched back to regular
+M64xN128 WGMMA despite only 128 routed tokens across 384 experts. An early
+branch version had rejected M128 swap-AB by 8.34%, but the swap epilogue,
+fragment lifetime, promotion schedule, and MXFP4 decode have since changed
+substantially. R23 therefore retests that boundary on the current source by
+extending only Pro's routed-only selector from M <= 64 to M <= 128. M8-M64
+already select the same path, and M >= 256 remains untouched.
+
+### Correctness and resources
+
+The eight-rank `production.pro_m128` physical-ring-wrap scenario passes at
+`diff=0.000700`. The selected kernel remains at `REG=128`, `STACK=0`,
+`LOCAL=0`, and 1024 bytes static shared memory. The swap kernel has a larger
+static instruction body because it contains N8/N16/N32/N64 buckets; its win is
+from executing a smaller WGMMA-N bucket for sparse expert ownership, not from
+shrinking total static SASS.
+
+### Matched cold-L2 performance
+
+A first ten-observation R21/R23/R21 screen measured `1664.5/1428.5/1617.0 us`,
+or `-14.18%/-11.66%`. The formal run used ten warmups, 50 observations, 20
+launches per observation, cold L2, and maximum-rank medians:
+
+| Pro M128 | median us | R23 change |
+| --- | ---: | ---: |
+| R21 first control | 1653.500 | - |
+| R23 | 1426.000 | -13.76% |
+| R21 second control | 1631.500 | -12.60% |
+
+Using the immediately preceding same-node PR383 M128 value of `1220.630 us`,
+R23's provisional gap is about `+16.82%`, down from R21's `+33.25%`. A fresh
+full matrix will establish the final same-epoch gap.
+
+R23 is retained because the improvement is large, reproduces in both launch
+orders at both 10 and 50 observations, passes production correctness, and
+does not add spilling or alter adjacent selectors. Raw artifacts are under
+`/app/deepgemm-auto-results/iter30-pro-m128-swap-retest`; the local export is
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter30-pro-m128-swap-retest`.
