@@ -1073,3 +1073,75 @@ export is under
 3. Start with a Pro M32 prototype and require separate L1/L2 launches, zero
    local sectors per phase, correctness, and a matched win before extending
    the selector to Flash or the full latency range.
+
+## Rejected experiment R14: current-source hard L1/L2 split for Pro M32
+
+### Reason and implementation
+
+R13 left Pro M32 17.47% behind PR383, so this experiment tested whether the
+remaining gap was caused mainly by retaining both logical phases in one
+compiled kernel. The prototype was derived from the current persistent source,
+not the obsolete historical split snapshot:
+
+- two compile-time `Linear1` and `Linear2` entry points;
+- a phase-only routed scheduler that never instantiated the other task type;
+- L1 retained dispatch metadata and task counters, while L2 performed combine
+  and cleanup;
+- a host safety proof required the complete worst-case routed pool for the
+  invocation to fit in the physical ring before enabling the split;
+- the production benchmark summed the two Kineto kernel durations.
+
+The selector was limited to routed-only DSV4 Pro M32. Every other shape kept
+the R13 fused kernel.
+
+### Generated resources
+
+Both phase cubins compiled and completed an eight-rank smoke launch while
+preserving the two-CTA occupancy contract:
+
+| Pro M32 phase | registers/thread | stack | local | shared |
+| --- | ---: | ---: | ---: | ---: |
+| Linear1 | 125 | 0 B | 0 B | 1024 B |
+| Linear2 | 128 | 0 B | 0 B | 1024 B |
+
+This proves that a hard phase boundary can reduce L1 below the 128-register
+launch cap, but the resource reduction alone is not sufficient.
+
+### Cold-L2 screening result
+
+The screen used ten observations, 20 launches per observation, explicit
+`--flush-l2 1`, and the maximum rank-local sum of L1 plus L2 time.
+
+| model | M | R13 us | split us | change | PR383 us | split gap |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Pro | 32 | 1250.500 | 1360.462 | +8.79% | 1064.547 | +27.79% |
+
+The split regresses decisively, so it was stopped before a 50-observation
+formal run and was not submitted as production code.
+
+### NSYS diagnosis
+
+NSYS confirms the intended two-kernel topology. Profiler-induced cross-rank
+skew makes the medians unsuitable as latency scores, but the least-perturbed
+rank records 0.824 ms for Linear1 and 0.445 ms for Linear2, or 1.269 ms
+combined, consistent with the Kineto result. The trace also contains one NCCL
+all-reduce and one fill kernel. The regression therefore comes from removing
+the useful L1/L2 overlap and adding a full phase boundary, not from spills or
+an accidental extra compute launch.
+
+The prototype source was reverted completely. Evidence remains on the pod at
+`/app/deepgemm-auto-results/iter17-current-split` and its isolated cubins at
+`/app/deepgemm-auto-results/jit-auto-r14b`. The compact local export is under
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter17-current-split`.
+
+### Next iteration
+
+1. Keep one cooperative launch and the interleaved ring scheduler; the hard
+   phase boundary gives up more overlap than its 125-register L1 saves.
+2. Use the split cubins only as a compiler oracle: identify state that is live
+   solely because both phase epilogues are present, then shorten or alias that
+   state inside the fused kernel without changing launch topology.
+3. Start with Pro M32/M64 and require a matched cold-L2 win. The first target
+   is phase-specific descriptor/epilogue selection around the task lambda,
+   followed by scheduler issue/barrier reductions rather than another
+   accumulator representation change.
