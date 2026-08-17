@@ -374,25 +374,51 @@ The extra synchronization costs substantially more than the 8-12 byte spill
 reduction saves, so the kernel change was reverted. The full remote evidence is
 under `/app/deepgemm-auto-results/iter05-shared-swiglu` on the H20 pod.
 
+## Rejected experiment R05: one-CTA high-register swap-AB
+
+### Reason and direction
+
+R05 tested whether the swap specialization could exchange the proven second
+resident CTA for enough registers to eliminate all local traffic. Its launch
+bound was relaxed from two blocks to one, and the cooperative worker grid was
+reduced from 156 to 78 CTAs to match exact-kernel residency. Regular large-M
+kernels retained the original two-block bound and 156-CTA grid.
+
+### Resource and correctness result
+
+Pro M32 forced-ring-wrap correctness passed at 0.000709. PTXAS moved from 128
+to 231 registers and eliminated the entire 488-byte stack frame and all
+584/732-byte spill stores/loads. The WGMMA serialization warning nevertheless
+remained, and exact occupancy allowed only one CTA per H20 SM.
+
+### Screening performance
+
+The ten-observation screen was stopped after two Flash points because the
+regression was decisive.
+
+| M | R01 128-reg/1-CTA us | accepted 128-reg/2-CTA us | R05 231-reg/1-CTA us | change vs accepted |
+| ---: | ---: | ---: | ---: | ---: |
+| 8 | 656.990 | 413.731 | 693.239 | +67.56% |
+| 16 | 723.421 | 445.744 | 754.531 | +69.27% |
+
+Despite zero spill traffic, R05 is also 5.52%/4.30% slower than R01. The
+current fused pipeline needs the second CTA's compute parallelism more than it
+benefits from a larger register file. The source change was reverted; evidence
+is under `/app/deepgemm-auto-results/iter06-swap-launchbound` on the H20 pod.
+
 ### Recommended next iterations
 
-1. Test a swap-AB-only launch-bound specialization that permits the existing
-   48/208-register warpgroup reconfiguration to take effect. The current
-   two-CTA launch bound caps every thread at 128 registers, ignores
-   `setmaxnreg`, spills, and serializes WGMMA. Keep the regular large-M kernel
-   at two-CTA launch bounds.
-2. If the extra register budget does not offset lower residency, consume the
-   existing packed BF16 routed accumulator directly in the swap epilogue. This
-   avoids converting it into a second 64-float per-thread array, while adding
-   no shared-memory barriers.
-3. Do not key a maximum N8/N16/N32 bucket only from global M: one expert can
+1. Consume the existing packed BF16 routed accumulator directly in the swap
+   epilogue. This avoids converting it into a second 64-float per-thread array,
+   while adding no shared-memory barriers and retaining two resident CTAs.
+2. Do not key a maximum N8/N16/N32 bucket only from global M: one expert can
    receive skewed routes aggregated from all ranks, so its runtime `valid_m`
    may require the N64 fallback even when per-rank M is small.
-4. Re-profile local sectors and long-scoreboard stalls after each resource
+3. Re-profile local sectors and long-scoreboard stalls after each resource
    change. If spilling is removed but the small-M gap remains above 20%,
    prototype a true two-phase L1/L2 latency kernel for M <= 64, matching
    PR383's one-CTA-per-SM resource allocation while keeping the fused kernel
    for throughput sizes.
-5. Preserve the measured crossover guards: Flash M <= 32 and Pro M <= 64.
+4. Preserve the measured crossover guards: Flash M <= 32 and Pro M <= 64.
    Every future change should rerun M64/M128 boundaries plus the full DSV4
    Flash/Pro matrix so a latency win cannot leak into the throughput path.
