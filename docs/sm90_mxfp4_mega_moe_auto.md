@@ -1200,3 +1200,60 @@ The next structural prototype keeps one fused launch but moves to one CTA per
 SM with two math warpgroups. Each warpgroup owns one N64 weight half, matching
 PR383's successful small-M parallel decomposition while retaining packed
 MXFP4 storage and the interleaved L1/L2 scheduler.
+
+## Rejected experiment R16: one-CTA dual-math-warpgroup Pro M32
+
+### Reason and direction
+
+R13 processes the two N64 weight halves with one math warpgroup per CTA and
+keeps two CTAs resident per H20 SM. PR383 instead uses one CTA per SM and two
+math warpgroups, each owning one N64 half. R16 ported that decomposition to the
+fused MXFP4 kernel for routed DSV4 Pro M32:
+
+- launch 78 cooperative CTAs instead of 156;
+- use two math warpgroups per CTA and decode disjoint N64 packed-weight halves;
+- combine the L1 per-token amax across all eight math warps before FP8
+  quantization;
+- keep one N128 L2 scratch tile and let one warpgroup perform the final remote
+  scatter after both warpgroups finish their disjoint stores.
+
+The first 384-thread/three-stage specialization compiled and launched at
+`REG=128, STACK=0, LOCAL=0`. It measured 1777 us in the first cold-L2 sample.
+A seven-stage version used the extra one-CTA shared-memory budget and improved
+the sample to 1684 us. A final 512-thread version restored 128 dispatch threads
+per SM (with two spare frontend warps so every `setmaxnreg` warpgroup stayed
+collective); it measured 1674 us and retained `REG=128, STACK=0, LOCAL=0`.
+
+### Adjacent performance screen
+
+The final topology and the untouched R13 control were measured adjacently with
+20 observations, 20 launches per observation, cold L2, and maximum-rank
+medians:
+
+| model | M | R13 control us | R16 us | change | PR383 us | R16 gap |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Pro | 32 | 1262.500 | 1665.000 | +31.88% | 1064.547 | +56.40% |
+
+The benchmark's warmup non-finite guard passed, but the dedicated numerical
+correctness suite was intentionally not run after the performance screen had
+already rejected the topology by a wide margin.
+
+### Conclusion
+
+Two math warpgroups preserve the same two tensor-core warpgroups per physical
+SM as R13, but binding them to one CTA also binds them to one scheduler task
+and halves the number of independent producer/scheduler streams. Increasing
+the producer pipeline from three to seven stages recovered only about 5%, and
+doubling dispatch width was neutral. The missing task-level concurrency is
+therefore more important than sequential weight-half WGMMA for this fused
+kernel. The full prototype was reverted.
+
+R16 rules out a direct PR383 launch-topology transplant. The next iteration
+returns to the accepted two-CTA fused schedule and targets the measured MXFP4
+decode/address body itself: reduce repeated B128 swizzle/address formation in
+`prepare_stage_weights`, then require a static SASS reduction and a matched
+cold-L2 improvement before retention.
+
+Artifacts are under
+`/app/deepgemm-auto-results/iter20-dual-math-wg`; the local export is
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter20-dual-math-wg`.
