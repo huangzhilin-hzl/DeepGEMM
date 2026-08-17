@@ -1257,3 +1257,50 @@ cold-L2 improvement before retention.
 Artifacts are under
 `/app/deepgemm-auto-results/iter20-dual-math-wg`; the local export is
 `/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter20-dual-math-wg`.
+
+## Rejected experiment R17: hoist expanded-B row swizzle
+
+### Reason and direction
+
+R14's phase cubins showed roughly four times as many integer/address
+instructions as PR383. In `prepare_stage_weights`, every decoded K32 word
+formed `logical_n * BLOCK_K + logical_k` and applied the B128 swizzle inside
+the unrolled loop. R17 computed the fixed expanded-row base and its swizzle XOR
+once per decoded row, then applied that XOR to each word offset.
+
+The transformation was algebraically valid because `Swizzle<3,4,3>` derives
+its XOR mask from row bits 7--9 while the within-row K offset occupies bits
+0--6. It did reduce two instruction classes, but ptxas changed address
+materialization in the opposite direction:
+
+| Pro M32 static SASS count | R13 | R17 | change |
+| --- | ---: | ---: | ---: |
+| LOP3 | 1820 | 1661 | -159 |
+| SHF | 734 | 552 | -182 |
+| IMAD | 1495 | 1675 | +180 |
+| IADD3 | 24 | 24 | 0 |
+
+Both cubins used `REG=128, STACK=8, LOCAL=0`.
+
+### Adjacent performance screen
+
+Twenty cold-L2 observations with 20 launches per observation produced:
+
+| model | M | R13 control us | R17 us | change |
+| --- | ---: | ---: | ---: | ---: |
+| Pro | 32 | 1291.000 | 1294.000 | +0.23% |
+
+The compiler-level trade was neutral-to-negative in the authoritative metric,
+so the source change was reverted. This also shows that aggregate static
+instruction reduction is insufficient when it lengthens dependency chains or
+keeps row bases live across the fully unrolled decoder.
+
+The next decode experiment should reduce work without adding live address
+state. A promising direction is to change the packed representation so the
+four K32 relative exponents for a row are broadcast/decoded with fewer
+per-word extracts, or to fuse address update into inline PTX with immediate
+increments rather than relying on C++ swizzle expressions.
+
+Artifacts are under
+`/app/deepgemm-auto-results/iter21-row-swizzle-hoist`; the local export is
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter21-row-swizzle-hoist`.
