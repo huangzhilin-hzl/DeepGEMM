@@ -258,6 +258,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     float kActivationClamp, \
     bool kFastMath, \
     bool kSmallMSwapAB, \
+    uint32_t kMaxSwapABTokens, \
     bool kPackedBF16SwapEpilogue, \
     bool kSwizzleL2CD, \
     bool kOverlapMXFP4ScalePath, \
@@ -334,6 +335,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     kNumMaxTokensPerRank, kHidden, kIntermediateHidden, kNumExperts, kNumTopk, \
     kNumSMs, kNumRanks, \
     kActivationClamp, kFastMath, kSmallMSwapAB, \
+    kMaxSwapABTokens, \
     kPackedBF16SwapEpilogue, kSwizzleL2CD, \
     kOverlapMXFP4ScalePath, \
     kUsePRMTMXFP4Exponent, \
@@ -374,6 +376,10 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                          (kSmallMSwapAB and kHidden == 7168 and
                           not kHasSharedExperts),
                      "Packed-BF16 swap epilogue is Pro small-M only");
+    DG_STATIC_ASSERT(
+        kMaxSwapABTokens == 8 or kMaxSwapABTokens == 16 or
+            kMaxSwapABTokens == 32 or kMaxSwapABTokens == 64,
+        "Swap-AB token bound must select a supported WGMMA bucket");
 
     // =====================================================================
     // Template checks
@@ -461,7 +467,11 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr uint32_t WG_BLOCK_N = BLOCK_N;
     constexpr uint32_t L1_OUT_BLOCK_N = BLOCK_N / 2;       // post-SwiGLU tile N
     constexpr uint32_t WG_L1_OUT_BLOCK_N = WG_BLOCK_N / 2; // post-SwiGLU per-WG N
-    constexpr uint32_t kSwapABTokenChunks = BLOCK_M / 8;
+    // The JIT knows the global token count. No routed expert can own more
+    // tokens than that, so small-M epilogues only need to materialize chunks
+    // up to this compile-time bound. The math mainloop still selects N8/N16/
+    // N32/N64 from each expert's actual valid_m.
+    constexpr uint32_t kSwapABTokenChunks = kMaxSwapABTokens / 8;
     constexpr uint32_t kSwapABWeightHalves = BLOCK_N / 64;
     constexpr uint32_t kSwapABHalfAccumPerThread = 64 * 64 / 128;
     DG_STATIC_ASSERT(BLOCK_M == 64 and BLOCK_N == 128 and

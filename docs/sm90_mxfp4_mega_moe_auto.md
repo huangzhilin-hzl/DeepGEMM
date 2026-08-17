@@ -2078,3 +2078,99 @@ The goal is still not complete. Large-M remains within geometric noise, but
 Flash M8-M32 is 33-38% behind PR383 and Pro M8 is 24% behind. Future work must
 reduce fixed swap-AB latency inside the already-correct selectors; widening
 the Flash selector beyond M64 is now formally ruled out.
+
+## R26: compile-time bounds for the swap-AB epilogue
+
+### Reason and direction
+
+The swap-AB math mainloop already dispatches N8/N16/N32/N64 WGMMA from each
+expert's actual `valid_m`, but both L1 and L2 epilogues still instantiated all
+eight token chunks of the M64 tile. Runtime predicates suppressed invalid
+loads and stores, but the unused chunks still enlarged the live fragment and
+executed control/address instructions. This was especially wasteful at global
+M8, M16, and M32, where no expert can own more than one, two, or four chunks.
+
+R26 passes the rounded global token upper bound (8/16/32/64) from the host JIT
+into the persistent-kernel template. `kSwapABTokenChunks` now uses that bound,
+so the compiler removes impossible epilogue chunks while the math mainloop
+continues to choose a still-smaller bucket from each expert's actual token
+count. M64 and larger retain the original eight-chunk bound. The full suite
+also gains explicit `production.flash_m8` and `production.flash_m16` physical
+ring-wrap scenarios.
+
+### Correctness and resources
+
+All changed eight-rank production cases pass:
+
+| model | M | calc diff |
+| --- | ---: | ---: |
+| Flash | 8 | 0.000649 |
+| Flash | 16 | 0.000645 |
+| Flash | 32 | 0.000656 |
+| Flash | 64 boundary | 0.000654 |
+| Pro | 8 | 0.000725 |
+| Pro | 16 | 0.000718 |
+| Pro | 32 | 0.000715 |
+
+Official-benchmark JIT cubins remain spill-free (`STACK=0`, `LOCAL=0`) and
+use 1024 bytes of static shared memory. Flash M8/M16/M32 fall from the R24
+control's 128 registers to 114/114/122; Pro M8/M16/M32 fall to 107/110/122.
+M64 retains 128 registers, as expected from its unchanged eight-chunk bound.
+
+### Matched cold-L2 performance
+
+The formal runs use the authoritative benchmark with ten warmups, 50
+observations, 20 launches per observation, cold L2, and maximum-rank medians.
+R23 is an exact code control for M8-M32 because R24 changed only Flash M64.
+
+| model | M | first control us | R26 us | change | second control us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Flash | 8 | 407.552 | 398.751 | -2.16% | 394.552 | +1.06% |
+| Flash | 16 | 426.754 | 404.858 | -5.13% | 422.286 | -4.13% |
+| Flash | 32 | 420.843 | 415.338 | -1.31% | 440.503 | -5.71% |
+| Pro | 8 | 884.382 | 856.493 | -3.15% | 888.608 | -3.61% |
+| Pro | 16 | 1114.500 | 1076.000 | -3.45% | 1111.500 | -3.19% |
+| Pro | 32 | 1167.500 | 1134.000 | -2.87% | 1172.000 | -3.24% |
+
+Flash M8-M32 improve geometrically by `-2.88%/-2.97%` against the two
+controls. Pro M8-M32 improve by `-3.16%/-3.35%`. Flash M8 alone straddles
+noise, but the other five comparisons and both model-level geometric means
+reproduce in both launch orders.
+
+### NCU and NSYS attribution
+
+An isolated M16 Flash NCU run uses one rank and 32 experts to remove
+distributed spin-wait perturbation while preserving the changed epilogue
+shape. R24 control versus R26 measures:
+
+| NCU metric | control | R26 | change |
+| --- | ---: | ---: | ---: |
+| `smsp__inst_executed.sum` | 78,936,825 | 73,213,868 | -7.25% |
+| `smsp__thread_inst_executed.sum` | 2,471,623,315 | 2,288,589,254 | -7.41% |
+| global-load sectors | 844,907 | 844,159 | -0.09% |
+| local-load sectors | 0 | 0 | unchanged |
+| local-store sectors | 0 | 0 | unchanged |
+
+The instruction reduction with unchanged traffic and no local memory directly
+matches the intended removal of impossible epilogue chunks. An eight-rank
+NSYS capture of the same point measures the main kernel at 804.764 us for the
+control and 797.468 us for R26 (`-0.91%`) in a single profiled launch; the
+formal repeated benchmark above remains the performance authority.
+
+Eight-rank NCU application-replay reports are retained, but their aggregate
+spin-wait instruction/sector counts are explicitly not used for comparison:
+the profiler independently relaunches distributed ranks, so small schedule
+changes alter how long peers spin and overwhelm this epilogue-sized delta.
+
+Screen artifacts are under
+`/app/deepgemm-auto-results/iter35-swap-epilogue-bounds-screen`, formal Flash
+and Pro artifacts under `iter36-swap-epilogue-bounds-formal` and
+`iter37-pro-swap-epilogue-bounds-formal`, and profiler reports under
+`iter38-swap-epilogue-profiles`. Local exports use the matching directory
+names below
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts`.
+
+R26 is retained. It reduces the fixed swap-AB epilogue cost across both DSV4
+models without changing M64+ execution or adding spills. The terminal goal is
+still unmet; the next full candidate/PR383 matrix will quantify the remaining
+gap before the next optimization iteration.

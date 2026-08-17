@@ -101,6 +101,10 @@ public:
             args.num_shared_experts == 0 and
             ((args.hidden == 4096 and args.num_tokens <= 64) or
              (args.hidden == 7168 and args.num_tokens <= 128));
+        const uint32_t max_swap_ab_tokens =
+            args.num_tokens <= 8 ? 8 :
+            args.num_tokens <= 16 ? 16 :
+            args.num_tokens <= 32 ? 32 : 64;
         const bool packed_bf16_swap_epilogue =
             args.num_shared_experts == 0 and
             args.hidden == 7168 and
@@ -130,6 +134,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}, {}, {}
     >);
 }};
@@ -143,6 +148,7 @@ static void __instantiate_kernel() {{
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false",
     small_m_swap_ab ? "true" : "false",
+    max_swap_ab_tokens,
     packed_bf16_swap_epilogue ? "true" : "false",
     swizzle_l2_cd ? "true" : "false",
     overlap_mxfp4_scale_path ? "true" : "false",
