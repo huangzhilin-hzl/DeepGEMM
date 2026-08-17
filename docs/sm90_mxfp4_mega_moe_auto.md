@@ -1614,3 +1614,67 @@ remaining Pro M128 gap is schedule/epilogue dominated, while Pro M8-M64 is now
 within 8-24% of PR383. Flash remains unchanged and is still the largest small-M
 gap, so its next optimization must preserve the monolithic decode schedule or
 use a different bank-conflict-free pairing.
+
+## Final matrix after R20
+
+R20 and PR383 were measured consecutively on the same H20 pod after the final
+source was synchronized and rebuilt through a fresh JIT cache. The matrix uses
+the authoritative DSV4 Flash/Pro shapes and M
+`8,16,32,64,128,256,512,1024,2048,4096,8192`. M <= 128 uses 50 observations,
+M >= 256 uses three observations, and every observation contains 20 launches
+with cold L2. The reported time is the maximum-rank median. PR383 reports the
+sum of its L1 and L2 phase durations; R20 reports its one fused persistent
+kernel.
+
+| model | M | PR383 us | R20 us | R20 gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 302.339 | 410.129 | +35.65% |
+| Flash | 16 | 307.546 | 431.620 | +40.34% |
+| Flash | 32 | 329.364 | 440.291 | +33.68% |
+| Flash | 64 | 364.272 | 504.705 | +38.55% |
+| Flash | 128 | 431.221 | 500.753 | +16.12% |
+| Flash | 256 | 510.901 | 523.112 | +2.39% |
+| Flash | 512 | 930.339 | 950.516 | +2.17% |
+| Flash | 1024 | 1548.364 | 1617.000 | +4.43% |
+| Flash | 2048 | 2739.407 | 2810.000 | +2.58% |
+| Flash | 4096 | 5076.000 | 5325.000 | +4.91% |
+| Flash | 8192 | 9845.000 | 10282.000 | +4.44% |
+| Pro | 8 | 701.251 | 867.432 | +23.70% |
+| Pro | 16 | 975.986 | 1118.500 | +14.60% |
+| Pro | 32 | 1064.510 | 1163.000 | +9.25% |
+| Pro | 64 | 1110.956 | 1214.000 | +9.28% |
+| Pro | 128 | 1219.869 | 1615.500 | +32.43% |
+| Pro | 256 | 1666.925 | 1635.000 | -1.92% |
+| Pro | 512 | 2417.349 | 2542.000 | +5.16% |
+| Pro | 1024 | 4057.000 | 3929.000 | -3.16% |
+| Pro | 2048 | 7054.000 | 6962.000 | -1.30% |
+| Pro | 4096 | 12997.000 | 13095.000 | +0.75% |
+| Pro | 8192 | 24986.000 | 25334.000 | +1.39% |
+
+The same-epoch geometric gaps are:
+
+- all 22 points: `+11.67%`;
+- M <= 128: `+24.82%`;
+- M >= 256: `+1.79%`;
+- Flash small-M: `+32.57%`;
+- Pro small-M: `+17.52%`;
+- all Flash points: `+15.81%`;
+- all Pro points: `+7.68%`.
+
+Compared with the R19 final matrix, the all-point gap falls from `+13.14%` to
+`+11.67%`, and Pro small-M falls from `+22.74%` to `+17.52%`. The matched
+R19/R20 control already measured the direct Pro small-M code improvement as
+`-6.63%`; the remaining difference between final matrices is node-epoch
+variation. Flash code is unchanged, so its final-matrix movement is not
+credited to R20.
+
+R20 is retained because its improvement is reproduced by the matched control,
+the complete matrix, the static SASS reduction, and NCU's 23.36% aggregate
+instruction reduction. It still does not meet the terminal goal: Flash M8-M64
+is 34-40% behind PR383, Pro M8 is 24% behind, and Pro M128 is 32% behind. R21
+therefore targets fixed small-M decode/synchronization cost, starting with a
+Flash-safe packed-word pairing and a separate M128 schedule diagnosis.
+
+Raw same-epoch logs are under
+`/app/deepgemm-auto-results/iter26-r20-final-matrix`; the local export is
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter26-r20-final-matrix`.
