@@ -1911,3 +1911,63 @@ orders at both 10 and 50 observations, passes production correctness, and
 does not add spilling or alter adjacent selectors. Raw artifacts are under
 `/app/deepgemm-auto-results/iter30-pro-m128-swap-retest`; the local export is
 `/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter30-pro-m128-swap-retest`.
+
+## Final matrix after R23
+
+R23 and PR383 were measured consecutively on the same H20 pod with fresh JIT
+caches. The candidate uses the authoritative fused MXFP4 benchmark, while
+PR383 uses its native compatible two-phase driver and reports L1 plus L2.
+Small-M points use 50 observations, large-M points use three, and every
+observation contains 20 launches with cold L2 and maximum-rank medians.
+
+| model | M | PR383 us | R23 us | R23 gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 301.405 | 410.895 | +36.33% |
+| Flash | 16 | 314.704 | 444.815 | +41.34% |
+| Flash | 32 | 323.060 | 436.988 | +35.27% |
+| Flash | 64 | 363.907 | 479.564 | +31.78% |
+| Flash | 128 | 441.379 | 496.806 | +12.56% |
+| Flash | 256 | 545.820 | 494.466 | -9.41% |
+| Flash | 512 | 926.856 | 1008.000 | +8.76% |
+| Flash | 1024 | 1510.966 | 1544.000 | +2.19% |
+| Flash | 2048 | 2716.829 | 2768.000 | +1.88% |
+| Flash | 4096 | 5045.000 | 5173.000 | +2.54% |
+| Flash | 8192 | 9803.000 | 10045.000 | +2.47% |
+| Pro | 8 | 690.600 | 865.957 | +25.39% |
+| Pro | 16 | 981.139 | 1116.000 | +13.74% |
+| Pro | 32 | 1078.618 | 1168.000 | +8.29% |
+| Pro | 64 | 1132.643 | 1207.500 | +6.61% |
+| Pro | 128 | 1233.846 | 1423.000 | +15.33% |
+| Pro | 256 | 1653.253 | 1613.000 | -2.43% |
+| Pro | 512 | 2447.575 | 2535.000 | +3.57% |
+| Pro | 1024 | 4035.000 | 3925.000 | -2.73% |
+| Pro | 2048 | 7007.000 | 6984.000 | -0.33% |
+| Pro | 4096 | 13016.000 | 13079.000 | +0.48% |
+| Pro | 8192 | 24997.000 | 25365.000 | +1.47% |
+
+The same-epoch geometric gaps are:
+
+- all 22 points: `+9.85%`;
+- M <= 128: `+22.06%`;
+- M >= 256: `+0.62%`;
+- Flash small-M: `+31.06%`;
+- Pro small-M: `+13.69%`;
+- all Flash points: `+13.85%`;
+- all Pro points: `+5.99%`;
+- Pro large-M: `-0.02%`.
+
+R23 reduces the all-point gap from R21's `+10.47%` to `+9.85%`, Pro all-point
+from `+7.56%` to `+5.99%`, Pro small-M from `+16.53%` to `+13.69%`, and Pro
+M128 from `+33.25%` to `+15.33%`. Flash and every point outside Pro M128 are
+source-identical to R21; their movement is node-epoch variance and is not
+credited to R23.
+
+Raw logs are under `/app/deepgemm-auto-results/iter31-r23-final-matrix`; the
+local export is
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter31-r23-final-matrix`.
+
+The terminal goal is still unmet. Pro large-M is closed and Pro M16-M128 is
+within 7-15%, but Flash M8-M64 remains 32-41% behind PR383 and now dominates
+the geometric gap. The next iteration returns to the Flash swap-AB latency
+kernel and targets its fixed epilogue/synchronization cost rather than the
+already-reduced MXFP4 decode body.
