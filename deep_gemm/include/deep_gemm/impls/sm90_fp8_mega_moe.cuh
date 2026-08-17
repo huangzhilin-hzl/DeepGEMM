@@ -300,8 +300,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr uint32_t kNumRingBlocks = kNumRingTokens / BLOCK_M;
     constexpr bool kHasSharedExperts = kNumSharedExperts > 0;
     DG_STATIC_ASSERT(not kSmallMSwapAB or
-                         (kHidden == 4096 and not kHasSharedExperts),
-                     "Small-M swap-AB is routed-only and Flash-specific");
+                         ((kHidden == 4096 or kHidden == 7168) and
+                          not kHasSharedExperts),
+                     "Small-M swap-AB is routed-only and model-specific");
 
     // =====================================================================
     // Template checks

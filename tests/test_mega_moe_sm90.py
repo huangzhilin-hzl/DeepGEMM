@@ -752,6 +752,28 @@ def _full_scenarios(
             fast_math=True,
             activation_clamp=10.0,
         )),
+        ('production.pro_m32', dict(
+            num_max_tokens_per_rank=128,
+            num_tokens=32,
+            hidden=7168,
+            intermediate_hidden=3072,
+            num_experts=48 * num_ranks,
+            num_topk=6,
+            fast_math=True,
+            activation_clamp=10.0,
+            require_ring_wrap=True,
+        )),
+        ('production.pro_m64', dict(
+            num_max_tokens_per_rank=128,
+            num_tokens=64,
+            hidden=7168,
+            intermediate_hidden=3072,
+            num_experts=48 * num_ranks,
+            num_topk=6,
+            fast_math=True,
+            activation_clamp=10.0,
+            require_ring_wrap=True,
+        )),
     ]
     rng = random.Random(0xC0FFEE)
     for index in range(stress_count):

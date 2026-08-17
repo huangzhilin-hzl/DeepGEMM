@@ -212,3 +212,56 @@ noise rather than widening the selector.
 - The resource report identifies the next target: shorten the live range of
   the swap epilogue/partial arrays enough to restore WGMMA issue parallelism,
   without giving up two resident CTAs.
+
+## Iteration 03: extend blockwise swap-AB to Pro M <= 64
+
+### Reason and direction
+
+Iteration 02 left the largest small-M gaps in DSV4 Pro: +70.17% at M8 and
++47.73% at M64. Pro uses the same routed MXFP4 numerical contract and fixed
+M64 x N128 Humming tile, so the validated blockwise swap-AB path was extended
+to H7168/I3072. Pro aliases the second decoded-weight buffer with C/D shared
+memory to preserve two-CTA occupancy; the alias is safe because the C/D
+epilogue begins only after the routed mainloop has finished.
+
+A temporary selector enabled the Pro path through M256 to locate the actual
+crossover before choosing a production cutoff.
+
+| M | baseline us | crossover sweep us | change |
+| ---: | ---: | ---: | ---: |
+| 8 | 1179.500 | 1060.000 | -10.13% |
+| 16 | 1538.500 | 1350.000 | -12.25% |
+| 32 | 1598.000 | 1395.500 | -12.67% |
+| 64 | 1634.000 | 1461.000 | -10.59% |
+| 128 | 1637.000 | 1773.500 | +8.34% |
+| 256 | 1663.000 | 3957.000 | +137.94% |
+
+The sweep used ten observations per point only to select the boundary. It
+rejects M128/M256 and fixes the final Pro selector at M <= 64. The accepted
+points were then rerun with the full 50-observation contract.
+
+### Final performance
+
+| M | baseline us | final us | change | PR383 us | gap to PR383 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 1179.500 | 1042.000 | -11.66% | 693.125 | +50.33% |
+| 16 | 1538.500 | 1328.000 | -13.68% | 971.170 | +36.74% |
+| 32 | 1598.000 | 1390.500 | -12.98% | 1064.547 | +30.62% |
+| 64 | 1634.000 | 1448.500 | -11.35% | 1106.107 | +30.95% |
+| 128 | 1637.000 | 1646.500 | +0.58% | 1228.166 | +34.06% |
+
+The four enabled points improve by 12.42% geometric mean. Their geometric-
+mean gap to PR383 falls from 56.36% to 36.94%. Across Pro M8-M128, including
+the unchanged M128 path, the gain is 9.97% geometric mean.
+
+### Correctness and resource result
+
+- Eight-rank, forced-ring-wrap validation passes at `diff=0.005395` for
+  `production.pro_m32` and `diff=0.003913` for `production.pro_m64`.
+- PTXAS reports 128 registers, four barriers, a 488-byte stack frame, 584
+  bytes of spill stores, and 732 bytes of spill loads for Pro M32, with the
+  same fixed-register WGMMA serialization warning as Flash.
+- The next optimization should split the shared blockwise math from the
+  model-specific remap so the N8/N16 specializations do not carry arrays sized
+  for N64. That is the most direct route to reduce the reported local frame and
+  long-scoreboard pressure while preserving the proven launch topology.

@@ -95,9 +95,9 @@ public:
             args.hidden == 4096 and
             args.num_tokens > kSM90MoeMaxLatencyOverlapTokens;
         const bool small_m_swap_ab =
-            args.hidden == 4096 and
             args.num_shared_experts == 0 and
-            args.num_tokens <= 32;
+            ((args.hidden == 4096 and args.num_tokens <= 32) or
+             (args.hidden == 7168 and args.num_tokens <= 64));
         constexpr int kL2CDSwizzleMinTokens = 1024;
         const bool swizzle_l2_cd =
             args.num_tokens >= kL2CDSwizzleMinTokens;
