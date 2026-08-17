@@ -1145,3 +1145,58 @@ The prototype source was reverted completely. Evidence remains on the pod at
    is phase-specific descriptor/epilogue selection around the task lambda,
    followed by scheduler issue/barrier reductions rather than another
    accumulator representation change.
+
+## PR383 phase diagnosis after R14
+
+The matched PR383 implementation uses FP8 weights, two split kernels, one
+78-CTA block per H20 SM, two math warpgroups per CTA, N64 per warpgroup for
+the small-M swap-AB schedule, and seven producer stages. Its authoritative
+Pro M32 rank-0 medians are about 0.675 ms for L1 and 0.382 ms for L2. A new
+low-perturbation NSYS capture reproduced 0.674/0.364 ms on the least-perturbed
+rank.
+
+R14's current-source MXFP4 phase kernels use two 256-thread CTAs per SM and one
+math warpgroup per CTA. Their least-perturbed NSYS times are 0.824/0.445 ms.
+The per-phase gaps are therefore already present before the fused scheduler;
+the production fused kernel merely recovers roughly 0.110 ms by overlapping
+L1 and L2.
+
+Static SASS structure identifies the source of the phase cost:
+
+| phase | implementation | IMAD | LOP3 | registers | local |
+| --- | --- | ---: | ---: | ---: | ---: |
+| L1 | PR383 FP8 | 345 | 66 | 168 | 0 B |
+| L1 | R14 MXFP4 | 1223 | 1129 | 125 | 0 B |
+| L2 | PR383 FP8 | 420 | 65 | 168 | 0 B |
+| L2 | R14 MXFP4 | 1194 | 996 | 128 | 0 B |
+
+The approximately fourfold integer-address/decode body in MXFP4, rather than
+register spill, is now the primary small-M target. PR383 evidence is retained
+under `/app/deepgemm-auto-results/iter18-pr383-phase-compare` and the local
+export under
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter18-pr383-phase-compare`.
+
+## Rejected experiment R15: replace Pro M32 packed BF16 with half-group pipeline
+
+R08's packed-BF16 epilogue is selected for Pro M16/M32, while R12's accepted
+separate-commit-group weight-half pipeline is selected only for non-packed
+Pro M8/M64. R15 removed M32 from the packed selector to test the previously
+unmeasured combination through the already-compiled R12 path.
+
+The adjacent ten-observation cold-L2 screen used 20 launches per observation
+and maximum-rank medians:
+
+| model | M | R13 control us | R15 us | change |
+| --- | ---: | ---: | ---: | ---: |
+| Pro | 32 | 1282.500 | 1287.000 | +0.35% |
+
+The result is neutral-to-negative and does not justify a 50-observation run.
+The one-line selector change was reverted. Logs and cubins remain under
+`/app/deepgemm-auto-results/iter19-pro-m32-half-pipeline`, with the compact
+local export under
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter19-pro-m32-half-pipeline`.
+
+The next structural prototype keeps one fused launch but moves to one CTA per
+SM with two math warpgroups. Each warpgroup owns one N64 weight half, matching
+PR383's successful small-M parallel decomposition while retaining packed
+MXFP4 storage and the interleaved L1/L2 scheduler.
