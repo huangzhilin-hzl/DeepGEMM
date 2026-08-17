@@ -807,3 +807,142 @@ export is under
 4. Keep Flash and M >= 128 unchanged. If the hybrid does not close most of the
    remaining 16.95-31.26% small-M gaps, prototype a current-source L1/L2 split
    instead of restoring the obsolete R09 snapshot.
+
+## Rejected experiment R11: issue both Pro weight halves in one commit group
+
+### Reason and direction
+
+R10's spill removal introduced a `wait<0>` between the two weight halves. The
+first overlap experiment allocated two compact fragments inside the existing
+32-float Pro storage and issued both halves before one wait. N64 retained the
+sequential fallback because two full fragments need 64 floats.
+
+### Screening result
+
+Correctness passed for Pro M32 at `diff=0.007567`, and PTXAS still reported
+128 registers, an 8-byte stack frame, and no local-memory allocation. However,
+the same-commit batch was consistently slower than R10:
+
+| model | M | R10 screen us | same-group us | change |
+| --- | ---: | ---: | ---: | ---: |
+| Pro | 8 | 932.734 | 1025.500 | +9.95% |
+| Pro | 16 | 1204.000 | 1308.500 | +8.68% |
+| Pro | 32 | 1258.500 | 1391.500 | +10.57% |
+| Pro | 64 | 1305.000 | 1439.000 | +10.27% |
+
+The regression is therefore WGMMA scheduling rather than restored spills.
+R11 is rejected and fully reverted.
+
+## Accepted experiment R12: pipeline separate Pro weight-half commit groups
+
+### Reason
+
+R11 showed that sharing one commit group serializes badly, while R10's
+per-half `wait<0>` leaves no WGMMA in flight during the first promotion. A
+middle ground is possible: give each compact fragment its own commit group,
+then use `wait<1>` to expose half 0 while half 1 remains in flight.
+
+### Direction
+
+- Issue the two compact weight halves as separate WGMMA commit groups.
+- Promote half 0 after `wait<1>`, then promote half 1 after the final
+  `wait<0>`; apply the same schedule to both L2 K32 promotion groups.
+- Reuse the existing 32-float allocation and preserve the 156-CTA cooperative
+  grid, four barriers, stage-release ordering, and numerical scaling.
+- Select the pipeline only for the measured Pro M8 and M64 specializations.
+  Packed-BF16 M16/M32 buckets keep R10's sequential schedule, as do Flash,
+  N64 fallback work, and M >= 128.
+
+Correctness passes for Pro M64 at `diff=0.003540`. PTXAS remains at 128
+registers, an 8-byte stack frame, and zero allocated local bytes.
+
+### Matched 50-observation A/B
+
+Control is fixed commit `3066396`; both sides use isolated JIT caches and the
+full cold-L2 benchmark contract.
+
+| model | M | R10 control us | R12 us | change |
+| --- | ---: | ---: | ---: | ---: |
+| Pro | 8 | 943.654 | 936.180 | -0.79% |
+| Pro | 64 | 1318.500 | 1300.000 | -1.40% |
+
+The two-point geometric-mean improvement is 1.10%. Both selected points agree
+with the 10-observation screen, so the targeted schedule is accepted.
+
+### Final DSV4 Flash/Pro matrix
+
+The final-selector run uses 50 observations for M <= 128, three for M >= 256,
+20 launches per observation, max-rank medians, and explicit `--flush-l2 1`.
+
+| model | M | PR383 us | R12 final us | gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 301.924 | 409.205 | +35.53% |
+| Flash | 16 | 312.858 | 447.273 | +42.96% |
+| Flash | 32 | 328.370 | 457.566 | +39.34% |
+| Flash | 64 | 361.647 | 492.922 | +36.30% |
+| Flash | 128 | 433.330 | 496.938 | +14.68% |
+| Flash | 256 | 518.971 | 588.401 | +13.38% |
+| Flash | 512 | 917.665 | 924.604 | +0.76% |
+| Flash | 1024 | 1526.078 | 1593.000 | +4.39% |
+| Flash | 2048 | 2745.844 | 2807.000 | +2.23% |
+| Flash | 4096 | 5079.000 | 5298.000 | +4.31% |
+| Flash | 8192 | 9808.000 | 10346.000 | +5.49% |
+| Pro | 8 | 693.125 | 921.860 | +33.00% |
+| Pro | 16 | 971.170 | 1202.000 | +23.77% |
+| Pro | 32 | 1064.547 | 1242.000 | +16.67% |
+| Pro | 64 | 1106.107 | 1296.000 | +17.17% |
+| Pro | 128 | 1228.166 | 1635.500 | +33.17% |
+| Pro | 256 | 1636.918 | 1675.000 | +2.33% |
+| Pro | 512 | 2415.108 | 2569.000 | +6.37% |
+| Pro | 1024 | 4060.000 | 4019.000 | -1.01% |
+| Pro | 2048 | 7025.000 | 7095.000 | +1.00% |
+| Pro | 4096 | 12987.000 | 13324.000 | +2.59% |
+| Pro | 8192 | 25203.000 | 25901.000 | +2.77% |
+
+The geometric-mean gaps versus PR383 are +14.45% over all 22 points, +28.88%
+for M <= 128, +3.66% for M >= 256, and +22.48% for Pro M8-M64. The matched
+A/B is the change attribution: all Flash points, Pro M16/M32, and M >= 128
+compile the previous schedule. In particular, the unchanged Flash M256 point
+is unusually slow in this three-observation matrix and accounts for most of
+the aggregate movement from R10; it is not caused by R12's Pro-only selector.
+
+### R12 NCU and NSYS
+
+Eight rank-local NCU application-replay reports were collected for Pro M64.
+R10's earlier report used Pro M32, so the counter comparison is directional
+rather than a latency attribution; the matched benchmark above remains the
+acceptance test.
+
+| median NCU counter | R10 Pro M32 | R12 Pro M64 |
+| --- | ---: | ---: |
+| local-load sectors | 36480 | 36864 |
+| local-store sectors | 2496 | 2496 |
+| issue active | 2.914% | 2.940% |
+| tensor-pipe active | 0.020% | 0.030% |
+| barrier stall | 64.002% | 63.353% |
+| long-scoreboard stall | 30.069% | 29.770% |
+
+The unchanged local-store count and near-identical local-load count confirm
+that the two live compact fragments did not restore R08's spill traffic. The
+small tensor-pipe increase and scoreboard decrease agree with the intended
+half-1 overlap, while the rank-skewed replay values remain diagnostic only.
+
+Low-perturbation NSYS still contains exactly one 156-CTA fused MegaMoE kernel,
+one NCCL all-reduce, and one fill kernel. The traced main kernel is 1.503 ms;
+this is topology evidence, not a replacement for the cold-L2 score.
+
+Complete evidence remains on the pod under
+`/app/deepgemm-auto-results/iter15-half-group-targeted`. The compact local
+export is under
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter15-half-group-targeted`.
+
+### Next iteration
+
+1. Apply the same separate-group schedule to Flash M8/M16/M32 while retaining
+   the sequential N64 fallback. Flash still carries R08's 448-byte frame and
+   is 35.53-42.96% behind PR383 at those points.
+2. Require PTXAS to remove the Flash frame without lowering two-CTA residency,
+   then run matched Flash M8/M16/M32 screening before a full matrix.
+3. If Flash cannot benefit from compact-fragment pipelining, stop tuning the
+   fused accumulator schedule and implement a current-source L1/L2 lifetime
+   split for the remaining M <= 128 latency gap.
