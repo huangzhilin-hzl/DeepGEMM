@@ -2609,3 +2609,139 @@ M1024/M2048 already win; the next work must prioritize the verified Flash
 latency gaps, especially M16 (`+36.60%`) and M64/M32/M8 (`+25-27%`). Raw logs
 are under `/app/deepgemm-auto-results/iter55-r32-final-matrix`, with a matching
 local export below the profile-artifact root.
+
+## Rejected experiment R33: rank-major Flash dispatch pull
+
+### Reason and direction
+
+The Flash dispatch pull loop rebuilt the SM100 round-robin rank schedule for
+every routed token. R33 tested a rank-major prefix lookup for the one-wave
+small-M Flash path: one warp prefix sum and ballot selected the source rank,
+while the existing source metadata preserved combine identity.
+
+Eight-rank correctness passed Flash M8/M16/M32/M64 at
+`0.000649/0.000645/0.000656/0.000654`. A broad 20-observation screen gave:
+
+| Flash point | first R32-equivalent us | R33 us | change | second control us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| M8 | 384.439 | 399.817 | +4.00% | 415.007 | -3.66% |
+| M16 | 426.691 | 453.448 | +6.27% | 442.527 | +2.47% |
+| M32 | 432.685 | 423.155 | -2.20% | 425.428 | -0.53% |
+| M64 | 463.276 | 456.064 | -1.56% | 452.086 | +0.88% |
+
+Only M32 won in that screen, so the selector was narrowed to exactly M32 and
+rerun with the full 50-observation A/B/A contract. The result was
+`430.171/425.395/420.352 us`: `-1.11%` versus the first control but `+1.20%`
+versus the second. The sign reversal identifies node drift rather than a
+stable win, so R33 was fully reverted. Evidence is under
+`iter56-flash-rank-major-pull-screen` and
+`iter57-flash-m32-rank-major-formal` on the pod and local artifact root.
+
+## Rejected experiments R34/R35: row-owned Flash MXFP4 decode
+
+### Reason and direction
+
+The accepted paired Flash decoder assigned two lanes to each logical row.
+Consequently each K32 row scale was shuffled and converted to an E4M3 lookup
+twice. R34 assigned one complete row to each lane, shared one lookup across
+all four packed K32 words, and loaded the four words with LDS.128. The exact
+M16 prototype passed eight-rank correctness at `0.000645` and an initial
+20-observation screen at `430.990/414.820/439.349 us` (`-3.75%/-5.58%`).
+
+Isolated M16 NCU confirmed that the intended work disappeared:
+
+| NCU metric | R32 | R34 | change |
+| --- | ---: | ---: | ---: |
+| executed warp instructions | 73,216,037 | 68,002,559 | -7.12% |
+| executed thread instructions | 2,288,537,091 | 2,121,797,338 | -7.29% |
+| global-load sectors | 844,012 | 846,724 | +0.32% |
+| local load/store sectors | 0/0 | 0/0 | unchanged |
+
+The formal 50-observation M16 run did not reproduce the screen:
+`417.055/428.269/434.773 us`, or `+2.69%/-1.50%`. A broad shape screen also
+failed to find a stable selector:
+
+| Flash point | first control us | R34 us | change | second control us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| M8 | 392.785 | 405.258 | +3.18% | 406.164 | -0.22% |
+| M32 | 454.404 | 448.362 | -1.33% | 434.601 | +3.17% |
+| M64 | 460.600 | 465.494 | +1.06% | 456.441 | +1.98% |
+
+R35 retained row ownership but split LDS.128 into two bank-validated LDS.64
+loads. M16 remained correct at `0.000645`, but measured
+`443.533/444.948/443.519 us`, a `+0.32%/+0.32%` regression. Fewer aggregate
+instructions did not shorten the critical shared-memory/decode schedule, so
+both row-owned variants were reverted. Evidence is under
+`iter58-flash-m16-row-owned-decode` through
+`iter61-flash-m16-row-owned-lds64`.
+
+## R36: packed BF16 HFMA2 promotion for Flash M8/M64
+
+### Reason and direction
+
+The swap-AB mainloop already retained its cross-K persistent result as packed
+BF16x2, but each promotion unpacked that result to FP32, issued four scalar
+FMAs per pair, and packed it again. The regular-orientation fast-math path had
+already validated BF16x2 fragment/scale promotion. R36 applies the same
+operation to swap-AB: the two token scales and two WGMMA accumulator values
+are packed, then accumulated directly with `__hfma2`.
+
+The broad implementation passed eight-rank Flash M8/M16/M32/M64 correctness
+at `0.000671/0.000654/0.000666/0.000660`. M16 was mixed at
+`429.567/436.640/445.452 us` (`+1.65%/-1.98%`). Independent shape screening
+selected only M8 and M64:
+
+| Flash point | first control us | broad R36 us | change | second control us | reverse change | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| M8 | 397.829 | 380.210 | -4.43% | 411.467 | -7.60% | accept |
+| M32 | 445.930 | 438.096 | -1.76% | 424.845 | +3.12% | reject |
+| M64 | 465.409 | 463.827 | -0.34% | 466.647 | -0.60% | accept |
+
+The final compile-time selector is exact for routed Flash M8/M64. Flash
+M16/M32, all Pro points, regular-orientation kernels, and strict math retain
+their old scalar promotion.
+
+### Formal performance
+
+The formal R32-equivalent/R36/R32-equivalent run used ten warmups, 50
+observations, 20 launches per observation, cold L2, and maximum-rank medians:
+
+| Flash point | first control us | R36 us | change | second control us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| M8 | 396.172 | 376.645 | -4.93% | 389.321 | -3.26% |
+| M64 | 460.989 | 449.242 | -2.55% | 465.193 | -3.43% |
+
+The retained two-point geometric mean improves by `-3.75%` versus the first
+control and `-3.32%` versus the second. Raw formal logs are under
+`iter64-flash-hfma2-formal`.
+
+### NCU and NSYS analysis
+
+An isolated one-rank, 32-expert Flash M64 profile preserves the production
+expert/scheduler layout while removing distributed replay skew:
+
+| NCU metric | R32-equivalent | R36 | change |
+| --- | ---: | ---: | ---: |
+| executed warp instructions | 94,250,307 | 87,158,677 | -7.52% |
+| executed thread instructions | 2,961,050,641 | 2,733,535,692 | -7.68% |
+| global-load sectors | 956,227 | 960,389 | +0.44% |
+| global atomic sectors | 4,396 | 4,396 | unchanged |
+| local load sectors | 0 | 180,224 | new spill traffic |
+| local store sectors | 0 | 73,024 | new spill traffic |
+
+Both cubins remain at 128 registers/thread. R36 wins the formal benchmark
+despite the compiler-generated local traffic because the scalar
+conversion/FMA body shrinks substantially; eliminating that spill is now the
+immediate optimization target.
+
+Low-perturbation eight-rank NSYS reports one 156-CTA fused kernel on both
+sides and a single-launch duration of `713.052 us` for the control versus
+`697.436 us` for R36 (`-2.19%`). Unlike several earlier one-launch traces,
+this direction agrees with both formal controls. Complete profiler evidence
+is under `iter65-flash-m64-hfma2-profiles` on the pod and local artifact root.
+
+The terminal goal remains unmet. R36 removes 2.5-5% from two Flash latency
+points but does not close the remaining PR383 gap. The next iteration should
+retain the exact M8/M64 selector and shorten the HFMA2 temporary live ranges
+or pair it with an epilogue layout that removes the newly measured local
+traffic before expanding to another shape.

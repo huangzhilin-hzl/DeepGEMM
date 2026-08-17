@@ -2199,29 +2199,58 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                             weight_half *
                                                 (kSwapABHalfAccumPerThread / 2) +
                                             chunk * 2;
-                                        const float2 persistent_0 =
-                                            __bfloat1622float2(
-                                                mxfp4_final_bf16[pair_offset]);
-                                        const float2 persistent_1 =
-                                            __bfloat1622float2(
-                                                mxfp4_final_bf16[
-                                                    pair_offset + 1]);
-                                        mxfp4_final_bf16[pair_offset] =
-                                            __floats2bfloat162_rn(
-                                                fmaf(combined_scale_0,
-                                                     accum[accum_offset],
-                                                     persistent_0.x),
-                                                fmaf(combined_scale_1,
-                                                     accum[accum_offset + 1],
-                                                     persistent_0.y));
-                                        mxfp4_final_bf16[pair_offset + 1] =
-                                            __floats2bfloat162_rn(
-                                                fmaf(combined_scale_0,
-                                                     accum[accum_offset + 2],
-                                                     persistent_1.x),
-                                                fmaf(combined_scale_1,
-                                                     accum[accum_offset + 3],
-                                                     persistent_1.y));
+                                        if constexpr (
+                                                kFastMath and
+                                                kHidden == 4096 and
+                                                kSmallMSwapAB and
+                                                (kMaxSwapABTokens == 8 or
+                                                 kMaxSwapABTokens == 64)) {
+                                            const nv_bfloat162 scale_pair =
+                                                __floats2bfloat162_rn(
+                                                    combined_scale_0,
+                                                    combined_scale_1);
+                                            mxfp4_final_bf16[pair_offset] =
+                                                __hfma2(
+                                                    scale_pair,
+                                                    __floats2bfloat162_rn(
+                                                        accum[accum_offset],
+                                                        accum[accum_offset + 1]),
+                                                    mxfp4_final_bf16[
+                                                        pair_offset]);
+                                            mxfp4_final_bf16[pair_offset + 1] =
+                                                __hfma2(
+                                                    scale_pair,
+                                                    __floats2bfloat162_rn(
+                                                        accum[accum_offset + 2],
+                                                        accum[accum_offset + 3]),
+                                                    mxfp4_final_bf16[
+                                                        pair_offset + 1]);
+                                        } else {
+                                            const float2 persistent_0 =
+                                                __bfloat1622float2(
+                                                    mxfp4_final_bf16[
+                                                        pair_offset]);
+                                            const float2 persistent_1 =
+                                                __bfloat1622float2(
+                                                    mxfp4_final_bf16[
+                                                        pair_offset + 1]);
+                                            mxfp4_final_bf16[pair_offset] =
+                                                __floats2bfloat162_rn(
+                                                    fmaf(combined_scale_0,
+                                                         accum[accum_offset],
+                                                         persistent_0.x),
+                                                    fmaf(combined_scale_1,
+                                                         accum[accum_offset + 1],
+                                                         persistent_0.y));
+                                            mxfp4_final_bf16[pair_offset + 1] =
+                                                __floats2bfloat162_rn(
+                                                    fmaf(combined_scale_0,
+                                                         accum[accum_offset + 2],
+                                                         persistent_1.x),
+                                                    fmaf(combined_scale_1,
+                                                         accum[accum_offset + 3],
+                                                         persistent_1.y));
+                                        }
                                     }
                                 }
                                 // SFA belongs to the same producer stage as A.
