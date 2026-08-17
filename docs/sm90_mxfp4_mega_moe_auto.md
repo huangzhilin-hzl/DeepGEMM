@@ -406,11 +406,41 @@ current fused pipeline needs the second CTA's compute parallelism more than it
 benefits from a larger register file. The source change was reverted; evidence
 is under `/app/deepgemm-auto-results/iter06-swap-launchbound` on the H20 pod.
 
+## Rejected experiment R06: consume packed BF16 in the epilogue
+
+### Reason and direction
+
+R06 preserved the 156-CTA, two-resident-CTA topology and added no barriers. It
+kept the routed result in the mainloop's 32 packed BF16x2 values and consumed
+them directly from both swap-AB epilogues, avoiding the intermediate expansion
+to 64 FP32 values per thread.
+
+Pro M32 correctness passed at 0.004380. PTXAS moved only from 488 to 480 bytes
+of stack, 584 to 574 bytes of spill stores, and 732 to 720 bytes of spill
+loads; WGMMA remained serialized.
+
+The ten-observation cold-L2 screen was mixed and regressed Flash M32
+decisively:
+
+| model | M | accepted us | R06 us | change |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 413.731 | 410.351 | -0.82% |
+| Flash | 16 | 445.744 | 465.213 | +4.37% |
+| Flash | 32 | 456.946 | 504.060 | +10.31% |
+| Pro | 8 | 1042.000 | 1072.000 | +2.88% |
+| Pro | 16 | 1328.000 | 1322.500 | -0.41% |
+| Pro | 32 | 1390.500 | 1377.500 | -0.93% |
+| Pro | 64 | 1448.500 | 1465.500 | +1.17% |
+
+The isolated sub-1% wins are within screening noise and do not justify the
+Flash regression, so the source change was reverted. Evidence is under
+`/app/deepgemm-auto-results/iter07-bf16-direct` on the H20 pod.
+
 ### Recommended next iterations
 
-1. Consume the existing packed BF16 routed accumulator directly in the swap
-   epilogue. This avoids converting it into a second 64-float per-thread array,
-   while adding no shared-memory barriers and retaining two resident CTAs.
+1. Isolate the runtime N8/N16/N32/N64 swap buckets into bucket-sized mainloop
+   frames so common N8/N16 expert tasks do not inherit the N64 accumulator
+   frame. Keep an explicit N64 fallback for skewed routing.
 2. Do not key a maximum N8/N16/N32 bucket only from global M: one expert can
    receive skewed routes aggregated from all ranks, so its runtime `valid_m`
    may require the N64 fallback even when per-rank M is small.
