@@ -1439,3 +1439,60 @@ matrix and rerun PR383 on the same H20 node epoch. Use that matrix to update
 the aggregate gap, then return to the integer/address body identified by R14:
 the retained PRMT changes recover about 2% per affected Pro point, but do not
 yet remove the double-digit small-M gap.
+
+## Final matrix after R19
+
+The accepted R19 branch and PR383 were measured consecutively on the same H20
+pod. Both used the authoritative DSV4 Flash/Pro shapes, M
+`8,16,32,64,128,256,512,1024,2048,4096,8192`, 50 observations for M <= 128,
+three observations for M >= 256, 20 launches per observation, cold L2, and
+maximum-rank medians. PR383 reports the sum of its L1 and L2 phase durations;
+the candidate reports its one fused persistent kernel.
+
+| model | M | PR383 us | R19 us | R19 gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 295.816 | 406.674 | +37.48% |
+| Flash | 16 | 307.067 | 436.333 | +42.10% |
+| Flash | 32 | 327.385 | 431.733 | +31.87% |
+| Flash | 64 | 366.641 | 480.363 | +31.02% |
+| Flash | 128 | 430.369 | 489.968 | +13.85% |
+| Flash | 256 | 498.118 | 538.485 | +8.10% |
+| Flash | 512 | 918.462 | 927.685 | +1.00% |
+| Flash | 1024 | 1572.457 | 1559.000 | -0.86% |
+| Flash | 2048 | 2729.000 | 2847.000 | +4.32% |
+| Flash | 4096 | 5094.000 | 5300.000 | +4.04% |
+| Flash | 8192 | 9840.000 | 10290.000 | +4.57% |
+| Pro | 8 | 708.989 | 915.649 | +29.15% |
+| Pro | 16 | 985.679 | 1194.500 | +21.19% |
+| Pro | 32 | 1065.082 | 1237.500 | +16.19% |
+| Pro | 64 | 1119.668 | 1284.500 | +14.72% |
+| Pro | 128 | 1227.411 | 1639.000 | +33.53% |
+| Pro | 256 | 1631.865 | 1668.000 | +2.21% |
+| Pro | 512 | 2441.122 | 2594.000 | +6.26% |
+| Pro | 1024 | 4052.000 | 4003.000 | -1.21% |
+| Pro | 2048 | 6990.000 | 7095.000 | +1.50% |
+| Pro | 4096 | 13011.000 | 13402.000 | +3.01% |
+| Pro | 8192 | 25143.000 | 25751.000 | +2.42% |
+
+The same-node geometric gaps are:
+
+- all 22 points: `+13.14%`;
+- M <= 128: `+26.75%`;
+- M >= 256: `+2.92%`;
+- Flash small-M: `+30.90%`;
+- Pro small-M: `+22.74%`.
+
+R13's recorded gaps were `+13.82%`, `+29.45%`, and `+2.25%` for all, small,
+and large points. R18/R19 reduce the small-M aggregate by another 2.70
+percentage points and the all-point aggregate by 0.68 points. The large-M
+code is unchanged; its movement is three-observation node variance.
+
+The remaining ranking is now unambiguous. Flash M8-M64 is 31-42% behind,
+Pro M8 and M128 are about 29% and 34% behind, while most M >= 256 points are
+within 1-8%. Flash already used the PRMT exponent extractor before R18, so the
+next small-M improvement must remove packed-nibble expansion/address work or
+hide it behind WGMMA rather than repeat the exponent-only optimization.
+
+Raw logs and the computed table are under
+`/app/deepgemm-auto-results/iter24-final-r19-matrix`; the local export is
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter24-final-r19-matrix`.
