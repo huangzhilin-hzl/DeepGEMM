@@ -265,3 +265,83 @@ the unchanged M128 path, the gain is 9.97% geometric mean.
   model-specific remap so the N8/N16 specializations do not carry arrays sized
   for N64. That is the most direct route to reduce the reported local frame and
   long-scoreboard pressure while preserving the proven launch topology.
+
+## Iteration 04: post-iteration profiler and final matrix
+
+### Matched large-M validation
+
+The optimized selectors are false above Flash M32 and Pro M64, but a first
+three-observation rerun showed enough node variance to make Flash M256 appear
+8.84% slower than the earlier branch baseline. A ten-observation recheck gave
+526.617 us versus the earlier 533.920 us, confirming that the source-identical
+path had not regressed. PR383 was then run immediately after the candidate on
+the same H20 node for a matched large-M comparison.
+
+| model | M | final us | matched PR383 us | gap |
+| --- | ---: | ---: | ---: | ---: |
+| flash | 256 | 526.617 | 520.417 | +1.19% |
+| flash | 512 | 951.115 | 965.191 | -1.46% |
+| flash | 1024 | 1609.000 | 1563.810 | +2.89% |
+| flash | 2048 | 2855.000 | 2743.821 | +4.05% |
+| flash | 4096 | 5392.000 | 5099.000 | +5.75% |
+| flash | 8192 | 10345.000 | 9899.000 | +4.51% |
+| pro | 256 | 1727.000 | 1678.652 | +2.88% |
+| pro | 512 | 2585.000 | 2455.305 | +5.28% |
+| pro | 1024 | 4031.000 | 4067.000 | -0.89% |
+| pro | 2048 | 7108.000 | 7084.000 | +0.34% |
+| pro | 4096 | 13332.000 | 13010.000 | +2.48% |
+| pro | 8192 | 25884.000 | 24955.000 | +3.72% |
+
+The matched M >= 256 geometric-mean gap is +2.54%, effectively unchanged from
+the original +2.51%. Combining it with the 50-observation small-M results gives
+a +16.19% geometric-mean gap over all 22 Flash/Pro points, down from +20.36%.
+The M <= 128 gap falls more substantially, from +45.93% to +34.99%.
+
+### Post-iteration NCU
+
+The table reports medians across eight application-replay reports for Pro M8.
+Rank-local utilization is highly skewed by distributed replay, so these values
+are diagnostic trends rather than throughput scores.
+
+| counter | baseline | final swap-AB |
+| --- | ---: | ---: |
+| local-load sectors | 0 | 675904 |
+| local-store sectors | 0 | 562560 |
+| issue active | 2.71% | 4.51% |
+| tensor-pipe active | 0.085% | 0.130% |
+| barrier stall | 62.45% | 62.37% |
+| long-scoreboard stall | 18.73% | 75.38% |
+
+Swap-AB increases useful issue/tensor activity and reduces unproductive padded
+WGMMA work enough to win despite introducing a large local-memory frame. The
+unchanged barrier median says grid synchronization is no longer the first
+optimization target. The new local traffic and fourfold long-scoreboard median
+agree with PTXAS's 488-byte Pro stack frame and are the clearest remaining
+bottleneck.
+
+### Post-iteration NSYS
+
+Low-perturbation rank-0 traces retain the same one-kernel, 156-CTA persistent
+topology. Their single-launch durations move from 755.548 to 744.348 us for
+Flash M8 (-1.48%) and from 1603.704 to 1399.545 us for Pro M8 (-12.73%). NSYS
+still perturbs the collective launch enough that these durations are not used
+as the benchmark score; the trace is evidence that no extra phase or launch
+was added.
+
+### Recommended next iterations
+
+1. Add a compile-time maximum swap bucket (N8/N16/N32/N64) to the JIT key and
+   size `accum`, packed partials, SwiGLU temporaries, and inverse-scale arrays
+   for that bucket. Today the runtime branch instantiates all four variants and
+   forces the local frame to accommodate N64 even for global M8.
+2. After bucket specialization, keep only one weight half's remap live at a
+   time or move the cross-warp amax scratch completely into the existing C/D
+   region. The acceptance criterion is zero or near-zero NCU local sectors
+   without reducing the two-CTA occupancy proven by R01.
+3. Re-profile long-scoreboard stalls. If spilling is removed but the small-M
+   gap remains above 20%, prototype a true two-phase L1/L2 latency kernel for
+   M <= 64, matching PR383's one-CTA-per-SM resource allocation while keeping
+   the fused 156-CTA kernel for throughput sizes.
+4. Preserve the measured crossover guards: Flash M <= 32 and Pro M <= 64.
+   Every future change should rerun M64/M128 boundaries plus the full DSV4
+   Flash/Pro matrix so a latency win cannot leak into the throughput path.
