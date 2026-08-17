@@ -323,9 +323,14 @@ def _benchmark_case(
         if args.profile_only:
             if rank_idx == 0:
                 _emit_json("PROFILE_CASE_JSON", case_metadata)
+            use_ncu_range = bool(int(os.environ.get("DG_NCU_RANGE", "0")))
+            if use_ncu_range:
+                torch.cuda.cudart().cudaProfilerStart()
             run_kernel()
             torch.cuda.synchronize()
             _barrier(group)
+            if use_ncu_range:
+                torch.cuda.cudart().cudaProfilerStop()
             return
 
         for _ in range(args.num_warmups):
