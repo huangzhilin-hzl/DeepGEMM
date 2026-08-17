@@ -1304,3 +1304,87 @@ increments rather than relying on C++ swizzle expressions.
 Artifacts are under
 `/app/deepgemm-auto-results/iter21-row-swizzle-hoist`; the local export is
 `/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter21-row-swizzle-hoist`.
+
+## Iteration R18: PRMT exponent extraction for Pro M32
+
+### Reason and direction
+
+R14 showed that integer decode/address work, rather than local-memory spill,
+is the primary remaining Pro M32 cost. The Flash path already had a validated
+`PRMT` implementation that extracts four UE8M0 scale bytes from one packed
+word. Pro M32 still instantiated the generic shift-and-mask implementation.
+R18 enables the existing `PRMT` specialization only for routed DSV4 Pro M32;
+all other model/batch combinations keep their previous specialization.
+
+The generated Pro M32 cubin keeps `REG=128, STACK=8, LOCAL=0`. Static SASS
+counts confirm a direct integer-instruction substitution with no address or
+resource side effect:
+
+| Pro M32 static SASS opcode | R13 control | R18 | change |
+| --- | ---: | ---: | ---: |
+| LOP3 | 1820 | 1628 | -192 |
+| SHF | 734 | 542 | -192 |
+| PRMT | 825 | 1081 | +256 |
+| IMAD | 1495 | 1495 | 0 |
+| IADD3 | 24 | 24 | 0 |
+
+The `-192/-192/+256` shape is consistent with replacing four independent
+byte shift/mask extracts per packed exponent word by byte permutations.
+
+### Correctness and authoritative cold-L2 result
+
+The full eight-rank `production.pro_m32` test passes with `fast_math=1` and
+`diff=0.000712`, including a physical 32-block ring wrap. The formal matched
+run used 50 observations, ten warmups, 20 launches per observation, explicit
+`--flush-l2 1`, and maximum-rank medians:
+
+| model | M | R13 control us | R18 us | change | PR383 us | R18 gap |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Pro | 32 | 1284.000 | 1258.500 | -1.99% | 1064.547 | +18.22% |
+
+An earlier adjacent 20-observation screen measured 1302.0 versus 1274.5 us
+(-2.11%), so the benefit reproduced under both run orders despite node-level
+variance. The 50-observation matched result is the acceptance score.
+
+### NCU and NSYS diagnosis
+
+Eight simultaneous application-replay NCU reports were collected for R18.
+The table compares cross-rank medians with the prior R10/R13-equivalent Pro
+M32 control report. Replay is rank-skewed, so sampled utilization and stalls
+are diagnostic trends, not latency scores.
+
+| median NCU counter | control | R18 | change |
+| --- | ---: | ---: | ---: |
+| executed instructions | 547.671 M | 445.730 M | -18.62% |
+| local-load sectors | 36480 | 36480 | 0 |
+| local-store sectors | 2496 | 2496 | 0 |
+| issue active | 2.915% | 3.000% | +0.085 pp |
+| tensor-pipe active | 0.020% | 0.025% | +0.005 pp |
+| barrier stall | 64.005% | 46.660% | -17.345 pp |
+| long-scoreboard stall | 30.070% | 21.945% | -8.125 pp |
+| wait stall | 2.415% | 4.475% | +2.060 pp |
+
+The stable findings are unchanged local traffic/resources and fewer dynamic
+instructions. The stall movement agrees directionally with a shorter decode
+dependency body, but is not used alone to attribute the 1.99% benchmark win.
+
+Low-perturbation rank-0 NSYS still contains exactly one 156-CTA fused MegaMoE
+launch. Its traced main kernel is 1.524 ms; as in prior iterations, this is
+topology evidence only and not a replacement for the cold-L2 score.
+
+Complete NCU reports remain on the H20 pod under
+`/app/deepgemm-auto-results/iter22-pro-prmt-exponent`. The compact local export,
+including raw counter text, NSYS, cubins, SASS, and resource usage, is under
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter22-pro-prmt-exponent`.
+
+### Next iteration
+
+1. Screen the same `PRMT` specialization independently at Pro M8, M16, and
+   M64. Accept per shape only when an adjacent cold-L2 A/B win reproduces;
+   do not infer benefit from M32 or from static instruction count alone.
+2. If the full Pro latency selector is retained, rerun all Pro M <= 128
+   points plus the final Flash/Pro matrix so selector boundaries and the
+   aggregate PR383 gap are measured on one node epoch.
+3. Continue reducing the MXFP4 decoder body after this low-risk extraction
+   win; the remaining +18.22% Pro M32 gap is too large to close with launch
+   topology or accumulator changes already rejected by R14-R17.
