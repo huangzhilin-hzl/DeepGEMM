@@ -1498,7 +1498,15 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 for (uint32_t i = 0; i < kAccumPerThread; ++ i)
                     final_accum[i] = 0.0f;
             }
-            float accum[kAccumPerThread];
+            // Swap-AB consumes one N64 weight half at a time. Reuse the same
+            // fragment for the second half after promotion instead of keeping
+            // both halves live across WGMMA. The regular orientation still
+            // needs the complete M64xN128 fragment.
+            constexpr bool kReuseSwapABFragment =
+                kSmallMSwapAB and kHidden == 7168;
+            constexpr uint32_t kAccumStorage = kReuseSwapABFragment ?
+                kSwapABHalfAccumPerThread : kAccumPerThread;
+            float accum[kAccumStorage];
             nv_bfloat162 mxfp4_final_bf16[kAccumPerThread / 2];
 
             const auto run_mxfp4_gemm_loop = [&]() {
@@ -1847,34 +1855,49 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             const uint32_t swap_col_idx = lane_idx % 4;
 
                             const auto issue_swap_wgmma = [&]<
+                                    uint32_t kFirstWeightHalf,
+                                    uint32_t kNumWeightHalves,
                                     uint32_t kStartK32,
                                     uint32_t kNumWGMMAs>(
                                     const uint32_t pipeline_stage,
                                     const uint32_t expanded_slot) {
+                                DG_STATIC_ASSERT(
+                                    kNumWeightHalves > 0 and
+                                        kFirstWeightHalf + kNumWeightHalves <=
+                                            kSwapABWeightHalves,
+                                    "Invalid swap-AB weight-half range");
                                 #pragma unroll
-                                for (uint32_t half = 0;
-                                     half < kSwapABWeightHalves; ++ half) {
-                                    auto* half_accum = accum +
-                                        half * kSwapABHalfAccumPerThread;
+                                for (uint32_t half_idx = 0;
+                                     half_idx < kNumWeightHalves; ++ half_idx) {
+                                    const uint32_t weight_half =
+                                        kFirstWeightHalf + half_idx;
+                                    auto* wgmma_accum = accum +
+                                        (kNumWeightHalves == 1 ? 0u :
+                                            weight_half *
+                                                kSwapABHalfAccumPerThread);
                                     #pragma unroll
                                     for (uint32_t i = 0; i < kSwapAccum; ++ i)
                                         ptx::warpgroup_fence_operand(
-                                            half_accum[i]);
+                                            wgmma_accum[i]);
                                 }
                                 ptx::warpgroup_arrive();
+                                const auto desc_b_base =
+                                    mma::sm90::make_smem_desc(
+                                        smem_a[pipeline_stage], 1);
                                 #pragma unroll
-                                for (uint32_t half = 0;
-                                     half < kSwapABWeightHalves; ++ half) {
-                                    auto* half_accum = accum +
-                                        half * kSwapABHalfAccumPerThread;
+                                for (uint32_t half_idx = 0;
+                                     half_idx < kNumWeightHalves; ++ half_idx) {
+                                    const uint32_t weight_half =
+                                        kFirstWeightHalf + half_idx;
+                                    auto* wgmma_accum = accum +
+                                        (kNumWeightHalves == 1 ? 0u :
+                                            weight_half *
+                                                kSwapABHalfAccumPerThread);
                                     const auto desc_a_base =
                                         mma::sm90::make_smem_desc(
                                             smem_b_expanded[expanded_slot] +
-                                                half * 64u * BLOCK_K,
+                                                weight_half * 64u * BLOCK_K,
                                             1);
-                                    const auto desc_b_base =
-                                        mma::sm90::make_smem_desc(
-                                            smem_a[pipeline_stage], 1);
                                     #pragma unroll
                                     for (uint32_t k = 0;
                                          k < kNumWGMMAs; ++ k) {
@@ -1884,26 +1907,38 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                         const cute::GmmaDescriptor desc_b(
                                             desc_b_base.desc_ + k32_idx * 2u);
                                         SwapWGMMA::wgmma(
-                                            desc_a, desc_b, half_accum,
+                                            desc_a, desc_b, wgmma_accum,
                                             k != 0);
                                     }
                                 }
                                 ptx::warpgroup_commit_batch();
                                 #pragma unroll
-                                for (uint32_t half = 0;
-                                     half < kSwapABWeightHalves; ++ half) {
-                                    auto* half_accum = accum +
-                                        half * kSwapABHalfAccumPerThread;
+                                for (uint32_t half_idx = 0;
+                                     half_idx < kNumWeightHalves; ++ half_idx) {
+                                    const uint32_t weight_half =
+                                        kFirstWeightHalf + half_idx;
+                                    auto* wgmma_accum = accum +
+                                        (kNumWeightHalves == 1 ? 0u :
+                                            weight_half *
+                                                kSwapABHalfAccumPerThread);
                                     #pragma unroll
                                     for (uint32_t i = 0; i < kSwapAccum; ++ i)
                                         ptx::warpgroup_fence_operand(
-                                            half_accum[i]);
+                                            wgmma_accum[i]);
                                 }
                             };
 
-                            const auto promote_swap_ab = [&]<bool kReleaseStage>(
+                            const auto promote_swap_ab = [&]<
+                                    uint32_t kFirstWeightHalf,
+                                    uint32_t kNumWeightHalves,
+                                    bool kReleaseStage>(
                                     const uint32_t pipeline_stage,
                                     const uint32_t activation_sf_group) {
+                                DG_STATIC_ASSERT(
+                                    kNumWeightHalves > 0 and
+                                        kFirstWeightHalf + kNumWeightHalves <=
+                                            kSwapABWeightHalves,
+                                    "Invalid swap-AB weight-half range");
                                 constexpr float kMaxSecondaryBeforeX64 =
                                     0x1p121f;
                                 const bool compensate_secondary =
@@ -1946,18 +1981,23 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                              scale_a_1 : scale_a_1 * 64.0f) *
                                         compensated_secondary;
                                     #pragma unroll
-                                    for (uint32_t half = 0;
-                                         half < kSwapABWeightHalves; ++ half) {
+                                    for (uint32_t half_idx = 0;
+                                         half_idx < kNumWeightHalves;
+                                         ++ half_idx) {
+                                        const uint32_t weight_half =
+                                            kFirstWeightHalf + half_idx;
                                         const uint32_t accum_offset =
-                                            half *
-                                                kSwapABHalfAccumPerThread +
+                                            (kNumWeightHalves == 1 ? 0u :
+                                                weight_half *
+                                                    kSwapABHalfAccumPerThread) +
                                             chunk * 4;
                                         const uint32_t pair_offset =
-                                            accum_offset / 2;
+                                            weight_half *
+                                                (kSwapABHalfAccumPerThread / 2) +
+                                            chunk * 2;
                                         const float2 persistent_0 =
                                             __bfloat1622float2(
-                                                mxfp4_final_bf16[
-                                                    pair_offset]);
+                                                mxfp4_final_bf16[pair_offset]);
                                         const float2 persistent_1 =
                                             __bfloat1622float2(
                                                 mxfp4_final_bf16[
@@ -2006,16 +2046,51 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                         stage_idx, expanded_slot);
                                 }
 
-                                if constexpr (is_linear1_phase) {
-                                    issue_swap_wgmma.template operator()<0, 4>(
-                                        stage_idx, expanded_slot);
+                                if constexpr (kReuseSwapABFragment) {
+                                    if constexpr (is_linear1_phase) {
+                                        issue_swap_wgmma.template operator()<
+                                            0, 1, 0, 4>(
+                                            stage_idx, expanded_slot);
+                                        promote_swap_ab.template operator()<
+                                            0, 1, false>(stage_idx, 0);
+                                        issue_swap_wgmma.template operator()<
+                                            1, 1, 0, 4>(
+                                            stage_idx, expanded_slot);
+                                    } else {
+                                        issue_swap_wgmma.template operator()<
+                                            0, 1, 0, 2>(
+                                            stage_idx, expanded_slot);
+                                        promote_swap_ab.template operator()<
+                                            0, 1, false>(stage_idx, 0);
+                                        issue_swap_wgmma.template operator()<
+                                            1, 1, 0, 2>(
+                                            stage_idx, expanded_slot);
+                                        promote_swap_ab.template operator()<
+                                            1, 1, false>(stage_idx, 0);
+                                        issue_swap_wgmma.template operator()<
+                                            0, 1, 2, 2>(
+                                            stage_idx, expanded_slot);
+                                        promote_swap_ab.template operator()<
+                                            0, 1, false>(stage_idx, 1);
+                                        issue_swap_wgmma.template operator()<
+                                            1, 1, 2, 2>(
+                                            stage_idx, expanded_slot);
+                                    }
                                 } else {
-                                    issue_swap_wgmma.template operator()<0, 2>(
-                                        stage_idx, expanded_slot);
-                                    promote_swap_ab.template operator()<false>(
-                                        stage_idx, 0);
-                                    issue_swap_wgmma.template operator()<2, 2>(
-                                        stage_idx, expanded_slot);
+                                    if constexpr (is_linear1_phase) {
+                                        issue_swap_wgmma.template operator()<
+                                            0, 2, 0, 4>(
+                                            stage_idx, expanded_slot);
+                                    } else {
+                                        issue_swap_wgmma.template operator()<
+                                            0, 2, 0, 2>(
+                                            stage_idx, expanded_slot);
+                                        promote_swap_ab.template operator()<
+                                            0, 2, false>(stage_idx, 0);
+                                        issue_swap_wgmma.template operator()<
+                                            0, 2, 2, 2>(
+                                            stage_idx, expanded_slot);
+                                    }
                                 }
 
                                 if constexpr (kPipelineMXFP4ExpandedB) {
@@ -2032,9 +2107,17 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                             expanded_slot ^ 1u);
                                     }
                                 }
-                                promote_swap_ab.template operator()<true>(
-                                    stage_idx,
-                                    is_linear1_phase ? 0u : 1u);
+                                if constexpr (kReuseSwapABFragment) {
+                                    promote_swap_ab.template operator()<
+                                        1, 1, true>(
+                                        stage_idx,
+                                        is_linear1_phase ? 0u : 1u);
+                                } else {
+                                    promote_swap_ab.template operator()<
+                                        0, 2, true>(
+                                        stage_idx,
+                                        is_linear1_phase ? 0u : 1u);
+                                }
                             }
                         };
 

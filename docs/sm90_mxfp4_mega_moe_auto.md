@@ -624,3 +624,186 @@ at
 5. Preserve the measured crossover guards: Flash M <= 32 and Pro M <= 64.
    Every future change should rerun M64/M128 boundaries plus the full DSV4
    Flash/Pro matrix so a latency win cannot leak into the throughput path.
+
+## Rejected experiment R09: restore the historical split-kernel snapshot
+
+### Reason and direction
+
+PR383 wins the latency points with separate L1 and L2 kernels, while the
+current branch uses one 156-CTA persistent kernel. Before transplanting that
+architecture into the current code, commit `985cbba` was built in an isolated
+worktree as a low-cost control. That snapshot already launches distinct
+`sm90_fp8_mega_moe_l1_impl` and `sm90_fp8_mega_moe_l2_impl` kernels and overlaps
+MXFP4 L2 weight decode. The benchmark was patched only to expose the current
+explicit `--flush-l2` switch; kernel source was left unchanged.
+
+The comparison is cold-L2 on the same H20 pod. PR383's original benchmark did
+not spell out the flag, but its `bench_kineto` call also defaults to
+`flush_l2=True`, so the reference matrix uses the same cache policy.
+
+### Screening result
+
+| model | M | R08 us | historical split us | change |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 423.155 | 459.975 | +8.70% |
+| Flash | 16 | 453.093 | 502.088 | +10.81% |
+| Flash | 32 | 453.737 | 532.980 | +17.47% |
+| Flash | 64 | 484.287 | 523.777 | +8.15% |
+| Flash | 128 | 481.499 | 535.222 | +11.16% |
+| Pro | 8 | 1038.500 | 1218.391 | +17.32% |
+| Pro | 16 | 1289.000 | 1677.314 | +30.12% |
+| Pro | 32 | 1375.500 | 1834.994 | +33.40% |
+| Pro | 64 | 1442.500 | 1879.606 | +30.30% |
+| Pro | 128 | 1657.000 | 1914.422 | +15.54% |
+
+The old snapshot is decisively slower, so restoring it wholesale is rejected.
+Its hard L1/L2 lifetime boundary remains useful as a mechanism reference, but
+it lacks the subsequent dispatch, decode, swap-AB, and epilogue work on this
+branch. A future split path must therefore be derived from current source.
+
+## Accepted experiment R10: reuse the Pro swap-AB fragment by weight half
+
+### Reason
+
+R08's Pro M32 kernel kept both N64 weight-half WGMMA fragments live at once.
+PTXAS consequently materialized a 480-byte local frame with 578-byte spill
+stores and 724-byte spill loads. NCU measured 449,920 local-load sectors and
+901,248 local-store sectors per median rank. The two halves are independent:
+after a completed half is promoted into the persistent packed-BF16 partial,
+its FP32 fragment does not need to survive the other half.
+
+### Direction
+
+- Add a compile-time `kReuseSwapABFragment` selector for routed DSV4 Pro
+  (`hidden=7168`) on the existing M <= 64 swap-AB path.
+- Allocate one 32-float half fragment instead of the complete 64-float pair.
+- Template WGMMA issue and promotion over a weight-half range. Pro issues,
+  waits for, and promotes half 0 before reusing the fragment for half 1.
+- Preserve the packed-BF16 state, numerical scaling, N8/N16/N32/N64 runtime
+  buckets, 156-CTA cooperative grid, two resident CTAs per H20 SM, and four
+  barriers.
+- Compile Flash back to the original simultaneous-half path. A preliminary
+  global experiment regressed changed Flash points while improving Pro, so the
+  final selector is deliberately model-specific.
+
+The L2 phase has two K32 promotion groups. It processes both halves for group
+0, then both halves for group 1; the A/SFA producer stage is released only
+after the final promotion, preserving the existing stage lifetime contract.
+
+### Correctness and generated resources
+
+Eight-rank forced-ring-wrap validation passes at `diff=0.000656` for Flash M32
+and `diff=0.000714` for Pro M32. The Flash smoke compile reproduces its exact
+R08 resource report, proving that the selector does not leak into that model.
+
+| Pro M32 resource | R08 | R10 | change |
+| --- | ---: | ---: | ---: |
+| stack frame | 480 B | 8 B | -472 B |
+| spill stores | 578 B | 4 B | -574 B |
+| spill loads | 724 B | 4 B | -720 B |
+| registers/thread | 128 | 128 | unchanged |
+| barriers | 4 | 4 | unchanged |
+| WGMMA serialization warning | yes | no | removed |
+
+Flash remains at a 448-byte frame, 518-byte spill stores, 604-byte spill loads,
+128 registers, and four barriers.
+
+### Matched 50-observation A/B
+
+The control is fixed commit `31efd2d`; candidate and control use isolated JIT
+caches and the full cold-L2 benchmark contract. `change` is the directly
+attributable result, independent of the older PR383 run.
+
+| model | M | matched control us | R10 us | change |
+| --- | ---: | ---: | ---: | ---: |
+| Pro | 8 | 1050.000 | 932.734 | -11.17% |
+| Pro | 16 | 1311.500 | 1204.000 | -8.20% |
+| Pro | 32 | 1371.000 | 1258.500 | -8.21% |
+| Pro | 64 | 1456.000 | 1305.000 | -10.37% |
+
+The four-point geometric-mean improvement is 9.49%. Every point agrees with
+the preliminary screen, so the optimization is accepted.
+
+### Final DSV4 Flash/Pro matrix
+
+This is a single authoritative run from the final selector: 50 observations
+for M <= 128, three for M >= 256, 20 launches per observation, and explicit
+`--flush-l2 1`. `gap` compares against the cold-L2 PR383 matrix.
+
+| model | M | PR383 us | R10 final us | gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 301.924 | 408.218 | +35.21% |
+| Flash | 16 | 312.858 | 464.321 | +48.41% |
+| Flash | 32 | 328.370 | 448.784 | +36.67% |
+| Flash | 64 | 361.647 | 489.366 | +35.32% |
+| Flash | 128 | 433.330 | 498.466 | +15.03% |
+| Flash | 256 | 518.971 | 505.672 | -2.56% |
+| Flash | 512 | 917.665 | 941.469 | +2.59% |
+| Flash | 1024 | 1526.078 | 1593.000 | +4.39% |
+| Flash | 2048 | 2745.844 | 2832.000 | +3.14% |
+| Flash | 4096 | 5079.000 | 5337.000 | +5.08% |
+| Flash | 8192 | 9808.000 | 10304.000 | +5.06% |
+| Pro | 8 | 693.125 | 909.827 | +31.26% |
+| Pro | 16 | 971.170 | 1192.000 | +22.74% |
+| Pro | 32 | 1064.547 | 1245.000 | +16.95% |
+| Pro | 64 | 1106.107 | 1304.000 | +17.89% |
+| Pro | 128 | 1228.166 | 1641.500 | +33.65% |
+| Pro | 256 | 1636.918 | 1647.000 | +0.62% |
+| Pro | 512 | 2415.108 | 2583.000 | +6.95% |
+| Pro | 1024 | 4060.000 | 3996.000 | -1.58% |
+| Pro | 2048 | 7025.000 | 7093.000 | +0.97% |
+| Pro | 4096 | 12987.000 | 13326.000 | +2.61% |
+| Pro | 8192 | 25203.000 | 25858.000 | +2.60% |
+
+The geometric-mean gaps versus PR383 are +13.73% over all 22 points, +28.91%
+for M <= 128, and +2.45% for M >= 256. R08 reported +15.56%, +34.14%, and
++2.06%, respectively. The unchanged large-M movement is run variance; the
+matched A/B above is the optimization attribution. Pro M8-M64 alone is now
++22.08% behind PR383 by geometric mean, versus +35.30% in R08's final matrix.
+
+### R10 NCU and NSYS
+
+Eight rank-local application-replay reports were collected for Pro M32. The
+counter values below are medians; replay remains strongly rank-skewed and is
+not a latency score.
+
+| NCU counter | R08 fused | R10 fused | PR383 L1 | PR383 L2 |
+| --- | ---: | ---: | ---: | ---: |
+| local-load sectors | 449920 | 36480 | 0 | 0 |
+| local-store sectors | 901248 | 2496 | 0 | 0 |
+| issue active | 3.315% | 2.914% | 1.545% | 1.030% |
+| tensor-pipe active | 0.050% | 0.020% | 0.025% | 0.065% |
+| barrier stall | 62.410% | 64.002% | 73.380% | 85.675% |
+| long-scoreboard stall | 14.480% | 30.069% | 24.680% | 16.615% |
+
+R10 removes 91.89% of local-load sectors and 99.72% of local-store sectors.
+The residual traffic agrees with PTXAS's tiny 4-byte spill accesses rather
+than the old cross-half frame. The lower sampled tensor activity and higher
+long-scoreboard median expose the new tradeoff: eliminating spills wins the
+production benchmark, but `wait<0>` between the two weight halves leaves the
+tensor pipeline under-filled.
+
+The low-perturbation NSYS trace still contains exactly one 156-CTA MegaMoE
+kernel, one NCCL all-reduce, and one fill kernel. Its traced main-kernel time is
+1.558 ms versus 1.660 ms for R08. PR383 remains a two-kernel L1/L2 topology;
+as before, trace durations are topology evidence rather than benchmark scores.
+
+Complete evidence remains on the pod under
+`/app/deepgemm-auto-results/iter12-pro-sequential-selector`. The compact local
+export is under
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter12-pro-sequential-selector`.
+
+### Next iteration
+
+1. Keep the same 32-float Pro fragment allocation, but issue both weight halves
+   in one batch for N8/N16/N32. Two bucket-sized fragments require at most 32
+   floats there, so this can restore overlap without restoring spills.
+2. Retain sequential reuse only for the skew-routing N64 fallback, whose two
+   fragments would require 64 floats. The runtime bucket remains authoritative;
+   global M cannot safely remove the fallback.
+3. Require PTXAS to stay near the 8/4/4-byte resource result and rerun matched
+   Pro M8/M16/M32/M64. Reject the hybrid if it restores either local traffic or
+   the WGMMA serialization warning.
+4. Keep Flash and M >= 128 unchanged. If the hybrid does not close most of the
+   remaining 16.95-31.26% small-M gaps, prototype a current-source L1/L2 split
+   instead of restoring the obsolete R09 snapshot.
