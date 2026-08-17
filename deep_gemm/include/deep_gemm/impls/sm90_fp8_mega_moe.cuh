@@ -56,6 +56,39 @@ namespace deep_gemm {
 // nibble signs of the four bytes therefore belong to outputs 0..3, and the
 // high nibble signs belong to outputs 4..7.  This removes the two sign-gather
 // PRMTs from every decode without changing its byte size.
+CUTLASS_DEVICE uint2 sm90_mxfp4_e4m3_lookup(
+    const uint32_t exponent_offset) {
+    uint2 result;
+    asm volatile(
+        "{\n\t"
+        "mad.lo.u32 %0, %2, 0x08080800, 0x0c080000;\n\t"
+        "mad.lo.u32 %1, %2, 0x08080808, 0x1c181410;\n\t"
+        "}"
+        : "=r"(result.x), "=r"(result.y)
+        : "r"(exponent_offset));
+    return result;
+}
+
+CUTLASS_DEVICE uint2 sm90_mxfp4_reordered_signs_e2m1x8_to_e4m3x8_bits(
+    const uint32_t packed, const uint2 lookup) {
+    uint2 result;
+    asm volatile(
+        "{\n\t"
+        ".reg .b32 temp0, temp1, out_lo;\n\t"
+        "shl.b32 out_lo, %2, 4;\n\t"
+        "and.b32 temp0, %2, 0x77777777;\n\t"
+        "prmt.b32 temp1, %3, %4, temp0;\n\t"
+        "lop3.b32 out_lo, out_lo, 0x80808080, temp1, 0xea;\n\t"
+        "shr.u32 temp0, temp0, 16;\n\t"
+        "prmt.b32 temp1, %3, %4, temp0;\n\t"
+        "lop3.b32 %1, %2, 0x80808080, temp1, 0xea;\n\t"
+        "mov.b32 %0, out_lo;\n\t"
+        "}"
+        : "=r"(result.x), "=r"(result.y)
+        : "r"(packed), "r"(lookup.x), "r"(lookup.y));
+    return result;
+}
+
 CUTLASS_DEVICE uint2 sm90_mxfp4_reordered_signs_e2m1x8_to_e4m3x8_bits(
     const uint32_t packed, const uint32_t exponent_offset) {
     uint2 result;
@@ -1539,64 +1572,59 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 32 % kRowsPerDecodeGroup == 0,
                                 "MXFP4 warp mapping requires 8 rows x 4 words");
 
-                            // Each half warp covers the same eight rows and
-                            // two disjoint words. This distributes B64 loads
-                            // over all 32 banks and also gives each half-warp
-                            // B128 STS.64 transaction one bank-word per bank.
-                            const uint32_t lane_in_half_warp = lane_idx % 16;
-                            const uint32_t row_in_decode_group =
-                                lane_in_half_warp / 2;
-                            const uint32_t packed_k_in_k32 =
-                                (lane_idx / 16) * 2 + lane_in_half_warp % 2;
-                            #pragma unroll
-                            for (uint32_t row_group = 0;
-                                 row_group < 32 / kRowsPerDecodeGroup; ++ row_group) {
-                                const uint32_t row_in_warp =
-                                    row_group * kRowsPerDecodeGroup +
-                                    row_in_decode_group;
-                                const uint32_t decoded_local_n =
-                                    warp_idx_in_wg * 32 + row_in_warp;
-                                const uint32_t decoded_scale_word = __shfl_sync(
-                                    0xffffffffu, scale_word, row_in_warp);
-                                const uint32_t packed_row_base =
-                                    decoded_local_n * (BLOCK_K / 2);
-                                const uint32_t packed_row_xor =
-                                    cute::Swizzle<2, 4, 3>::apply(packed_row_base) ^
-                                    packed_row_base;
-
-                                // Reuse the validated two-word LDS lookahead
-                                // in every overlap-enabled routed phase.
-                                // Decoder temporaries die before the first
-                                // QGMMA, so they do not cross accumulator
-                                // lifetime like rejected next-stage overlap.
-                                constexpr bool kPipelinePackedLDS =
-                                    kOverlapMXFP4ScalePath;
-                                if constexpr (kPipelinePackedLDS) {
+                            constexpr bool kPairPackedWords =
+                                kOverlapMXFP4ScalePath and kHidden == 7168;
+                            if constexpr (kPairPackedWords) {
+                                constexpr uint32_t kPairRowsPerDecodeGroup = 16;
+                                const uint32_t pair_row_in_decode_group =
+                                    lane_idx % 16;
+                                const uint32_t packed_k_pair_in_k32 =
+                                    (lane_idx / 16) * 2;
+                                #pragma unroll
+                                for (uint32_t row_group = 0;
+                                     row_group <
+                                         32 / kPairRowsPerDecodeGroup;
+                                     ++ row_group) {
+                                    const uint32_t row_in_warp =
+                                        row_group * kPairRowsPerDecodeGroup +
+                                        pair_row_in_decode_group;
+                                    const uint32_t decoded_local_n =
+                                        warp_idx_in_wg * 32 + row_in_warp;
+                                    const uint32_t decoded_scale_word =
+                                        __shfl_sync(
+                                            0xffffffffu, scale_word, row_in_warp);
+                                    const uint32_t packed_row_base =
+                                        decoded_local_n * (BLOCK_K / 2);
+                                    const uint32_t packed_row_xor =
+                                        cute::Swizzle<2, 4, 3>::apply(
+                                            packed_row_base) ^ packed_row_base;
                                     const uint32_t first_packed_byte_offset =
                                         packed_row_base +
-                                        ((packed_k_in_k32 * sizeof(uint32_t)) ^
-                                         packed_row_xor);
-                                    uint32_t packed_current = ptx::ld_shared(
-                                        reinterpret_cast<const uint32_t*>(
+                                        ((packed_k_pair_in_k32 *
+                                          sizeof(uint32_t)) ^ packed_row_xor);
+                                    uint2 packed_current = ptx::ld_shared(
+                                        reinterpret_cast<const uint2*>(
                                             packed + first_packed_byte_offset));
                                     #pragma unroll
                                     for (uint32_t k32_idx = 0;
                                          k32_idx < kNumMXFP4SFBKGroups;
                                          ++ k32_idx) {
-                                        const uint32_t packed_k =
+                                        const uint32_t packed_k_pair =
                                             k32_idx * kPackedWordsPerK32 +
-                                            packed_k_in_k32;
-                                        uint32_t packed_next = 0;
+                                            packed_k_pair_in_k32;
+                                        uint2 packed_next{0u, 0u};
                                         if (k32_idx + 1 <
                                             kNumMXFP4SFBKGroups) {
-                                            const uint32_t next_packed_k =
-                                                packed_k + kPackedWordsPerK32;
+                                            const uint32_t next_packed_k_pair =
+                                                packed_k_pair +
+                                                kPackedWordsPerK32;
                                             const uint32_t next_packed_byte_offset =
                                                 packed_row_base +
-                                                ((next_packed_k * sizeof(uint32_t)) ^
+                                                ((next_packed_k_pair *
+                                                  sizeof(uint32_t)) ^
                                                  packed_row_xor);
                                             packed_next = ptx::ld_shared(
-                                                reinterpret_cast<const uint32_t*>(
+                                                reinterpret_cast<const uint2*>(
                                                     packed +
                                                     next_packed_byte_offset));
                                         }
@@ -1609,61 +1637,156 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                                         (k32_idx * 8u)) & 0xffu;
                                             }
                                         }();
-                                        const uint2 decoded =
-                                            sm90_mxfp4_reordered_signs_e2m1x8_to_e4m3x8_bits(
-                                                packed_current,
+                                        const uint2 lookup =
+                                            sm90_mxfp4_e4m3_lookup(
                                                 exponent_offset);
-                                        const uint32_t logical_n =
-                                            decoded_local_n;
+                                        const uint2 decoded0 =
+                                            sm90_mxfp4_reordered_signs_e2m1x8_to_e4m3x8_bits(
+                                                packed_current.x, lookup);
+                                        const uint2 decoded1 =
+                                            sm90_mxfp4_reordered_signs_e2m1x8_to_e4m3x8_bits(
+                                                packed_current.y, lookup);
                                         const uint32_t logical_k0 =
-                                            packed_k * 8;
+                                            packed_k_pair * 8;
                                         const uint32_t flat0 =
-                                            logical_n * BLOCK_K + logical_k0;
+                                            decoded_local_n * BLOCK_K +
+                                            logical_k0;
                                         const uint32_t swizzled0 =
                                             cute::Swizzle<3, 4, 3>::apply(flat0);
                                         ptx::st_shared(
                                             expanded + swizzled0,
-                                            decoded.x, decoded.y);
+                                            decoded0.x, decoded0.y,
+                                            decoded1.x, decoded1.y);
                                         packed_current = packed_next;
                                     }
-                                } else {
-                                    #pragma unroll
-                                    for (uint32_t k32_idx = 0;
-                                         k32_idx < kNumMXFP4SFBKGroups;
-                                         ++ k32_idx) {
-                                        const uint32_t packed_k =
-                                            k32_idx * kPackedWordsPerK32 +
-                                            packed_k_in_k32;
-                                        const uint32_t exponent_offset = [&]() {
-                                            if constexpr (kUsePRMTMXFP4Exponent) {
-                                                return sm90_extract_u8_prmt(
-                                                    decoded_scale_word, k32_idx);
-                                            } else {
-                                                return (decoded_scale_word >>
-                                                        (k32_idx * 8u)) & 0xffu;
-                                            }
-                                        }();
-                                        const uint32_t packed_byte_offset =
+                                }
+                            } else {
+                                // Each half warp covers the same eight rows and
+                                // two disjoint words. This distributes B64 loads
+                                // over all 32 banks and also gives each half-warp
+                                // B128 STS.64 transaction one bank-word per bank.
+                                const uint32_t lane_in_half_warp = lane_idx % 16;
+                                const uint32_t row_in_decode_group =
+                                    lane_in_half_warp / 2;
+                                const uint32_t packed_k_in_k32 =
+                                    (lane_idx / 16) * 2 + lane_in_half_warp % 2;
+                                #pragma unroll
+                                for (uint32_t row_group = 0;
+                                     row_group < 32 / kRowsPerDecodeGroup; ++ row_group) {
+                                    const uint32_t row_in_warp =
+                                        row_group * kRowsPerDecodeGroup +
+                                        row_in_decode_group;
+                                    const uint32_t decoded_local_n =
+                                        warp_idx_in_wg * 32 + row_in_warp;
+                                    const uint32_t decoded_scale_word = __shfl_sync(
+                                        0xffffffffu, scale_word, row_in_warp);
+                                    const uint32_t packed_row_base =
+                                        decoded_local_n * (BLOCK_K / 2);
+                                    const uint32_t packed_row_xor =
+                                        cute::Swizzle<2, 4, 3>::apply(packed_row_base) ^
+                                        packed_row_base;
+
+                                    // Reuse the validated two-word LDS lookahead
+                                    // in every overlap-enabled routed phase.
+                                    // Decoder temporaries die before the first
+                                    // QGMMA, so they do not cross accumulator
+                                    // lifetime like rejected next-stage overlap.
+                                    constexpr bool kPipelinePackedLDS =
+                                        kOverlapMXFP4ScalePath;
+                                    if constexpr (kPipelinePackedLDS) {
+                                        const uint32_t first_packed_byte_offset =
                                             packed_row_base +
-                                            ((packed_k * sizeof(uint32_t)) ^
+                                            ((packed_k_in_k32 * sizeof(uint32_t)) ^
                                              packed_row_xor);
-                                        const uint2 decoded =
-                                            sm90_mxfp4_reordered_signs_e2m1x8_to_e4m3x8_bits(
-                                                ptx::ld_shared(
+                                        uint32_t packed_current = ptx::ld_shared(
+                                            reinterpret_cast<const uint32_t*>(
+                                                packed + first_packed_byte_offset));
+                                        #pragma unroll
+                                        for (uint32_t k32_idx = 0;
+                                             k32_idx < kNumMXFP4SFBKGroups;
+                                             ++ k32_idx) {
+                                            const uint32_t packed_k =
+                                                k32_idx * kPackedWordsPerK32 +
+                                                packed_k_in_k32;
+                                            uint32_t packed_next = 0;
+                                            if (k32_idx + 1 <
+                                                kNumMXFP4SFBKGroups) {
+                                                const uint32_t next_packed_k =
+                                                    packed_k + kPackedWordsPerK32;
+                                                const uint32_t next_packed_byte_offset =
+                                                    packed_row_base +
+                                                    ((next_packed_k * sizeof(uint32_t)) ^
+                                                     packed_row_xor);
+                                                packed_next = ptx::ld_shared(
                                                     reinterpret_cast<const uint32_t*>(
                                                         packed +
-                                                        packed_byte_offset)),
-                                                exponent_offset);
-                                        const uint32_t logical_n =
-                                            decoded_local_n;
-                                        const uint32_t logical_k0 = packed_k * 8;
-                                        const uint32_t flat0 =
-                                            logical_n * BLOCK_K + logical_k0;
-                                        const uint32_t swizzled0 =
-                                            cute::Swizzle<3, 4, 3>::apply(flat0);
-                                        ptx::st_shared(
-                                            expanded + swizzled0,
-                                            decoded.x, decoded.y);
+                                                        next_packed_byte_offset));
+                                            }
+                                            const uint32_t exponent_offset = [&]() {
+                                                if constexpr (kUsePRMTMXFP4Exponent) {
+                                                    return sm90_extract_u8_prmt(
+                                                        decoded_scale_word, k32_idx);
+                                                } else {
+                                                    return (decoded_scale_word >>
+                                                            (k32_idx * 8u)) & 0xffu;
+                                                }
+                                            }();
+                                            const uint2 decoded =
+                                                sm90_mxfp4_reordered_signs_e2m1x8_to_e4m3x8_bits(
+                                                    packed_current,
+                                                    exponent_offset);
+                                            const uint32_t logical_n =
+                                                decoded_local_n;
+                                            const uint32_t logical_k0 =
+                                                packed_k * 8;
+                                            const uint32_t flat0 =
+                                                logical_n * BLOCK_K + logical_k0;
+                                            const uint32_t swizzled0 =
+                                                cute::Swizzle<3, 4, 3>::apply(flat0);
+                                            ptx::st_shared(
+                                                expanded + swizzled0,
+                                                decoded.x, decoded.y);
+                                            packed_current = packed_next;
+                                        }
+                                    } else {
+                                        #pragma unroll
+                                        for (uint32_t k32_idx = 0;
+                                             k32_idx < kNumMXFP4SFBKGroups;
+                                             ++ k32_idx) {
+                                            const uint32_t packed_k =
+                                                k32_idx * kPackedWordsPerK32 +
+                                                packed_k_in_k32;
+                                            const uint32_t exponent_offset = [&]() {
+                                                if constexpr (kUsePRMTMXFP4Exponent) {
+                                                    return sm90_extract_u8_prmt(
+                                                        decoded_scale_word, k32_idx);
+                                                } else {
+                                                    return (decoded_scale_word >>
+                                                            (k32_idx * 8u)) & 0xffu;
+                                                }
+                                            }();
+                                            const uint32_t packed_byte_offset =
+                                                packed_row_base +
+                                                ((packed_k * sizeof(uint32_t)) ^
+                                                 packed_row_xor);
+                                            const uint2 decoded =
+                                                sm90_mxfp4_reordered_signs_e2m1x8_to_e4m3x8_bits(
+                                                    ptx::ld_shared(
+                                                        reinterpret_cast<const uint32_t*>(
+                                                            packed +
+                                                            packed_byte_offset)),
+                                                    exponent_offset);
+                                            const uint32_t logical_n =
+                                                decoded_local_n;
+                                            const uint32_t logical_k0 = packed_k * 8;
+                                            const uint32_t flat0 =
+                                                logical_n * BLOCK_K + logical_k0;
+                                            const uint32_t swizzled0 =
+                                                cute::Swizzle<3, 4, 3>::apply(flat0);
+                                            ptx::st_shared(
+                                                expanded + swizzled0,
+                                                decoded.x, decoded.y);
+                                        }
                                     }
                                 }
                             }

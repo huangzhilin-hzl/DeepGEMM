@@ -1496,3 +1496,121 @@ hide it behind WGMMA rather than repeat the exponent-only optimization.
 Raw logs and the computed table are under
 `/app/deepgemm-auto-results/iter24-final-r19-matrix`; the local export is
 `/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter24-final-r19-matrix`.
+
+## Iteration R20: paired packed-word decode for Pro
+
+### Reason and direction
+
+The prior decoder assigned four lanes to the four packed E2M1 words of one
+row/K32 group. Every lane independently extracted the same exponent and built
+the same two-word E4M3 lookup. R20 remaps the DSV4 Pro decoder so each half
+warp owns the same 16 rows and one adjacent packed-word pair:
+
+- one LDS.64 fetches two packed words;
+- one exponent lookup is reused by both word decodes;
+- one STS.128 publishes the resulting 16 E4M3 bytes;
+- two row groups replace the previous four row groups.
+
+All 32 lanes remain active and perform the same total nibble conversion, but
+the duplicated lookup, address, LDS, and STS warp instructions are reduced.
+The non-Pro path retains the original 8-row/4-word mapping.
+
+The first global prototype improved Pro M32 by 5.59% and 5.40% in opposite
+run orders, but regressed Flash M32 by 1.45% and 1.43%. A Pro-only guard alone
+did not fully isolate Flash because splitting the old monolithic inline PTX
+changed ptxas scheduling. The final implementation therefore also preserves
+the exact monolithic `(packed, exponent)` decoder for Flash; only the Pro
+paired path uses the separated lookup overload. A final adjacent Flash M32
+check measured 466.1 versus 477.8 us, so the earlier regression was removed.
+
+### Generated-code effect
+
+The table compares the R19 and R20 Pro M32 cubins. Opcode counts use the same
+static SASS method as R17-R19.
+
+| Pro M32 SASS/resource | R19 | R20 | change |
+| --- | ---: | ---: | ---: |
+| LOP3 | 1628 | 1435 | -193 |
+| SHF | 542 | 455 | -87 |
+| SHFL | 150 | 118 | -32 |
+| PRMT | 1081 | 958 | -123 |
+| IMAD | 1495 | 1469 | -26 |
+| LDS | 510 | 382 | -128 |
+| STS | 408 | 280 | -128 |
+| registers/thread | 128 | 128 | 0 |
+| stack | 8 B | 0 B | -8 B |
+| local | 0 B | 0 B | 0 |
+
+The paired path emits LDS.64 and STS.128 for the decode body. It removes the
+short compiler frame without increasing registers or shared memory.
+
+### Correctness and formal performance
+
+The full eight-rank production cases pass with `fast_math=1`:
+
+| case | diff |
+| --- | ---: |
+| Pro M8 | 0.000715 |
+| Pro M16 | 0.000710 |
+| Pro M32 | 0.000715 |
+| Pro M64 | 0.000712 |
+| Pro M128 | 0.001838 |
+| Pro M256 | 0.000713 |
+
+R20 adds the missing Pro M8 and M128 production scenarios. M8 does not require
+every rank to wrap because its route population cannot guarantee that; the
+M16-M128 cases retain the physical-ring wrap contract.
+
+The formal matched run used 50 observations, ten warmups, 20 launches per
+observation, cold L2, and maximum-rank medians:
+
+| Pro point | R19 control us | R20 us | change | same-node PR383 us | R20 gap |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| M8 | 955.362 | 881.407 | -7.74% | 708.989 | +24.32% |
+| M16 | 1214.500 | 1119.500 | -7.82% | 985.679 | +13.58% |
+| M32 | 1261.000 | 1171.500 | -7.10% | 1065.082 | +9.99% |
+| M64 | 1321.000 | 1207.500 | -8.59% | 1119.668 | +7.84% |
+| M128 | 1660.000 | 1631.000 | -1.75% | 1227.411 | +32.88% |
+
+The matched Pro small-M geometric improvement is `-6.63%`. Its geometric gap
+to the same-node PR383 matrix is `+17.35%`, down from R19's `+22.74%`.
+
+A ten-observation large-M screen showed no throughput regression:
+
+| Pro point | R19 control us | R20 us | change |
+| --- | ---: | ---: | ---: |
+| M256 | 1672.0 | 1668.5 | -0.21% |
+| M512 | 2619.5 | 2586.5 | -1.26% |
+| M1024 | 4020.5 | 3971.0 | -1.23% |
+| M8192 | 25836.0 | 25487.0 | -1.35% |
+
+### NCU and NSYS diagnosis
+
+Eight simultaneous NCU application-replay reports were collected for Pro
+M32. Because work distribution is rank-skewed, total executed instructions
+across all eight reports are more meaningful than the rank median: R18/R19
+uses 12.238 billion instructions versus 9.379 billion for R20, a 23.36%
+reduction. Aggregate local-load/store sectors fall from 291072/19968 to zero.
+
+Replay utilization remains noisy: issue-active median is 3.020%, tensor-pipe
+active 0.035%, barrier stall 63.875%, long-scoreboard stall 30.020%, and wait
+stall 4.795%. Those samples do not replace the matched benchmark; zero local
+traffic, lower distributed instruction count, and the static SASS reduction
+are the stable profiler evidence.
+
+Low-perturbation NSYS retains exactly one 156-CTA fused MegaMoE launch. Its
+rank-0 traced main kernel is 1.435 ms versus 1.524 ms for R18; the trace is
+topology evidence, not the benchmark score.
+
+Complete reports remain under
+`/app/deepgemm-auto-results/iter25-paired-word-decode`; the compact local export
+is
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter25-paired-word-decode`.
+
+### Next iteration
+
+Commit the Pro paired decoder, then rerun the complete Flash/Pro matrix. The
+remaining Pro M128 gap is schedule/epilogue dominated, while Pro M8-M64 is now
+within 8-24% of PR383. Flash remains unchanged and is still the largest small-M
+gap, so its next optimization must preserve the monolithic decode schedule or
+use a different bank-conflict-free pairing.
