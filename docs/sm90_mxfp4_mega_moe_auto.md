@@ -2174,3 +2174,66 @@ R26 is retained. It reduces the fixed swap-AB epilogue cost across both DSV4
 models without changing M64+ execution or adding spills. The terminal goal is
 still unmet; the next full candidate/PR383 matrix will quantify the remaining
 gap before the next optimization iteration.
+
+## Final matrix after R26
+
+R26 and PR383 were run consecutively on the same H20 pod. The candidate uses
+the authoritative fused MXFP4 benchmark and PR383 uses its native compatible
+two-phase driver, reporting L1 plus L2. Candidate small-M points use ten
+warmups and both drivers use 50 observations for M <= 128, three for M >= 256,
+20 launches per observation, cold L2, and maximum-rank medians. PR383 has one
+explicit driver warmup, matching all preceding PR383 matrices; cold-L2 timing
+makes the different untimed warmup counts immaterial.
+
+| model | M | PR383 us | R26 us | R26 gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 299.531 | 410.841 | +37.16% |
+| Flash | 16 | 308.502 | 428.164 | +38.79% |
+| Flash | 32 | 333.619 | 433.800 | +30.03% |
+| Flash | 64 | 367.438 | 456.904 | +24.35% |
+| Flash | 128 | 445.626 | 502.369 | +12.73% |
+| Flash | 256 | 495.505 | 504.141 | +1.74% |
+| Flash | 512 | 905.925 | 924.273 | +2.03% |
+| Flash | 1024 | 1534.908 | 1521.000 | -0.91% |
+| Flash | 2048 | 2734.939 | 2760.000 | +0.92% |
+| Flash | 4096 | 5099.000 | 5195.000 | +1.88% |
+| Flash | 8192 | 9853.000 | 10045.000 | +1.95% |
+| Pro | 8 | 704.874 | 848.015 | +20.31% |
+| Pro | 16 | 979.115 | 1080.500 | +10.35% |
+| Pro | 32 | 1066.244 | 1131.000 | +6.07% |
+| Pro | 64 | 1117.183 | 1199.000 | +7.32% |
+| Pro | 128 | 1232.130 | 1406.500 | +14.15% |
+| Pro | 256 | 1667.199 | 1632.000 | -2.11% |
+| Pro | 512 | 2450.788 | 2525.000 | +3.03% |
+| Pro | 1024 | 4042.000 | 3924.000 | -2.92% |
+| Pro | 2048 | 7044.000 | 6972.000 | -1.02% |
+| Pro | 4096 | 13004.000 | 13110.000 | +0.82% |
+| Pro | 8192 | 24987.000 | 25488.000 | +2.01% |
+
+The same-epoch geometric gaps are:
+
+- all 22 points: `+8.83%`;
+- M <= 128: `+19.60%`;
+- M >= 256: `+0.60%`;
+- all Flash points: `+12.74%`;
+- Flash small-M: `+28.25%`;
+- Flash large-M: `+1.26%`;
+- all Pro points: `+5.05%`;
+- Pro small-M: `+11.53%`;
+- Pro large-M: `-0.06%`.
+
+R26's exact R24-equivalent A/B controls, rather than cross-epoch R24 matrix
+movement, remain the source attribution: Flash M8-M32 improve geometrically by
+2.88-2.97% and Pro M8-M32 by 3.16-3.35%. The fresh matrix shows the resulting
+state against PR383. Pro large-M is closed, and both models' large-M aggregate
+is within 0.60%; the remaining budget is fixed latency at Flash M8-M64 and Pro
+M8/M128.
+
+Raw logs are under `/app/deepgemm-auto-results/iter39-r26-final-matrix`; the
+local export is
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter39-r26-final-matrix`.
+
+The terminal goal is still not complete. R27 should target work scheduling,
+dispatch/combine synchronization, or the number of persistent tasks reached
+at sparse expert occupancy. Further instruction-only trimming of the now
+bounded epilogue is unlikely to close Flash's remaining 24-39% small-M gap.
