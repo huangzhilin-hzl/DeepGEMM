@@ -1388,3 +1388,54 @@ including raw counter text, NSYS, cubins, SASS, and resource usage, is under
 3. Continue reducing the MXFP4 decoder body after this low-risk extraction
    win; the remaining +18.22% Pro M32 gap is too large to close with launch
    topology or accumulator changes already rejected by R14-R17.
+
+## Iteration R19: extend PRMT extraction to Pro M16 and M64
+
+### Reason and direction
+
+R18's Pro M32 result established that the `PRMT` UE8M0 extractor reduces the
+MXFP4 integer body without changing resources. R19 temporarily enabled the
+same specialization for every routed DSV4 Pro M <= 64 point, then treated M8,
+M16, and M64 as independent acceptance decisions. M32 remained the accepted
+R18 path throughout.
+
+Two 20-observation adjacent screens were run in opposite orders. Their
+candidate changes for M8/M16/M64 were respectively
+`+0.08%/-0.04%/-1.22%` and `-2.50%/-0.33%/-1.79%`. M64 reproduced clearly;
+M16 remained weakly positive; M8 changed sign. The final decision therefore
+used the required 50-observation run rather than the screen average.
+
+### Formal cold-L2 selection
+
+The formal run used ten warmups, 50 observations, 20 launches per observation,
+explicit `--flush-l2 1`, and maximum-rank medians:
+
+| Pro point | generic control us | temporary PRMT us | change | decision | PR383 us | retained gap |
+| --- | ---: | ---: | ---: | --- | ---: | ---: |
+| M8 | 927.100 | 929.900 | +0.30% | reject | 693.125 | generic path |
+| M16 | 1215.500 | 1188.000 | -2.26% | accept | 971.170 | +22.33% |
+| M64 | 1309.000 | 1284.000 | -1.91% | accept | 1106.107 | +16.08% |
+
+The production selector is explicit: Pro M16, M32, and M64 use `PRMT`; Pro M8
+and unmeasured token counts retain the generic extractor. This avoids turning
+M8's formal regression into a committed change and avoids extrapolating from
+the standard benchmark points.
+
+Both retained cubin specializations remain at `REG=128, STACK=8, LOCAL=0`.
+The full eight-rank correctness suite passes `production.pro_m16` with
+`diff=0.001685` and `production.pro_m64` with `diff=0.001142`, including the
+required physical-ring wrap. Because the repository previously lacked an M16
+production correctness case, R19 adds one with the same DSV4 Pro configuration
+and ring-wrap contract as M32/M64.
+
+Artifacts are under `/app/deepgemm-auto-results/iter23-pro-prmt-sweep`; the
+local export is
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter23-pro-prmt-sweep`.
+
+### Next iteration
+
+Run the final accepted selector across the complete authoritative Flash/Pro
+matrix and rerun PR383 on the same H20 node epoch. Use that matrix to update
+the aggregate gap, then return to the integer/address body identified by R14:
+the retained PRMT changes recover about 2% per affected Pro point, but do not
+yet remove the double-digit small-M gap.
