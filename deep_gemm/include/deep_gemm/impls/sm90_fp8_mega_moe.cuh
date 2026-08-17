@@ -775,7 +775,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         L1_SHAPE_N, L1_SHAPE_K,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank, kNumSMs, kNumRanks,
-        kNumRingBlocks, kNumSharedExperts, 1>;
+        kNumRingBlocks, kNumSharedExperts, 1,
+        kSmallMSwapAB and
+            (kMaxSwapABTokens == 8 or kMaxSwapABTokens == 64)>;
     auto scheduler = scheduler_t(
         workspace, task_info_full_barriers,
         task_info_empty_barriers, task_infos);

@@ -148,6 +148,7 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumRingBlocks,
           uint32_t kNumSharedExperts = 0,
           uint32_t kNumCTAsPerTask = 2,
+          bool kSingleBlockTaskFastPath = false,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
@@ -290,6 +291,30 @@ struct MegaMoEScheduler {
         const uint32_t n_cluster_idx = task_idx % num_clusters;
 
         task_info_t result(block_phase, 0, 0, n_cluster_idx, m_block_idx, 0, shape_n, shape_k);
+        // DSV4 Flash places one local expert on each lane. At small M, an
+        // expert normally owns at most one M64 block, so the pool-block index
+        // is just its ordinal in the nonempty-lane mask. Avoid rebuilding the
+        // same warp prefix sum for every L1/L2 N tile. A skewed expert with
+        // more than BLOCK_M tokens takes the general multi-block path below.
+        if constexpr (kSingleBlockTaskFastPath and
+                      kNumExpertsPerLane == 1) {
+            const uint32_t expert_idx = lane_idx;
+            const uint32_t num_tokens = stored_num_tokens_per_expert[0];
+            const uint32_t multi_block_mask = __ballot_sync(
+                0xffffffff, expert_idx < kNumExpertsPerRank and
+                                num_tokens > BLOCK_M);
+            if (multi_block_mask == 0) {
+                const uint32_t owner_mask = __ballot_sync(
+                    0xffffffff, expert_idx < kNumExpertsPerRank and
+                                    num_tokens != 0);
+                const uint32_t owner_lane_idx = __fns(
+                    owner_mask, 0, m_block_idx + 1);
+                result.local_expert_idx = owner_lane_idx;
+                result.valid_m = ptx::exchange(num_tokens, owner_lane_idx);
+                return result;
+            }
+        }
+
         uint32_t block_offset = 0;
         #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {

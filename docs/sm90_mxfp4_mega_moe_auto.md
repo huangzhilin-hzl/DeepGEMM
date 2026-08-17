@@ -2369,3 +2369,103 @@ The goal is still not complete. Excluding the anomalous unchanged M256 point,
 large-M remains near PR383 while the dominant verified gaps are Flash M8/M16/
 M64 and Pro M8/M128. R28 must change the dense frontend or task schedule rather
 than extending sparse completion to points where it formally regressed.
+
+## Rejected experiment R28: skip the second sparse-completion grid sync
+
+### Reason and direction
+
+The Flash M32 sparse-completion path first synchronizes all 156 CTAs after
+publishing per-rank counts, then has SM0 aggregate the 32 rank-local expert
+totals and performs a second grid synchronization. Every scheduler already
+polls the packed ready high word in `fetch_expert_recv_count()`, so R28 tested
+whether nonzero CTAs could proceed directly to that acquire loop after SM0's
+publication. Flash M1024 retained the established two-sync sequence.
+
+Eight-rank `production.flash_m32` correctness passed with `diff=0.000656`, but
+the formal R27/R28/R27 run did not reproduce a win. It used ten warmups, 50
+observations, 20 launches per observation, cold L2, and maximum-rank medians:
+
+| Flash point | first R27 us | R28 us | change | second R27 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| M32 | 425.158 | 421.790 | -0.79% | 420.533 | +0.30% |
+
+The sign changes across the two controls, so the change was fully reverted.
+The post-aggregation grid rendezvous is not a stable latency bottleneck at
+M32. Raw evidence is under
+`/app/deepgemm-auto-results/iter47-flash-m32-no-grid-formal`; the local export
+uses the matching directory below
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts`.
+
+## R29: single-block expert lookup for Flash M8 and M64
+
+### Reason and direction
+
+DSV4 Flash has 32 local experts per rank, exactly one expert per scheduler
+lane. For every claimed L1 or L2 N tile, the general scheduler reconstructed
+the same M-block-to-expert mapping with a warp prefix sum. At small M, each
+nonempty expert normally owns only one M64 block, so its pool-block index is
+simply its ordinal in the nonempty-lane mask.
+
+R29 adds a compile-time latency selector and a runtime-safe fast path:
+
+- one ballot detects any expert with more than 64 received tokens;
+- when none exists, a second ballot plus `__fns` selects the owner directly;
+- any skewed multi-block distribution falls back to the unchanged prefix-sum
+  implementation;
+- the final selector is exact for Flash M8 and M64. Flash M16/M32 and every
+  non-swap/large-M specialization compile the old scheduler path. DSV4 Pro has
+  48 local experts, so its two-experts-per-lane scheduler is unchanged.
+
+### Correctness and formal shape selection
+
+Eight-rank production validation passes Flash M32 at `diff=0.000656` during
+the broad screen and Flash M64 at `diff=0.000654` after formal selection, both
+with physical ring wrap. The formal R27/R29/R27 run used the authoritative
+ten warmups, 50 observations, 20 launches, cold L2, and max-rank medians:
+
+| Flash point | first R27 us | broad R29 us | change | second R27 us | reverse change | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| M8 | 396.201 | 393.090 | -0.79% | 399.895 | -1.70% | accept |
+| M16 | 412.611 | 415.151 | +0.62% | 421.115 | -1.42% | reject |
+| M32 | 412.735 | 423.995 | +2.73% | 420.938 | +0.73% | reject |
+| M64 | 448.635 | 437.068 | -2.58% | 447.945 | -2.43% | accept |
+
+The retained M8/M64 pair improves by `-1.69%` geometric mean versus the first
+control and `-2.07%` versus the second. M16 changed sign and M32 regressed in
+both orders, so their compile-time selectors were removed before commit.
+
+### NCU and NSYS analysis
+
+An isolated one-rank, 32-expert M64 NCU run keeps the exact Flash scheduling
+shape while avoiding distributed replay skew:
+
+| NCU metric | R27 | R29 | change |
+| --- | ---: | ---: | ---: |
+| executed warp instructions | 94,252,780 | 94,252,607 | -0.0002% |
+| executed thread instructions | 2,960,902,839 | 2,960,868,408 | -0.0012% |
+| global-load sectors | 956,108 | 955,131 | -0.10% |
+| global atomic sectors | 4,396 | 4,396 | unchanged |
+| local load/store sectors | 0/0 | 0/0 | unchanged |
+
+The aggregate instruction delta is deliberately small because only the
+task-owner lookup changes; the formal win comes from shortening that uniform
+dependency chain on the scheduler critical path. Both cubins retain 128
+registers, zero stack, and zero local allocation.
+
+Eight-rank NSYS single-launch durations were 696.221 us for R27 and 706.813 us
+for R29 (`+1.52%`), opposite to both formal 50-observation controls. As with
+earlier distributed traces, that one perturbed launch is retained as topology
+evidence only: both variants remain one 156-CTA fused kernel. The cold-L2
+benchmark above is the acceptance authority.
+
+Screen, formal, and profiler artifacts are respectively under
+`/app/deepgemm-auto-results/iter48-single-block-scheduler-screen`,
+`iter49-flash-single-block-scheduler-formal`, and
+`iter50-flash-m64-single-block-profiles`; local exports use matching names
+below `/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts`.
+
+The terminal goal remains unmet. R29 removes about 2% from two Flash latency
+points but does not close their remaining PR383 gap. The next scheduler
+experiment should generalize the direct lookup to Pro's two experts per lane,
+then independently select M8 and M128; further Flash work should target the
+dispatch/token-pull critical path rather than another grid barrier.
