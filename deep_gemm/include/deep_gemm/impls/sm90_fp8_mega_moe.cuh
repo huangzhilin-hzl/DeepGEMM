@@ -111,6 +111,38 @@ CUTLASS_DEVICE uint2 sm90_mxfp4_reordered_signs_e2m1x8_to_e4m3x8_bits(
     return result;
 }
 
+CUTLASS_DEVICE uint4 sm90_mxfp4_reordered_signs_e2m1x16_to_e4m3x16_bits(
+    const uint32_t packed0,
+    const uint32_t packed1,
+    const uint32_t exponent_offset) {
+    uint4 result;
+    asm volatile(
+        "{\n\t"
+        ".reg .b32 lookup_lo, lookup_hi, temp0, temp1, out_lo;\n\t"
+        "mad.lo.u32 lookup_lo, %6, 0x08080800, 0x0c080000;\n\t"
+        "mad.lo.u32 lookup_hi, %6, 0x08080808, 0x1c181410;\n\t"
+        "shl.b32 out_lo, %4, 4;\n\t"
+        "and.b32 temp0, %4, 0x77777777;\n\t"
+        "prmt.b32 temp1, lookup_lo, lookup_hi, temp0;\n\t"
+        "lop3.b32 out_lo, out_lo, 0x80808080, temp1, 0xea;\n\t"
+        "shr.u32 temp0, temp0, 16;\n\t"
+        "prmt.b32 temp1, lookup_lo, lookup_hi, temp0;\n\t"
+        "lop3.b32 %1, %4, 0x80808080, temp1, 0xea;\n\t"
+        "mov.b32 %0, out_lo;\n\t"
+        "shl.b32 out_lo, %5, 4;\n\t"
+        "and.b32 temp0, %5, 0x77777777;\n\t"
+        "prmt.b32 temp1, lookup_lo, lookup_hi, temp0;\n\t"
+        "lop3.b32 out_lo, out_lo, 0x80808080, temp1, 0xea;\n\t"
+        "shr.u32 temp0, temp0, 16;\n\t"
+        "prmt.b32 temp1, lookup_lo, lookup_hi, temp0;\n\t"
+        "lop3.b32 %3, %5, 0x80808080, temp1, 0xea;\n\t"
+        "mov.b32 %2, out_lo;\n\t"
+        "}"
+        : "=r"(result.x), "=r"(result.y), "=r"(result.z), "=r"(result.w)
+        : "r"(packed0), "r"(packed1), "r"(exponent_offset));
+    return result;
+}
+
 __forceinline__ __device__ uint32_t sm90_extract_u8_prmt(
     const uint32_t packed, const uint32_t byte_idx) {
     uint32_t result = 0;
@@ -1573,7 +1605,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 "MXFP4 warp mapping requires 8 rows x 4 words");
 
                             constexpr bool kPairPackedWords =
-                                kOverlapMXFP4ScalePath and kHidden == 7168;
+                                kOverlapMXFP4ScalePath;
                             if constexpr (kPairPackedWords) {
                                 constexpr uint32_t kPairRowsPerDecodeGroup = 16;
                                 const uint32_t pair_row_in_decode_group =
@@ -1637,15 +1669,27 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                                         (k32_idx * 8u)) & 0xffu;
                                             }
                                         }();
-                                        const uint2 lookup =
-                                            sm90_mxfp4_e4m3_lookup(
-                                                exponent_offset);
-                                        const uint2 decoded0 =
-                                            sm90_mxfp4_reordered_signs_e2m1x8_to_e4m3x8_bits(
-                                                packed_current.x, lookup);
-                                        const uint2 decoded1 =
-                                            sm90_mxfp4_reordered_signs_e2m1x8_to_e4m3x8_bits(
-                                                packed_current.y, lookup);
+                                        uint4 decoded;
+                                        if constexpr (kHidden == 4096) {
+                                            decoded =
+                                                sm90_mxfp4_reordered_signs_e2m1x16_to_e4m3x16_bits(
+                                                    packed_current.x,
+                                                    packed_current.y,
+                                                    exponent_offset);
+                                        } else {
+                                            const uint2 lookup =
+                                                sm90_mxfp4_e4m3_lookup(
+                                                    exponent_offset);
+                                            const uint2 decoded0 =
+                                                sm90_mxfp4_reordered_signs_e2m1x8_to_e4m3x8_bits(
+                                                    packed_current.x, lookup);
+                                            const uint2 decoded1 =
+                                                sm90_mxfp4_reordered_signs_e2m1x8_to_e4m3x8_bits(
+                                                    packed_current.y, lookup);
+                                            decoded = make_uint4(
+                                                decoded0.x, decoded0.y,
+                                                decoded1.x, decoded1.y);
+                                        }
                                         const uint32_t logical_k0 =
                                             packed_k_pair * 8;
                                         const uint32_t flat0 =
@@ -1655,8 +1699,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                             cute::Swizzle<3, 4, 3>::apply(flat0);
                                         ptx::st_shared(
                                             expanded + swizzled0,
-                                            decoded0.x, decoded0.y,
-                                            decoded1.x, decoded1.y);
+                                            decoded.x, decoded.y,
+                                            decoded.z, decoded.w);
                                         packed_current = packed_next;
                                     }
                                 }

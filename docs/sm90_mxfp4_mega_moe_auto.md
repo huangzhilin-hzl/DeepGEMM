@@ -1678,3 +1678,94 @@ Flash-safe packed-word pairing and a separate M128 schedule diagnosis.
 Raw same-epoch logs are under
 `/app/deepgemm-auto-results/iter26-r20-final-matrix`; the local export is
 `/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter26-r20-final-matrix`.
+
+## R21: monolithic paired-word decode for Flash
+
+### Reason and direction
+
+R20 reduced Pro's fixed MXFP4 expansion cost by loading and expanding two
+packed words together, but the same source-level construction regressed Flash:
+the compiler duplicated lookup construction and extended temporary live
+ranges. R21 makes the Flash pairing explicit in one inline PTX block. It builds
+the E2M1-to-E4M3 lookup once, decodes both 32-bit packed words serially through
+the same four scratch registers, and emits one 128-bit shared-memory store.
+The Pro path is deliberately kept byte-for-byte equivalent to R20 in this
+iteration so that Flash can be isolated.
+
+Relative to the exact R20 control, Flash M32 static SASS changes are:
+
+| opcode/resource | R20 | R21 | change |
+| --- | ---: | ---: | ---: |
+| IMAD | 2367 | 1815 | -552 |
+| LDS | 514 | 386 | -128 |
+| LOP3 | 1707 | 1460 | -247 |
+| PRMT | 1030 | 925 | -105 |
+| SHF | 587 | 457 | -130 |
+| SHFL | 132 | 100 | -32 |
+| STS | 420 | 292 | -128 |
+| registers/thread | 128 | 128 | unchanged |
+| stack/local bytes | 0/0 | 0/0 | unchanged |
+
+The paired decoder passes the production eight-rank physical-ring-wrap cases:
+Flash M32 has maximum difference `0.000656`, and Flash M128 has maximum
+difference `0.000658`.
+
+### Matched cold-L2 benchmark
+
+The formal matched runs use 50 observations, ten warmups, 20 launches per
+observation, cold L2, and maximum-rank medians. Each candidate run was bracketed
+by an exact R20 control where practical:
+
+| Flash point | R20 first us | R21 us | change | R20 second us | reverse-order change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| M8 | 436.040 | 395.743 | -9.24% | 411.962 | -3.94% |
+| M16 | 453.419 | 439.959 | -2.97% | 452.526 | -2.78% |
+| M32 | 456.822 | 427.592 | -6.40% | - | - |
+| M64 | 504.903 | 487.142 | -3.52% | 502.745 | -3.10% |
+| M128 | 513.803 | 490.561 | -4.52% | 539.134 | -9.01% |
+
+The first-control geometric improvement across Flash M8-M128 is `-5.36%`.
+The four reverse-order points independently reproduce a `-4.74%` geometric
+improvement. Two-order ten-observation screens also retain the pairing at
+M512, M1024, and M8192; M256 is neutral. Pro M32 produces identical static
+opcode and resource counts to the R20 control, confirming that this iteration
+does not alter the Pro kernel.
+
+### NCU and NSYS diagnosis
+
+Eight simultaneous NCU application-replay reports were collected for Flash
+M32. Aggregate metrics across all ranks are used because the distributed work
+is rank-skewed:
+
+| NCU metric, eight-rank aggregate unless noted | R20 | R21 | change |
+| --- | ---: | ---: | ---: |
+| executed instructions | 1,593,199,640 | 1,085,946,078 | -31.84% |
+| executed thread instructions | 37,308,122,624 | 27,247,325,090 | -26.97% |
+| theoretical global L2 sectors | 450,190,210 | 241,314,531 | -46.40% |
+| theoretical local L2 sectors | 0 | 0 | unchanged |
+| registers/thread, rank mean | 128 | 128 | unchanged |
+| replay duration, rank mean | 229.447 ms | 169.798 ms | -26.00% |
+| issue-active, rank mean | 4.045% | 4.818% | +19.12% |
+| tensor-pipe active, rank mean | 0.157% | 0.264% | +67.93% |
+
+Replay duration and PM sampling are profiler-perturbed and are supporting
+evidence only. The stable conclusions are the large dynamic-instruction and
+sector reductions, unchanged register footprint, zero local traffic, and the
+matched benchmark improvement.
+
+Low-perturbation NSYS preserves one 156-CTA fused MegaMoE launch. The rank-0
+traced main kernel falls from `779.357 us` to `753.437 us`; NCCL timing varies
+between captures, so the trace is used only to confirm launch topology and the
+direction of the kernel-local change.
+
+Complete logs and profiler reports are under
+`/app/deepgemm-auto-results/iter27-flash-paired-monolithic`; the local export is
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter27-flash-paired-monolithic`.
+
+### Next iteration
+
+R21 is retained because the improvement reproduces across launch order, full
+correctness passes, static SASS, NCU, and NSYS. The next step is a fresh full
+Flash/Pro matrix against PR383. R22 will then test the same monolithic paired
+decoder for Pro, where R20 still uses split helper calls and leaves avoidable
+lookup scheduling and live-range overhead.
