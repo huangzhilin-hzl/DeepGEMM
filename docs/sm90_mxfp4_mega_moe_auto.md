@@ -1769,3 +1769,67 @@ correctness passes, static SASS, NCU, and NSYS. The next step is a fresh full
 Flash/Pro matrix against PR383. R22 will then test the same monolithic paired
 decoder for Pro, where R20 still uses split helper calls and leaves avoidable
 lookup scheduling and live-range overhead.
+
+## Final matrix after R21
+
+R21 and PR383 were measured consecutively on the same H20 pod with fresh JIT
+caches. The candidate uses the authoritative fused MXFP4 driver; PR383 uses its
+native compatible two-phase FP8 driver, with reported time equal to L1 plus L2.
+Both use the DSV4 Flash/Pro shapes, 50 observations for M <= 128, three for
+M >= 256, 20 launches per observation, cold L2, and maximum-rank medians.
+
+| model | M | PR383 us | R21 us | R21 gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 300.630 | 426.831 | +41.98% |
+| Flash | 16 | 305.645 | 434.094 | +42.03% |
+| Flash | 32 | 328.809 | 434.549 | +32.16% |
+| Flash | 64 | 364.264 | 481.075 | +32.07% |
+| Flash | 128 | 433.449 | 484.672 | +11.82% |
+| Flash | 256 | 506.221 | 504.392 | -0.36% |
+| Flash | 512 | 947.005 | 887.077 | -6.33% |
+| Flash | 1024 | 1526.217 | 1577.000 | +3.33% |
+| Flash | 2048 | 2749.035 | 2801.000 | +1.89% |
+| Flash | 4096 | 5085.000 | 5177.000 | +1.81% |
+| Flash | 8192 | 9880.000 | 10067.000 | +1.89% |
+| Pro | 8 | 701.005 | 857.922 | +22.39% |
+| Pro | 16 | 987.907 | 1113.000 | +12.66% |
+| Pro | 32 | 1079.527 | 1163.500 | +7.78% |
+| Pro | 64 | 1114.844 | 1209.500 | +8.49% |
+| Pro | 128 | 1220.630 | 1626.500 | +33.25% |
+| Pro | 256 | 1639.223 | 1628.000 | -0.68% |
+| Pro | 512 | 2415.025 | 2559.000 | +5.96% |
+| Pro | 1024 | 4050.000 | 3937.000 | -2.79% |
+| Pro | 2048 | 7050.000 | 6962.000 | -1.25% |
+| Pro | 4096 | 12978.000 | 13120.000 | +1.09% |
+| Pro | 8192 | 24961.000 | 25358.000 | +1.59% |
+
+The same-epoch geometric gaps are:
+
+- all 22 points: `+10.47%`;
+- M <= 128: `+23.80%`;
+- M >= 256: `+0.47%`;
+- Flash small-M: `+31.52%`;
+- Pro small-M: `+16.53%`;
+- all Flash points: `+13.46%`;
+- all Pro points: `+7.56%`.
+
+The all-point gap improves from R20's `+11.67%` to `+10.47%`, all-Flash from
+`+15.81%` to `+13.46%`, Flash small-M from `+32.57%` to `+31.52%`, and large-M
+from `+1.79%` to `+0.47%`. The absolute Flash M8/M16 medians moved with node
+epoch, so the R21 code change is credited from the bracketed exact-R20 controls
+(`-5.36%` geometric), not from cross-epoch absolute medians alone.
+
+The failed `bench_mega_moe_sm90_r20_standard.py` startup in the artifact is
+retained for audit: it passed the newer `num_shared_experts` keyword into the
+old PR383 API and failed before timing. The successful matrix uses PR383's
+native `tests/bench_mega_moe_sm90.py`, matching all preceding PR383 matrices.
+
+Raw logs are under
+`/app/deepgemm-auto-results/iter28-r21-final-matrix`; the local export is
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter28-r21-final-matrix`.
+
+R21 does not meet the terminal goal. Large-M is effectively closed, while the
+remaining optimization budget is dominated by Flash M8-M64 and Pro M128. R22
+first applies the proven monolithic paired decoder to Pro; if M128 remains
+unchanged, the next diagnosis must separate its schedule/dispatch fixed cost
+from MXFP4 expansion cost.
