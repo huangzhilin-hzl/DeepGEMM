@@ -99,7 +99,7 @@ public:
             args.num_tokens > kSM90MoeMaxLatencyOverlapTokens;
         const bool small_m_swap_ab =
             args.num_shared_experts == 0 and
-            ((args.hidden == 4096 and args.num_tokens <= 32) or
+            ((args.hidden == 4096 and args.num_tokens <= 64) or
              (args.hidden == 7168 and args.num_tokens <= 128));
         const bool packed_bf16_swap_epilogue =
             args.num_shared_experts == 0 and

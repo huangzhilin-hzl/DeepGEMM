@@ -1971,3 +1971,39 @@ within 7-15%, but Flash M8-M64 remains 32-41% behind PR383 and now dominates
 the geometric gap. The next iteration returns to the Flash swap-AB latency
 kernel and targets its fixed epilogue/synchronization cost rather than the
 already-reduced MXFP4 decode body.
+
+## R24: extend the current Flash swap-AB path to M64
+
+### Reason and direction
+
+The remaining Flash latency gap had the same selector discontinuity that R23
+resolved for Pro: M32 used sparse-expert swap-AB, while M64 switched to the
+regular M64xN128 WGMMA kernel. The original R02 source rejected Flash M64
+swap-AB by only `+1.17%`; since then fragment reuse removed the swap frame and
+paired decoding reduced its MXFP4 body. R24 therefore retests the boundary on
+the current source by extending routed-only Flash swap-AB from M <= 32 to
+M <= 64. Flash M8-M32 already select this path, M >= 128 remains regular, and
+all Pro selectors are unchanged.
+
+The correctness suite previously had no production Flash M64 case, so R24
+adds `production.flash_m64` with the same DSV4 shape and forced physical-ring
+wrap contract as M32/M128. The new eight-rank case passes at `diff=0.000654`.
+Both the R23 regular control and R24 swap kernel use `REG=128`, `STACK=0`,
+`LOCAL=0`, and 1024 bytes static shared memory.
+
+A ten-observation R23/R24/R23 screen measured
+`515.841/476.958/486.771 us`, or `-7.54%/-2.02%`. The formal run used ten
+warmups, 50 observations, 20 launches per observation, cold L2, and
+maximum-rank medians:
+
+| Flash M64 | median us | R24 change |
+| --- | ---: | ---: |
+| R23 first control | 490.817 | - |
+| R24 | 464.221 | -5.42% |
+| R23 second control | 494.298 | -6.08% |
+
+R24 is retained because the formal improvement is consistent in both orders,
+the added production scenario proves the new selector under physical ring
+wrap, and resources remain spill-free. Artifacts are under
+`/app/deepgemm-auto-results/iter32-flash-m64-swap-retest`; the local export is
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter32-flash-m64-swap-retest`.
