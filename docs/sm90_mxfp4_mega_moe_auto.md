@@ -2306,3 +2306,66 @@ R27 is retained only for Flash M32. The terminal goal remains unmet; the dense
 path is faster at M8/M16, so their remaining gap requires a different way to
 reduce frontend/barrier latency rather than simply skipping zero-count
 completion atomics.
+
+## Final matrix after R27
+
+The R27 candidate was run across the complete authoritative matrix. PR383 is
+the unchanged iter39 native two-phase log from the same pod; the source,
+hardware, and benchmark settings are unchanged. Both logs use 50 observations
+for M <= 128, three for M >= 256, 20 launches per observation, cold L2, and
+maximum-rank medians.
+
+| model | M | PR383 us | R27 us | R27 gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 299.531 | 394.786 | +31.80% |
+| Flash | 16 | 308.502 | 419.919 | +36.12% |
+| Flash | 32 | 333.619 | 416.520 | +24.85% |
+| Flash | 64 | 367.438 | 460.693 | +25.38% |
+| Flash | 128 | 445.626 | 486.371 | +9.14% |
+| Flash | 256 | 495.505 | 596.176 | +20.32% |
+| Flash | 512 | 905.925 | 934.160 | +3.12% |
+| Flash | 1024 | 1534.908 | 1569.000 | +2.22% |
+| Flash | 2048 | 2734.939 | 2780.000 | +1.65% |
+| Flash | 4096 | 5099.000 | 5185.000 | +1.69% |
+| Flash | 8192 | 9853.000 | 10061.000 | +2.11% |
+| Pro | 8 | 704.874 | 839.829 | +19.15% |
+| Pro | 16 | 979.115 | 1065.000 | +8.77% |
+| Pro | 32 | 1066.244 | 1140.000 | +6.92% |
+| Pro | 64 | 1117.183 | 1207.000 | +8.04% |
+| Pro | 128 | 1232.130 | 1416.000 | +14.92% |
+| Pro | 256 | 1667.199 | 1647.000 | -1.21% |
+| Pro | 512 | 2450.788 | 2566.000 | +4.70% |
+| Pro | 1024 | 4042.000 | 3944.000 | -2.42% |
+| Pro | 2048 | 7044.000 | 6981.000 | -0.89% |
+| Pro | 4096 | 13004.000 | 13107.000 | +0.79% |
+| Pro | 8192 | 24987.000 | 25319.000 | +1.33% |
+
+The raw same-node geometric gaps are:
+
+- all 22 points: `+9.40%`;
+- M <= 128: `+18.09%`;
+- M >= 256: `+2.64%`;
+- all Flash points: `+13.69%`;
+- Flash small-M: `+25.11%`;
+- Flash large-M: `+4.98%`;
+- all Pro points: `+5.26%`;
+- Pro small-M: `+11.46%`;
+- Pro large-M: `+0.36%`.
+
+Flash M256 is an explicit epoch anomaly, not an R27 source regression: R27
+only changes generated code at Flash M32, while M256 is byte-identical to R26.
+A subsequent PR383/R27/PR383 three-observation check measured
+`602.613/563.397/528.811 us`; PR383 itself moved 14% across the two controls.
+The raw iter44 value remains in the table for audit, but it is not attributed
+to R27 and should not drive the next optimization. R27's source attribution
+remains the three exact M32 comparisons in the preceding section.
+
+Raw matrix logs are under
+`/app/deepgemm-auto-results/iter44-r27-final-matrix`, and the epoch check is
+under `iter45-flash-m256-epoch-check`. Local exports use matching names below
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts`.
+
+The goal is still not complete. Excluding the anomalous unchanged M256 point,
+large-M remains near PR383 while the dominant verified gaps are Flash M8/M16/
+M64 and Pro M8/M128. R28 must change the dense frontend or task schedule rather
+than extending sparse completion to points where it formally regressed.
