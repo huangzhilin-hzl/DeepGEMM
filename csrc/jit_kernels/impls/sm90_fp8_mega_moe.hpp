@@ -94,6 +94,10 @@ public:
         const bool use_incremental_mxfp4_descriptor =
             args.hidden == 4096 and
             args.num_tokens > kSM90MoeMaxLatencyOverlapTokens;
+        const bool small_m_swap_ab =
+            args.hidden == 4096 and
+            args.num_shared_experts == 0 and
+            args.num_tokens <= 32;
         constexpr int kL2CDSwizzleMinTokens = 1024;
         const bool swizzle_l2_cd =
             args.num_tokens >= kL2CDSwizzleMinTokens;
@@ -117,6 +121,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}, {}, {}
     >);
 }};
@@ -129,6 +134,7 @@ static void __instantiate_kernel() {{
     args.config.num_sms, args.num_ranks,
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false",
+    small_m_swap_ab ? "true" : "false",
     swizzle_l2_cd ? "true" : "false",
     overlap_mxfp4_scale_path ? "true" : "false",
     use_prmt_mxfp4_exponent ? "true" : "false",

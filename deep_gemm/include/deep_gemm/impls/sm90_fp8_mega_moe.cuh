@@ -192,6 +192,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     uint32_t kNumSMs, uint32_t kNumRanks, \
     float kActivationClamp, \
     bool kFastMath, \
+    bool kSmallMSwapAB, \
     bool kSwizzleL2CD, \
     bool kOverlapMXFP4ScalePath, \
     bool kUsePRMTMXFP4Exponent, \
@@ -266,7 +267,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
 #define DG_SM90_FP8_MOE_CORE_TEMPLATE_ARGS \
     kNumMaxTokensPerRank, kHidden, kIntermediateHidden, kNumExperts, kNumTopk, \
     kNumSMs, kNumRanks, \
-    kActivationClamp, kFastMath, kSwizzleL2CD, \
+    kActivationClamp, kFastMath, kSmallMSwapAB, kSwizzleL2CD, \
     kOverlapMXFP4ScalePath, \
     kUsePRMTMXFP4Exponent, \
     kUseIncrementalMXFP4Descriptor, \
@@ -298,6 +299,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr uint32_t kNumExpertsPerRank = kNumExperts / kNumRanks;
     constexpr uint32_t kNumRingBlocks = kNumRingTokens / BLOCK_M;
     constexpr bool kHasSharedExperts = kNumSharedExperts > 0;
+    DG_STATIC_ASSERT(not kSmallMSwapAB or
+                         (kHidden == 4096 and not kHasSharedExperts),
+                     "Small-M swap-AB is routed-only and Flash-specific");
 
     // =====================================================================
     // Template checks
@@ -385,6 +389,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr uint32_t WG_BLOCK_N = BLOCK_N;
     constexpr uint32_t L1_OUT_BLOCK_N = BLOCK_N / 2;       // post-SwiGLU tile N
     constexpr uint32_t WG_L1_OUT_BLOCK_N = WG_BLOCK_N / 2; // post-SwiGLU per-WG N
+    constexpr uint32_t kSwapABTokenChunks = BLOCK_M / 8;
+    constexpr uint32_t kSwapABWeightHalves = BLOCK_N / 64;
+    constexpr uint32_t kSwapABHalfAccumPerThread = 64 * 64 / 128;
+    DG_STATIC_ASSERT(BLOCK_M == 64 and BLOCK_N == 128 and
+                         kSwapABWeightHalves == 2,
+                     "Small-M swap-AB requires the fixed Humming tile");
     // Two-CTA MXFP4 is compiled at 128 registers/thread. Keeping both the
     // 64-value WGMMA fragment and a 64-value FP32 persistent sum live creates
     // a short local-memory frame. Retain the cross-promotion sum as 32 packed
@@ -1810,6 +1820,237 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     const float mxfp4_secondary = __ldg(
                         (is_linear1_phase ? l1_mxfp4_secondary : l2_mxfp4_secondary) +
                         local_expert_idx);
+                    if constexpr (kSmallMSwapAB) {
+                        // The regular M64xN128 orientation wastes nearly all
+                        // tensor-core work when each routed expert owns only a
+                        // handful of tokens.  Use each N64 weight half as the
+                        // WGMMA M operand and bucket valid tokens along N.
+                        // Unlike the retired per-tensor path, every K128/K64
+                        // group is promoted with the token's staged activation
+                        // scale before the temporary accumulator is reused.
+                        auto run_swap_ab = [&]<uint32_t N_SWAP>() {
+                            using SwapWGMMA = typename
+                                mma::sm90::FP8MMASelector<N_SWAP>::type;
+                            constexpr uint32_t kSwapAccum =
+                                SwapWGMMA::kNumAccum;
+                            DG_STATIC_ASSERT(
+                                kSwapAccum <= kSwapABHalfAccumPerThread,
+                                "Invalid swap-AB accumulator bucket");
+                            const uint32_t swap_col_idx = lane_idx % 4;
+
+                            const auto issue_swap_wgmma = [&]<
+                                    uint32_t kStartK32,
+                                    uint32_t kNumWGMMAs>(
+                                    const uint32_t pipeline_stage,
+                                    const uint32_t expanded_slot) {
+                                #pragma unroll
+                                for (uint32_t half = 0;
+                                     half < kSwapABWeightHalves; ++ half) {
+                                    auto* half_accum = accum +
+                                        half * kSwapABHalfAccumPerThread;
+                                    #pragma unroll
+                                    for (uint32_t i = 0; i < kSwapAccum; ++ i)
+                                        ptx::warpgroup_fence_operand(
+                                            half_accum[i]);
+                                }
+                                ptx::warpgroup_arrive();
+                                #pragma unroll
+                                for (uint32_t half = 0;
+                                     half < kSwapABWeightHalves; ++ half) {
+                                    auto* half_accum = accum +
+                                        half * kSwapABHalfAccumPerThread;
+                                    const auto desc_a_base =
+                                        mma::sm90::make_smem_desc(
+                                            smem_b_expanded[expanded_slot] +
+                                                half * 64u * BLOCK_K,
+                                            1);
+                                    const auto desc_b_base =
+                                        mma::sm90::make_smem_desc(
+                                            smem_a[pipeline_stage], 1);
+                                    #pragma unroll
+                                    for (uint32_t k = 0;
+                                         k < kNumWGMMAs; ++ k) {
+                                        const uint32_t k32_idx = kStartK32 + k;
+                                        const cute::GmmaDescriptor desc_a(
+                                            desc_a_base.desc_ + k32_idx * 2u);
+                                        const cute::GmmaDescriptor desc_b(
+                                            desc_b_base.desc_ + k32_idx * 2u);
+                                        SwapWGMMA::wgmma(
+                                            desc_a, desc_b, half_accum,
+                                            k != 0);
+                                    }
+                                }
+                                ptx::warpgroup_commit_batch();
+                                #pragma unroll
+                                for (uint32_t half = 0;
+                                     half < kSwapABWeightHalves; ++ half) {
+                                    auto* half_accum = accum +
+                                        half * kSwapABHalfAccumPerThread;
+                                    #pragma unroll
+                                    for (uint32_t i = 0; i < kSwapAccum; ++ i)
+                                        ptx::warpgroup_fence_operand(
+                                            half_accum[i]);
+                                }
+                            };
+
+                            const auto promote_swap_ab = [&]<bool kReleaseStage>(
+                                    const uint32_t pipeline_stage,
+                                    const uint32_t activation_sf_group) {
+                                constexpr float kMaxSecondaryBeforeX64 =
+                                    0x1p121f;
+                                const bool compensate_secondary =
+                                    mxfp4_secondary <=
+                                        kMaxSecondaryBeforeX64;
+                                const float compensated_secondary =
+                                    compensate_secondary ?
+                                        mxfp4_secondary * 64.0f :
+                                        mxfp4_secondary;
+                                ptx::warpgroup_wait<0>();
+
+                                #pragma unroll
+                                for (uint32_t chunk = 0;
+                                     chunk < kSwapAccum / 4; ++ chunk) {
+                                    const uint32_t token_0 =
+                                        chunk * 8 + swap_col_idx * 2;
+                                    const uint32_t token_1 = token_0 + 1;
+                                    const float scale_a_0 =
+                                        token_0 < valid_m ?
+                                            ptx::ld_shared(
+                                                smem_sfa[pipeline_stage] +
+                                                activation_sf_group *
+                                                    kL2SFAHalfStride +
+                                                token_0) :
+                                            0.0f;
+                                    const float scale_a_1 =
+                                        token_1 < valid_m ?
+                                            ptx::ld_shared(
+                                                smem_sfa[pipeline_stage] +
+                                                activation_sf_group *
+                                                    kL2SFAHalfStride +
+                                                token_1) :
+                                            0.0f;
+                                    const float combined_scale_0 =
+                                        (compensate_secondary ?
+                                             scale_a_0 : scale_a_0 * 64.0f) *
+                                        compensated_secondary;
+                                    const float combined_scale_1 =
+                                        (compensate_secondary ?
+                                             scale_a_1 : scale_a_1 * 64.0f) *
+                                        compensated_secondary;
+                                    #pragma unroll
+                                    for (uint32_t half = 0;
+                                         half < kSwapABWeightHalves; ++ half) {
+                                        const uint32_t accum_offset =
+                                            half *
+                                                kSwapABHalfAccumPerThread +
+                                            chunk * 4;
+                                        const uint32_t pair_offset =
+                                            accum_offset / 2;
+                                        const float2 persistent_0 =
+                                            __bfloat1622float2(
+                                                mxfp4_final_bf16[
+                                                    pair_offset]);
+                                        const float2 persistent_1 =
+                                            __bfloat1622float2(
+                                                mxfp4_final_bf16[
+                                                    pair_offset + 1]);
+                                        mxfp4_final_bf16[pair_offset] =
+                                            __floats2bfloat162_rn(
+                                                fmaf(combined_scale_0,
+                                                     accum[accum_offset],
+                                                     persistent_0.x),
+                                                fmaf(combined_scale_1,
+                                                     accum[accum_offset + 1],
+                                                     persistent_0.y));
+                                        mxfp4_final_bf16[pair_offset + 1] =
+                                            __floats2bfloat162_rn(
+                                                fmaf(combined_scale_0,
+                                                     accum[accum_offset + 2],
+                                                     persistent_1.x),
+                                                fmaf(combined_scale_1,
+                                                     accum[accum_offset + 3],
+                                                     persistent_1.y));
+                                    }
+                                }
+                                // SFA belongs to the same producer stage as A.
+                                // Release it only after every token scale has
+                                // been consumed; otherwise the loader can
+                                // overwrite a later chunk during promotion.
+                                if constexpr (kReleaseStage)
+                                    arrive_task_empty_barrier(pipeline_stage);
+                            };
+
+                            for (uint32_t k_block_idx = 0;
+                                 k_block_idx < num_k_blocks;
+                                 advance_pipeline(k_block_idx)) {
+                                const uint32_t expanded_slot =
+                                    kPipelineMXFP4ExpandedB ?
+                                        (k_block_idx & 1u) : 0u;
+                                if constexpr (kPipelineMXFP4ExpandedB) {
+                                    if (k_block_idx == 0) {
+                                        full_barriers[stage_idx]->wait(phase);
+                                        prepare_stage_weights(
+                                            stage_idx, expanded_slot);
+                                    }
+                                } else {
+                                    full_barriers[stage_idx]->wait(phase);
+                                    prepare_stage_weights(
+                                        stage_idx, expanded_slot);
+                                }
+
+                                if constexpr (is_linear1_phase) {
+                                    issue_swap_wgmma.template operator()<0, 4>(
+                                        stage_idx, expanded_slot);
+                                } else {
+                                    issue_swap_wgmma.template operator()<0, 2>(
+                                        stage_idx, expanded_slot);
+                                    promote_swap_ab.template operator()<false>(
+                                        stage_idx, 0);
+                                    issue_swap_wgmma.template operator()<2, 2>(
+                                        stage_idx, expanded_slot);
+                                }
+
+                                if constexpr (kPipelineMXFP4ExpandedB) {
+                                    if (k_block_idx + 1 < num_k_blocks) {
+                                        const uint32_t next_stage =
+                                            stage_idx == kNumStages - 1 ?
+                                                0u : stage_idx + 1u;
+                                        const uint32_t next_phase =
+                                            phase ^ (next_stage == 0u);
+                                        full_barriers[next_stage]->wait(
+                                            next_phase);
+                                        prepare_stage_weights(
+                                            next_stage,
+                                            expanded_slot ^ 1u);
+                                    }
+                                }
+                                promote_swap_ab.template operator()<true>(
+                                    stage_idx,
+                                    is_linear1_phase ? 0u : 1u);
+                            }
+                        };
+
+                        const uint32_t n_swap =
+                            math::ceil_div(valid_m, 8u) * 8u;
+                        if (n_swap <= 8)
+                            run_swap_ab.template operator()<8>();
+                        else if (n_swap <= 16)
+                            run_swap_ab.template operator()<16>();
+                        else if (n_swap <= 32)
+                            run_swap_ab.template operator()<32>();
+                        else
+                            run_swap_ab.template operator()<64>();
+
+                        #pragma unroll
+                        for (uint32_t i = 0;
+                             i < kAccumPerThread / 2; ++ i) {
+                            const float2 pair =
+                                __bfloat1622float2(
+                                    mxfp4_final_bf16[i]);
+                            final_accum[i * 2] = pair.x;
+                            final_accum[i * 2 + 1] = pair.y;
+                        }
+                    } else {
                     for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks;
                          advance_pipeline(k_block_idx)) {
                         const uint32_t expanded_slot =
@@ -1890,6 +2131,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             __bfloat1622float2(mxfp4_final_bf16[i]);
                         final_accum[i * 2] = pair.x;
                         final_accum[i * 2 + 1] = pair.y;
+                    }
                     }
                 }
             };
@@ -2106,6 +2348,210 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             const bool valid_r1 = row_offset_r1 < valid_m;
 
             if (is_linear1_phase) {
+                auto* smem_cd_l1_wg = smem_cd_l1;
+                if constexpr (kSmallMSwapAB and not is_shared_phase) {
+                    // Swap-AB maps tokens across WGMMA N and output channels
+                    // across lanes/warps.  Derive the dynamic per-token K64
+                    // output scale with a two-level warpgroup reduction, then
+                    // write the same row-major FP8/SF contract consumed by L2.
+                    float swap_swiglu[
+                        kSwapABWeightHalves][kSwapABTokenChunks][2];
+                    auto silu = [](float x) {
+                        const float e = kFastMath ? __expf(-x) : expf(-x);
+                        const float sig = kFastMath ?
+                            math::fast_rcp(1.0f + e) :
+                            1.0f / (1.0f + e);
+                        return x * sig;
+                    };
+                    auto clamp_gate = [](float& x) {
+                        if constexpr (kActivationClamp !=
+                                      cute::numeric_limits<float>::infinity())
+                            x = cute::min(x, kActivationClamp);
+                    };
+                    auto clamp_up = [](float& x) {
+                        if constexpr (kActivationClamp !=
+                                      cute::numeric_limits<float>::infinity())
+                            x = cute::min(
+                                cute::max(x, -kActivationClamp),
+                                kActivationClamp);
+                    };
+                    const uint32_t num_swap_token_chunks =
+                        math::ceil_div(valid_m, 8u);
+                    // Pipeline SFA is reusable by the producer immediately
+                    // after the math loop releases a stage.  Use C/D storage,
+                    // which is epilogue-exclusive, for the cross-warp amax.
+                    auto* swap_scale_scratch =
+                        reinterpret_cast<float*>(smem_cd_base);
+
+                    #pragma unroll
+                    for (uint32_t chunk = 0;
+                         chunk < kSwapABTokenChunks; ++ chunk) {
+                        const uint32_t token_0 =
+                            chunk * 8 + col_idx * 2;
+                        const uint32_t token_1 = token_0 + 1;
+                        const bool active_chunk =
+                            chunk < num_swap_token_chunks;
+                        const float weight_0 =
+                            active_chunk and token_0 < valid_m ?
+                                *l1_topk_weights_buffer
+                                    .get_data_buffer(m_idx + token_0)
+                                    .template get_base_ptr<float>() :
+                                0.0f;
+                        const float weight_1 =
+                            active_chunk and token_1 < valid_m ?
+                                *l1_topk_weights_buffer
+                                    .get_data_buffer(m_idx + token_1)
+                                    .template get_base_ptr<float>() :
+                                0.0f;
+                        #pragma unroll
+                        for (uint32_t half = 0;
+                             half < kSwapABWeightHalves; ++ half) {
+                            const uint32_t accum_offset =
+                                half * kSwapABHalfAccumPerThread +
+                                chunk * 4;
+                            float gate_0 = final_accum[accum_offset];
+                            float gate_1 = final_accum[accum_offset + 1];
+                            float up_0 = final_accum[accum_offset + 2];
+                            float up_1 = final_accum[accum_offset + 3];
+                            clamp_gate(gate_0);
+                            clamp_gate(gate_1);
+                            clamp_up(up_0);
+                            clamp_up(up_1);
+                            swap_swiglu[half][chunk][0] =
+                                silu(gate_0) * up_0 * weight_0;
+                            swap_swiglu[half][chunk][1] =
+                                silu(gate_1) * up_1 * weight_1;
+                        }
+
+                        float partial_0 = cute::max(
+                            cute::abs(swap_swiglu[0][chunk][0]),
+                            cute::abs(swap_swiglu[1][chunk][0]));
+                        float partial_1 = cute::max(
+                            cute::abs(swap_swiglu[0][chunk][1]),
+                            cute::abs(swap_swiglu[1][chunk][1]));
+                        #pragma unroll
+                        for (uint32_t delta = 4; delta <= 16; delta *= 2) {
+                            partial_0 = cute::max(
+                                partial_0,
+                                __shfl_xor_sync(
+                                    0xffffffffu, partial_0, delta));
+                            partial_1 = cute::max(
+                                partial_1,
+                                __shfl_xor_sync(
+                                    0xffffffffu, partial_1, delta));
+                        }
+                        if (row_idx == 0 and active_chunk) {
+                            swap_scale_scratch[
+                                warp_idx_in_wg * BLOCK_M + token_0] =
+                                    partial_0;
+                            swap_scale_scratch[
+                                warp_idx_in_wg * BLOCK_M + token_1] =
+                                    partial_1;
+                        }
+                    }
+                    ptx::sync_aligned(
+                        kNumEpilogueThreads,
+                        kEpilogueWGBarrierStartIdx);
+
+                    if (warp_idx_in_wg == 0) {
+                        #pragma unroll
+                        for (uint32_t half = 0; half < 2; ++ half) {
+                            const uint32_t token = lane_idx + half * 32;
+                            if (token < valid_m) {
+                                float amax = 0.0f;
+                                #pragma unroll
+                                for (uint32_t warp = 0;
+                                     warp < kNumEpilogueWarps; ++ warp)
+                                    amax = cute::max(
+                                        amax,
+                                        swap_scale_scratch[
+                                            warp * BLOCK_M + token]);
+                                float2 amax_pair = {amax, amax};
+                                float2 sf_pair, sf_inv_pair;
+                                sm90_fp8_mega_moe_get_e4m3_sf_and_sf_inv(
+                                    amax_pair, sf_pair, sf_inv_pair);
+                                swap_scale_scratch[token] = sf_pair.x;
+                                swap_scale_scratch[BLOCK_M + token] =
+                                    sf_inv_pair.x;
+                            }
+                        }
+                    }
+                    ptx::sync_aligned(
+                        kNumEpilogueThreads,
+                        kEpilogueWGBarrierStartIdx);
+
+                    float swap_sf_inv[kSwapABTokenChunks][2];
+                    #pragma unroll
+                    for (uint32_t chunk = 0;
+                         chunk < kSwapABTokenChunks; ++ chunk) {
+                        const uint32_t token_0 =
+                            chunk * 8 + col_idx * 2;
+                        const uint32_t token_1 = token_0 + 1;
+                        swap_sf_inv[chunk][0] = token_0 < valid_m ?
+                            swap_scale_scratch[BLOCK_M + token_0] : 0.0f;
+                        swap_sf_inv[chunk][1] = token_1 < valid_m ?
+                            swap_scale_scratch[BLOCK_M + token_1] : 0.0f;
+                    }
+                    if (warp_idx_in_wg == 0) {
+                        auto sf_base_ptr =
+                            l2_sf_buffer.get_base_ptr<float>();
+                        const uint32_t base_k_sf_idx = n_block_idx;
+                        #pragma unroll
+                        for (uint32_t half = 0; half < 2; ++ half) {
+                            const uint32_t token = lane_idx + half * 32;
+                            if (token < valid_m)
+                                sf_base_ptr[
+                                    base_k_sf_idx * kNumSFRingTokens +
+                                    m_idx + token] =
+                                    swap_scale_scratch[token];
+                        }
+                    }
+                    // Every thread must retain its inverse scales before the
+                    // row-major FP8 stores overwrite C/D scratch.
+                    ptx::sync_aligned(
+                        kNumEpilogueThreads,
+                        kEpilogueWGBarrierStartIdx);
+
+                    #pragma unroll
+                    for (uint32_t chunk = 0;
+                         chunk < kSwapABTokenChunks; ++ chunk) {
+                        if (chunk < num_swap_token_chunks) {
+                            const uint32_t token_0 =
+                                chunk * 8 + col_idx * 2;
+                            const uint32_t token_1 = token_0 + 1;
+                            #pragma unroll
+                            for (uint32_t half = 0;
+                                 half < kSwapABWeightHalves; ++ half) {
+                                const uint32_t out_col =
+                                    half * 32u +
+                                    warp_idx_in_wg * 8 + row_idx;
+                                if (token_0 < valid_m) {
+                                    const __nv_fp8_e4m3 q(
+                                        swap_swiglu[half][chunk][0] *
+                                        swap_sf_inv[chunk][0]);
+                                    reinterpret_cast<uint8_t*>(
+                                        smem_cd_l1_wg)[
+                                            token_0 *
+                                                WG_SMEM_CD_L1_STRIDE_N +
+                                            out_col] =
+                                        *reinterpret_cast<const uint8_t*>(&q);
+                                }
+                                if (token_1 < valid_m) {
+                                    const __nv_fp8_e4m3 q(
+                                        swap_swiglu[half][chunk][1] *
+                                        swap_sf_inv[chunk][1]);
+                                    reinterpret_cast<uint8_t*>(
+                                        smem_cd_l1_wg)[
+                                            token_1 *
+                                                WG_SMEM_CD_L1_STRIDE_N +
+                                            out_col] =
+                                        *reinterpret_cast<const uint8_t*>(&q);
+                                }
+                            }
+                        }
+                    }
+
+                } else {
                 // ---------------- L1 EPILOGUE: SwiGLU + FP8 quantize + TMA store ----------------
                 // Layout in `final_accum`:
                 //   16 chunks of 8 N-cols, each chunk = 4 floats per thread = (r0c0, r0c1, r1c0, r1c1).
@@ -2234,7 +2680,6 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 }
 
                 // Quantize and write to smem_cd_l1 (row-major, no swizzle).
-                auto* smem_cd_l1_wg = smem_cd_l1;
                 #pragma unroll
                 for (uint32_t p = 0; p < kNumPairs; ++ p) {
                     const uint32_t sf_group = p / 8;
@@ -2280,6 +2725,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         if (valid_r1)
                             sf_base_ptr[(base_k_sf_idx + g) * sf_stride + token_r1] = sf_r1[g];
                     }
+                }
                 }
 
                 // Issue TMA store of the entire tile. Padding rows beyond
@@ -2336,14 +2782,64 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         return cute::Swizzle<3, 4, 3>::apply(byte_idx);
                     return byte_idx;
                 };
-                    auto store_l2_pair = [&](const uint32_t& elem_idx,
-                                             float value0, float value1) {
-                        const uint32_t storage_byte_idx = get_l2_cd_byte_idx(
-                            elem_idx * sizeof(nv_bfloat16));
-                        *reinterpret_cast<uint32_t*>(
-                            smem_cd_base + storage_byte_idx) =
-                                math::cast_into_bf16_and_pack(value0, value1);
-                    };
+                auto store_l2_pair = [&](const uint32_t& elem_idx,
+                                         float value0, float value1) {
+                    const uint32_t storage_byte_idx = get_l2_cd_byte_idx(
+                        elem_idx * sizeof(nv_bfloat16));
+                    *reinterpret_cast<uint32_t*>(
+                        static_cast<uint8_t*>(smem_cd_base) +
+                            storage_byte_idx) =
+                            math::cast_into_bf16_and_pack(value0, value1);
+                };
+                auto store_l2_scalar = [&](const uint32_t& elem_idx,
+                                           float value) {
+                    const uint32_t storage_byte_idx = get_l2_cd_byte_idx(
+                        elem_idx * sizeof(nv_bfloat16));
+                    *reinterpret_cast<nv_bfloat16*>(
+                        static_cast<uint8_t*>(smem_cd_base) +
+                            storage_byte_idx) = __float2bfloat16_rn(value);
+                };
+                if constexpr (kSmallMSwapAB and not is_shared_phase) {
+                        const uint32_t num_swap_token_chunks =
+                            math::ceil_div(valid_m, 8u);
+                        #pragma unroll
+                        for (uint32_t chunk = 0;
+                             chunk < kSwapABTokenChunks; ++ chunk) {
+                            if (chunk < num_swap_token_chunks) {
+                                const uint32_t token_0 =
+                                    chunk * 8 + col_idx * 2;
+                                const uint32_t token_1 = token_0 + 1;
+                                #pragma unroll
+                                for (uint32_t half = 0;
+                                     half < kSwapABWeightHalves; ++ half) {
+                                    const uint32_t accum_offset =
+                                        half * kSwapABHalfAccumPerThread +
+                                        chunk * 4;
+                                    const uint32_t col_offset = half * 64u;
+                                    if (token_0 < valid_m) {
+                                        store_l2_scalar(
+                                            token_0 * WG_BLOCK_N +
+                                                col_offset + r_0,
+                                            final_accum[accum_offset]);
+                                        store_l2_scalar(
+                                            token_0 * WG_BLOCK_N +
+                                                col_offset + r_1,
+                                            final_accum[accum_offset + 2]);
+                                    }
+                                    if (token_1 < valid_m) {
+                                        store_l2_scalar(
+                                            token_1 * WG_BLOCK_N +
+                                                col_offset + r_0,
+                                            final_accum[accum_offset + 1]);
+                                        store_l2_scalar(
+                                            token_1 * WG_BLOCK_N +
+                                                col_offset + r_1,
+                                            final_accum[accum_offset + 3]);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
                     #pragma unroll
                         for (uint32_t i = 0; i < kAccumPerThread / 8; ++ i) {
                             const uint32_t chunk_lo = 2 * i, chunk_hi = 2 * i + 1;
@@ -2372,6 +2868,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                     final_accum[chunk_hi * 4 + 3]);
                             }
                         }
+                    }
 
                     ptx::sync_aligned(128, kEpilogueWGBarrierStartIdx);
 

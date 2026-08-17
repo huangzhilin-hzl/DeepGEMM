@@ -140,3 +140,75 @@ The second resident CTA provides necessary compute parallelism in the current
 register/shared-memory budget and change the pipeline, rather than only
 shrinking the grid. The next iteration therefore targets latency-path register
 pressure or fixed synchronization inside the existing two-CTA grid.
+
+## Iteration 02: blockwise Flash swap-AB for M <= 32
+
+### Reason
+
+NCU ruled out local-memory traffic as the baseline bottleneck: Pro M8 reported
+zero local loads/stores, while the fused kernel spent 18.73% of sampled cycles
+on long-scoreboard stalls versus 4.86-6.08% in PR383's two phase kernels. The
+baseline also issues an M64 x N128 WGMMA for experts that commonly own fewer
+than eight tokens. Repository history showed that an earlier per-tensor-scale
+kernel avoided this waste by swapping the WGMMA operands at small M, but the
+path was removed when routed activations changed to per-block scaling.
+
+### Direction
+
+- Keep the 156-CTA, two-resident-CTA launch topology proven necessary by R01.
+- Treat each N64 weight half as WGMMA M and bucket routed tokens into WGMMA N8,
+  N16, N32, or N64.
+- Preserve the current blockwise numerical contract: promote each L1 K128 and
+  L2 K64 group with its staged activation scale, and retain cross-promotion
+  partials as packed BF16.
+- Remap the swapped L1 result through SwiGLU and a cross-warp dynamic-scale
+  reduction; remap L2 back into the existing BF16 scatter layout.
+- Use epilogue-exclusive C/D shared memory for the scale reduction. Reusing a
+  released pipeline stage caused the producer to overwrite the reduction
+  scratch and was rejected during correctness development.
+- Enable the specialization only for routed-only Flash with M <= 32. The
+  crossover sweep below shows that M64 is neutral-to-slower and M128 is a clear
+  regression.
+
+### Crossover sweep
+
+This sweep temporarily enabled swap-AB through M128. It uses the same 50
+observations, cold-L2 policy, and `max_rank_median_us` score as the baseline.
+
+| M | baseline us | swap-AB us | change |
+| ---: | ---: | ---: | ---: |
+| 8 | 449.780 | 414.278 | -7.89% |
+| 16 | 494.348 | 450.907 | -8.79% |
+| 32 | 503.078 | 463.545 | -7.86% |
+| 64 | 487.814 | 493.518 | +1.17% |
+| 128 | 489.759 | 683.926 | +39.64% |
+
+### Final performance
+
+After fixing the selector at M <= 32, all five points were rerun from the final
+source. M64 and M128 compile the regular baseline path.
+
+| M | baseline us | final us | change | PR383 us | gap to PR383 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 449.780 | 413.731 | -8.01% | 301.924 | +37.03% |
+| 16 | 494.348 | 445.744 | -9.83% | 312.858 | +42.47% |
+| 32 | 503.078 | 456.946 | -9.17% | 328.370 | +39.16% |
+| 64 | 487.814 | 483.059 | -0.97% | 361.647 | +33.57% |
+| 128 | 489.759 | 508.761 | +3.88% | 433.330 | +17.41% |
+
+The geometric-mean gain over the branch baseline is 9.01% for the three
+enabled points and 4.97% over M8-M128. The remaining M8-M32 geometric-mean gap
+to PR383 falls from 53.30% to 39.54%. The unchanged M128 path varied by +3.88%
+in this run; it has no generated swap-AB code and is retained as run-to-run
+noise rather than widening the selector.
+
+### Correctness and resource result
+
+- Eight-rank `production.flash_m32` with forced ring wrap passes at
+  `diff=0.000656` (`0.01` tolerance).
+- The specialized kernel uses 128 registers and four barriers. PTXAS reports a
+  448-byte stack frame, 518 bytes of spill stores, and 604 bytes of spill
+  loads, plus serialized WGMMA due to the fixed 128-register launch bound.
+- The resource report identifies the next target: shorten the live range of
+  the swap epilogue/partial arrays enough to restore WGMMA issue parallelism,
+  without giving up two resident CTAs.
