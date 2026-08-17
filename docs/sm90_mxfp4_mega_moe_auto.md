@@ -436,11 +436,40 @@ The isolated sub-1% wins are within screening noise and do not justify the
 Flash regression, so the source change was reverted. Evidence is under
 `/app/deepgemm-auto-results/iter07-bf16-direct` on the H20 pod.
 
+## Rejected experiment R07: bucket-local mainloop frames
+
+### Reason and direction
+
+R07 retained all four runtime swap buckets and the N64 skew-routing fallback,
+but allocated each branch's WGMMA accumulator and packed BF16 persistent state
+at its actual N8/N16/N32/N64 size. It initialized and expanded only live bucket
+values, while preserving the 156-CTA, two-resident-CTA topology.
+
+Pro M32 correctness passed at 0.000704. PTXAS removed the WGMMA serialization
+warning and reduced the stack from 488 to 472 bytes, but spill stores/loads
+rose from 584/732 to 752/896 bytes. A same-node, immediately following matched
+control confirmed that the added spill traffic outweighed the issue benefit:
+
+| model | M | matched control us | R07 us | change |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 426.198 | 434.758 | +2.01% |
+| Flash | 16 | 478.143 | 495.790 | +3.69% |
+| Flash | 32 | 491.390 | 497.128 | +1.17% |
+| Pro | 8 | 1041.000 | 1117.000 | +7.30% |
+| Pro | 16 | 1340.500 | 1435.500 | +7.09% |
+| Pro | 32 | 1400.500 | 1474.500 | +5.28% |
+| Pro | 64 | 1466.000 | 1559.000 | +6.34% |
+
+Both sides used ten cold-L2 observations and 20 launches per observation. The
+source change was reverted; candidate and matched-control logs are under
+`/app/deepgemm-auto-results/iter08-bucket-frames` on the H20 pod.
+
 ### Recommended next iterations
 
-1. Isolate the runtime N8/N16/N32/N64 swap buckets into bucket-sized mainloop
-   frames so common N8/N16 expert tasks do not inherit the N64 accumulator
-   frame. Keep an explicit N64 fallback for skewed routing.
+1. Isolate the packed-BF16 epilogue signal to Pro M16/M32 with a compile-time
+   selector. R06 showed -0.41%/-0.93% versus the earlier accepted result and
+   -1.34%/-1.64% versus the later matched control, while Pro M8 and Flash must
+   retain their original path.
 2. Do not key a maximum N8/N16/N32 bucket only from global M: one expert can
    receive skewed routes aggregated from all ranks, so its runtime `valid_m`
    may require the N64 fallback even when per-rank M is small.
