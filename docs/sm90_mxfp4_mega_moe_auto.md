@@ -328,20 +328,71 @@ still perturbs the collective launch enough that these durations are not used
 as the benchmark score; the trace is evidence that no extra phase or launch
 was added.
 
+## Rejected experiment R04: stage swap-AB SwiGLU in shared memory
+
+### Reason and direction
+
+Iteration 04 attributed the remaining small-M bottleneck to the swap-AB local
+frame. R04 tested whether the epilogue's 32 FP32 post-SwiGLU values and 16
+inverse scales per thread were responsible. The experiment staged a row-major
+BF16 post-SwiGLU tile in epilogue-exclusive C/D shared memory, retained only
+the current eight-token chunk in registers, and compressed the staging tile to
+FP8 in place. This added one warpgroup barrier per token chunk while preserving
+the 156-CTA, two-resident-CTA topology.
+
+### Resource and correctness result
+
+All forced-ring-wrap cases passed the 0.01 tolerance: Flash M32 at 0.000661,
+Pro M32 at 0.002372, and Pro M64 at 0.002741. Resource usage barely changed:
+
+| model | stack before/after | spill stores before/after | spill loads before/after |
+| --- | ---: | ---: | ---: |
+| Flash | 448 / 440 B | 518 / 514 B | 604 / 596 B |
+| Pro | 488 / 480 B | 584 / 572 B | 732 / 720 B |
+
+The persistent WGMMA serialization warning remained. The small resource delta
+shows that these epilogue arrays were not the dominant source of the local
+frame; the accumulator lifetime across the routed mainloop remains the primary
+suspect.
+
+### Screening performance
+
+The experiment used ten cold-L2 observations and 20 launches per observation.
+`change` compares it with the accepted 50-observation Iteration 02/03 result.
+
+| model | M | accepted us | R04 us | change |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 413.731 | 453.184 | +9.54% |
+| Flash | 16 | 445.744 | 491.462 | +10.26% |
+| Flash | 32 | 456.946 | 489.124 | +7.04% |
+| Pro | 8 | 1042.000 | 1069.500 | +2.64% |
+| Pro | 16 | 1328.000 | 1404.000 | +5.72% |
+| Pro | 32 | 1390.500 | 1405.000 | +1.04% |
+| Pro | 64 | 1448.500 | 1486.000 | +2.59% |
+
+The extra synchronization costs substantially more than the 8-12 byte spill
+reduction saves, so the kernel change was reverted. The full remote evidence is
+under `/app/deepgemm-auto-results/iter05-shared-swiglu` on the H20 pod.
+
 ### Recommended next iterations
 
-1. Add a compile-time maximum swap bucket (N8/N16/N32/N64) to the JIT key and
-   size `accum`, packed partials, SwiGLU temporaries, and inverse-scale arrays
-   for that bucket. Today the runtime branch instantiates all four variants and
-   forces the local frame to accommodate N64 even for global M8.
-2. After bucket specialization, keep only one weight half's remap live at a
-   time or move the cross-warp amax scratch completely into the existing C/D
-   region. The acceptance criterion is zero or near-zero NCU local sectors
-   without reducing the two-CTA occupancy proven by R01.
-3. Re-profile long-scoreboard stalls. If spilling is removed but the small-M
-   gap remains above 20%, prototype a true two-phase L1/L2 latency kernel for
-   M <= 64, matching PR383's one-CTA-per-SM resource allocation while keeping
-   the fused 156-CTA kernel for throughput sizes.
-4. Preserve the measured crossover guards: Flash M <= 32 and Pro M <= 64.
+1. Test a swap-AB-only launch-bound specialization that permits the existing
+   48/208-register warpgroup reconfiguration to take effect. The current
+   two-CTA launch bound caps every thread at 128 registers, ignores
+   `setmaxnreg`, spills, and serializes WGMMA. Keep the regular large-M kernel
+   at two-CTA launch bounds.
+2. If the extra register budget does not offset lower residency, consume the
+   existing packed BF16 routed accumulator directly in the swap epilogue. This
+   avoids converting it into a second 64-float per-thread array, while adding
+   no shared-memory barriers.
+3. Do not key a maximum N8/N16/N32 bucket only from global M: one expert can
+   receive skewed routes aggregated from all ranks, so its runtime `valid_m`
+   may require the N64 fallback even when per-rank M is small.
+4. Re-profile local sectors and long-scoreboard stalls after each resource
+   change. If spilling is removed but the small-M gap remains above 20%,
+   prototype a true two-phase L1/L2 latency kernel for M <= 64, matching
+   PR383's one-CTA-per-SM resource allocation while keeping the fused kernel
+   for throughput sizes.
+5. Preserve the measured crossover guards: Flash M <= 32 and Pro M <= 64.
    Every future change should rerun M64/M128 boundaries plus the full DSV4
    Flash/Pro matrix so a latency win cannot leak into the throughput path.
