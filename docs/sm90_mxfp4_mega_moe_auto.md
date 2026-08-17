@@ -2007,3 +2007,74 @@ the added production scenario proves the new selector under physical ring
 wrap, and resources remain spill-free. Artifacts are under
 `/app/deepgemm-auto-results/iter32-flash-m64-swap-retest`; the local export is
 `/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter32-flash-m64-swap-retest`.
+
+## Rejected experiment R25: extend Flash swap-AB to M128
+
+R25 temporarily extended the newly accepted Flash selector one point farther
+to M128. The existing eight-rank physical-ring-wrap scenario passed at
+`diff=0.000651`, but the ten-observation R24-control/candidate/control sequence
+measured `498.147/518.301/507.805 us`. The candidate regressed by
+`+4.05%/+2.07%` in both orders, confirming that M128 remains above the current
+swap-AB crossover. The source was restored to R24's M64 cutoff without a
+commit. Artifacts are under
+`/app/deepgemm-auto-results/iter33-flash-m128-swap-retest`; the local export is
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter33-flash-m128-swap-retest`.
+
+## Final matrix after R24
+
+The R24 candidate was run across the complete authoritative matrix with a
+fresh JIT cache. PR383 is the immediately preceding iter31 native two-phase
+matrix from the same H20 pod; neither PR383 source nor the pod changed between
+runs, so its log is copied into the R24 artifact rather than spending another
+identical full run. Both use 50 observations for M <= 128, three for M >= 256,
+20 launches per observation, cold L2, and maximum-rank medians. Direct
+R23/R24/R23 controls remain the change-attribution evidence for Flash M64.
+
+| model | M | PR383 us | R24 us | R24 gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 301.405 | 407.397 | +35.17% |
+| Flash | 16 | 314.704 | 433.674 | +37.80% |
+| Flash | 32 | 323.060 | 429.279 | +32.88% |
+| Flash | 64 | 363.907 | 449.459 | +23.51% |
+| Flash | 128 | 441.379 | 483.269 | +9.49% |
+| Flash | 256 | 545.820 | 516.773 | -5.32% |
+| Flash | 512 | 926.856 | 921.571 | -0.57% |
+| Flash | 1024 | 1510.966 | 1531.000 | +1.33% |
+| Flash | 2048 | 2716.829 | 2759.000 | +1.55% |
+| Flash | 4096 | 5045.000 | 5156.000 | +2.20% |
+| Flash | 8192 | 9803.000 | 10102.000 | +3.05% |
+| Pro | 8 | 690.600 | 854.297 | +23.70% |
+| Pro | 16 | 981.139 | 1126.000 | +14.76% |
+| Pro | 32 | 1078.618 | 1154.000 | +6.99% |
+| Pro | 64 | 1132.643 | 1208.500 | +6.70% |
+| Pro | 128 | 1233.846 | 1402.500 | +13.67% |
+| Pro | 256 | 1653.253 | 1656.000 | +0.17% |
+| Pro | 512 | 2447.575 | 2554.000 | +4.35% |
+| Pro | 1024 | 4035.000 | 3941.000 | -2.33% |
+| Pro | 2048 | 7007.000 | 6985.000 | -0.31% |
+| Pro | 4096 | 13016.000 | 13126.000 | +0.85% |
+| Pro | 8192 | 24997.000 | 25473.000 | +1.90% |
+
+The resulting geometric gaps are:
+
+- all 22 points: `+8.94%`;
+- M <= 128: `+19.95%`;
+- M >= 256: `+0.54%`;
+- Flash small-M: `+27.33%`;
+- Pro small-M: `+13.00%`;
+- all Flash points: `+11.81%`;
+- all Pro points: `+6.14%`.
+
+Relative to R23, the all-point gap falls from `+9.85%` to `+8.94%`, Flash
+small-M from `+31.06%` to `+27.33%`, and all-Flash from `+13.85%` to `+11.81%`.
+Only Flash M64 changed source, and its directly matched `-5.42%/-6.08%` result
+is the credited improvement; other point movement is node variation.
+
+Raw logs are under `/app/deepgemm-auto-results/iter34-r24-final-matrix`; the
+local export is
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter34-r24-final-matrix`.
+
+The goal is still not complete. Large-M remains within geometric noise, but
+Flash M8-M32 is 33-38% behind PR383 and Pro M8 is 24% behind. Future work must
+reduce fixed swap-AB latency inside the already-correct selectors; widening
+the Flash selector beyond M64 is now formally ruled out.
