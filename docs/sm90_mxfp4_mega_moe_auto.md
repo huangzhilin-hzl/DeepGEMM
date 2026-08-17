@@ -2556,3 +2556,56 @@ The terminal goal is still not complete. R32 recovers only about 0.3% at Pro
 M8; the next authoritative full matrix must measure the combined R29/R32
 branch against a fresh same-epoch PR383 run before another structural
 dispatch or mainloop change.
+
+## Final matrix after R32
+
+R32 and PR383 were run consecutively on the same H20 pod. Both use the
+authoritative DSV4 Flash/Pro shapes and M
+`8,16,32,64,128,256,512,1024,2048,4096,8192`: M <= 128 has 50 observations,
+M >= 256 has three, every observation has 20 launches with cold L2, and the
+score is the maximum-rank median. PR383 reports the sum of its native L1/L2
+phase kernels; R32 reports its fused persistent kernel.
+
+| model | M | PR383 us | R32 us | R32 gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 307.925 | 385.280 | +25.12% |
+| Flash | 16 | 308.482 | 421.392 | +36.60% |
+| Flash | 32 | 329.268 | 413.592 | +25.61% |
+| Flash | 64 | 366.392 | 464.909 | +26.89% |
+| Flash | 128 | 433.574 | 485.777 | +12.04% |
+| Flash | 256 | 511.177 | 523.341 | +2.38% |
+| Flash | 512 | 922.909 | 897.317 | -2.77% |
+| Flash | 1024 | 1521.499 | 1538.000 | +1.08% |
+| Flash | 2048 | 2723.100 | 2787.000 | +2.35% |
+| Flash | 4096 | 5059.000 | 5164.000 | +2.08% |
+| Flash | 8192 | 9829.000 | 10055.000 | +2.30% |
+| Pro | 8 | 706.418 | 836.358 | +18.39% |
+| Pro | 16 | 979.714 | 1070.500 | +9.27% |
+| Pro | 32 | 1064.703 | 1135.500 | +6.65% |
+| Pro | 64 | 1106.698 | 1215.500 | +9.83% |
+| Pro | 128 | 1219.255 | 1419.000 | +16.38% |
+| Pro | 256 | 1637.733 | 1658.000 | +1.24% |
+| Pro | 512 | 2396.359 | 2526.000 | +5.41% |
+| Pro | 1024 | 4074.000 | 3926.000 | -3.63% |
+| Pro | 2048 | 7014.000 | 6976.000 | -0.54% |
+| Pro | 4096 | 12989.000 | 13239.000 | +1.92% |
+| Pro | 8192 | 24966.000 | 25446.000 | +1.92% |
+
+The fresh same-epoch geometric gaps are:
+
+- all 22 points: `+8.61%`;
+- M <= 128: `+18.33%`;
+- M >= 256: `+1.12%`;
+- all Flash points: `+11.41%`;
+- Flash small-M: `+25.00%`;
+- Flash large-M: `+1.22%`;
+- all Pro points: `+5.88%`;
+- Pro small-M: `+12.02%`;
+- Pro large-M: `+1.02%`.
+
+This is the lowest fresh all-point gap recorded on the branch, but it remains
+far from the terminal goal. Large-M is near PR383 and Flash M512 plus Pro
+M1024/M2048 already win; the next work must prioritize the verified Flash
+latency gaps, especially M16 (`+36.60%`) and M64/M32/M8 (`+25-27%`). Raw logs
+are under `/app/deepgemm-auto-results/iter55-r32-final-matrix`, with a matching
+local export below the profile-artifact root.
