@@ -111,3 +111,32 @@ ranking, so it is retained as a dependency/timeline view only.
 
 No kernel behavior changed in iteration 00. The benchmark values above remain
 the branch baseline.
+
+## Rejected experiment R01: one worker CTA per SM
+
+### Reason and direction
+
+NCU showed a 156-CTA candidate grid versus 78 CTAs per PR383 phase. To test
+whether the second resident CTA was mostly fixed dispatch/barrier overhead,
+M <= 128 was changed temporarily from `2 * physical_sms` workers to
+`physical_sms` workers. The kernel remained at 128 registers/thread and kept
+the same pipeline; M >= 256 was untouched.
+
+### Performance
+
+| model | M | baseline us | experiment us | change |
+| --- | ---: | ---: | ---: | ---: |
+| flash | 8 | 449.780 | 656.990 | +46.07% |
+| flash | 16 | 494.348 | 723.421 | +46.34% |
+
+Both points used the full 50-observation benchmark contract. The experiment
+was stopped after the second completed point because the regression was far
+outside measurement noise; the source change was reverted and not committed.
+
+### Conclusion
+
+The second resident CTA provides necessary compute parallelism in the current
+128-register kernel. A useful one-CTA path must also reclaim the per-SM
+register/shared-memory budget and change the pipeline, rather than only
+shrinking the grid. The next iteration therefore targets latency-path register
+pressure or fixed synchronization inside the existing two-CTA grid.
