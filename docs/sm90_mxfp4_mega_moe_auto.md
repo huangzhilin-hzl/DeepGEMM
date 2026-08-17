@@ -946,3 +946,130 @@ export is under
 3. If Flash cannot benefit from compact-fragment pipelining, stop tuning the
    fused accumulator schedule and implement a current-source L1/L2 lifetime
    split for the remaining M <= 128 latency gap.
+
+## Accepted experiment R13: extend fragment reuse to Flash swap-AB
+
+### Reason and direction
+
+Flash M8/M16/M32 still compiled the simultaneous-half accumulator allocation.
+The generated kernel retained a 448-byte stack frame with 518-byte spill
+stores and 604-byte spill loads even after the Pro path became spill-free.
+R12's separate-group schedule provides the missing mechanism: compact runtime
+buckets can overlap the two halves without retaining the full N128 fragment,
+while N64 can still reuse one N64 fragment sequentially.
+
+Change `kReuseSwapABFragment` from the DSV4 Pro-only selector to every
+compile-time small-M swap-AB specialization. No runtime branch, template
+argument, grid shape, barrier, SMEM allocation, or host dispatch changes.
+
+### Correctness and generated resources
+
+Eight-rank forced-ring-wrap validation passes for Flash M32 at
+`diff=0.000656`. The final Flash cubin retains 128 registers/thread and removes
+the entire generated local frame:
+
+| Flash M32 resource | R12 | R13 | change |
+| --- | ---: | ---: | ---: |
+| stack frame | 448 B | 0 B | -448 B |
+| spill stores | 518 B | 0 B | -518 B |
+| spill loads | 604 B | 0 B | -604 B |
+| registers/thread | 128 | 128 | unchanged |
+| stack-backed local frame | yes | no | removed |
+
+### Matched 50-observation A/B
+
+The Flash control is commit `3066396`, which is code-identical to R12 for
+Flash. Control and candidate use isolated JIT caches and the full cold-L2
+contract.
+
+| model | M | R12 control us | R13 us | change |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 427.321 | 399.766 | -6.45% |
+| Flash | 16 | 431.292 | 425.902 | -1.25% |
+| Flash | 32 | 449.645 | 449.304 | -0.08% |
+
+The three-point geometric-mean improvement is 2.63%. M32 is effectively
+neutral, while M8 and M16 reproduce the screening direction. Because every
+point is non-regressing and the common selector eliminates the full frame,
+R13 is accepted without another token-count template switch.
+
+### Final DSV4 Flash/Pro matrix
+
+This final-selector run uses the full authoritative contract: 50 observations
+for M <= 128, three for M >= 256, 20 launches per observation, max-rank
+medians, and explicit `--flush-l2 1`.
+
+| model | M | PR383 us | R13 final us | gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 301.924 | 427.080 | +41.45% |
+| Flash | 16 | 312.858 | 445.934 | +42.54% |
+| Flash | 32 | 328.370 | 455.301 | +38.65% |
+| Flash | 64 | 361.647 | 500.512 | +38.40% |
+| Flash | 128 | 433.330 | 492.109 | +13.56% |
+| Flash | 256 | 518.971 | 504.073 | -2.87% |
+| Flash | 512 | 917.665 | 916.746 | -0.10% |
+| Flash | 1024 | 1526.078 | 1600.000 | +4.84% |
+| Flash | 2048 | 2745.844 | 2847.000 | +3.68% |
+| Flash | 4096 | 5079.000 | 5332.000 | +4.98% |
+| Flash | 8192 | 9808.000 | 10309.000 | +5.11% |
+| Pro | 8 | 693.125 | 916.829 | +32.27% |
+| Pro | 16 | 971.170 | 1192.000 | +22.74% |
+| Pro | 32 | 1064.547 | 1250.500 | +17.47% |
+| Pro | 64 | 1106.107 | 1301.500 | +17.66% |
+| Pro | 128 | 1228.166 | 1645.500 | +33.98% |
+| Pro | 256 | 1636.918 | 1660.000 | +1.41% |
+| Pro | 512 | 2415.108 | 2576.000 | +6.66% |
+| Pro | 1024 | 4060.000 | 3998.000 | -1.53% |
+| Pro | 2048 | 7025.000 | 7071.000 | +0.65% |
+| Pro | 4096 | 12987.000 | 13315.000 | +2.53% |
+| Pro | 8192 | 25203.000 | 25730.000 | +2.09% |
+
+The geometric-mean gaps versus PR383 are +13.82% over all 22 points, +29.45%
+for M <= 128, and +2.25% for M >= 256. The single-sided small-M aggregate is
+slightly worse than R12 because Flash M8 moved from 409.205 to 427.080 us in a
+different run. Conversely, unchanged Flash M256 moved from the anomalous
+588.401 to 504.073 us. These opposite shifts demonstrate why the matched
+2.63% Flash A/B, rather than cross-run aggregate movement, is the R13 change
+attribution.
+
+### R13 NCU and NSYS
+
+Eight rank-local NCU application-replay reports were collected for Flash M8.
+Every rank reports exactly zero local-load and zero local-store sectors,
+confirming that the generated-frame removal survives production dispatch and
+is not merely a PTXAS allocation annotation.
+
+| median NCU counter | R13 Flash M8 |
+| --- | ---: |
+| local-load sectors | 0 |
+| local-store sectors | 0 |
+| issue active | 2.737% |
+| tensor-pipe active | 0.010% |
+| barrier stall | 53.528% |
+| long-scoreboard stall | 25.228% |
+| wait stall | 4.433% |
+
+Utilization and stall samples remain strongly rank-skewed under replay and are
+not latency scores. Zero local sectors is invariant across all eight reports
+and is therefore the stable profiler result.
+
+Low-perturbation NSYS still shows exactly one 156-CTA fused MegaMoE kernel,
+one NCCL all-reduce, and one fill kernel. The traced main kernel is 0.735 ms;
+the trace is retained only as launch-topology evidence.
+
+Complete evidence remains on the pod under
+`/app/deepgemm-auto-results/iter16-flash-fragment-pipeline`. The compact local
+export is under
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter16-flash-fragment-pipeline`.
+
+### Next iteration
+
+1. Stop widening accumulator micro-schedules: routed Flash and Pro swap-AB
+   paths now have zero or near-zero generated local traffic, but the small-M
+   geometric-mean gap remains +29.45% versus PR383.
+2. Implement the hard current-source L1/L2 lifetime boundary for M <= 128.
+   Preserve the fused kernel for M >= 256 and preserve R12/R13 fragment reuse
+   inside whichever phase kernel consumes the routed MXFP4 weights.
+3. Start with a Pro M32 prototype and require separate L1/L2 launches, zero
+   local sectors per phase, correctness, and a matched win before extending
+   the selector to Flash or the full latency range.

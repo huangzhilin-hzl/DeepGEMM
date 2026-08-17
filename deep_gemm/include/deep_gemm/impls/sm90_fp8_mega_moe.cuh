@@ -1502,8 +1502,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             // fragment for the second half after promotion instead of keeping
             // both halves live across WGMMA. The regular orientation still
             // needs the complete M64xN128 fragment.
-            constexpr bool kReuseSwapABFragment =
-                kSmallMSwapAB and kHidden == 7168;
+            constexpr bool kReuseSwapABFragment = kSmallMSwapAB;
             constexpr uint32_t kAccumStorage = kReuseSwapABFragment ?
                 kSwapABHalfAccumPerThread : kAccumPerThread;
             float accum[kAccumStorage];
