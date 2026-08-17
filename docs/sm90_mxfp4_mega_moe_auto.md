@@ -2237,3 +2237,72 @@ The terminal goal is still not complete. R27 should target work scheduling,
 dispatch/combine synchronization, or the number of persistent tasks reached
 at sparse expert occupancy. Further instruction-only trimming of the now
 bounded epilogue is unlikely to close Flash's remaining 24-39% small-M gap.
+
+## R27: sparse dispatch completion for Flash M32
+
+### Reason and direction
+
+Dense dispatch contributes one completion atomic for every expert from every
+CTA, including zero local counts. With 156 logical CTAs and 256 Flash experts,
+that is 39,936 expert completion atomics even when M8-M32 contains only
+48-192 routes per rank. The kernel already has a production sparse-completion
+path for Flash M1024: CTAs issue atomics only for nonzero local counts, the
+existing grid/NVLink rendezvous proves completion, and SM0 aggregates the
+eight rank-local expert counts. It uses the same number of grid barriers as
+the dense path.
+
+R27 first tested this existing path at Flash M8, M16, and M32. All three
+eight-rank physical-ring-wrap scenarios remained bitwise-equivalent within
+their previous tolerances (`0.000649`, `0.000645`, and `0.000656`). Formal
+performance rejected M8 and M16, however, so the retained host selector is
+deliberately exact: Flash M32 and the pre-existing Flash M1024 point only.
+
+### Rejected broad selector and retained M32 result
+
+The formal run uses ten warmups, 50 observations, 20 launches per
+observation, cold L2, and maximum-rank medians against the exact R26 commit
+`6a20cec`:
+
+| Flash point | first R26 us | sparse us | change | second R26 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| M8 | 380.732 | 388.059 | +1.92% | 386.782 | +0.33% |
+| M16 | 414.444 | 429.259 | +3.57% | 421.474 | +1.85% |
+| M32 | 431.728 | 415.297 | -3.81% | 417.442 | -0.51% |
+
+The M8/M16 selectors were removed after both launch orders regressed. M32 was
+then independently repeated in candidate/control order at `442.923/445.956 us`,
+another `-0.68%`. Three 50-observation comparisons therefore agree on
+the sign for M32 (`-3.81%`, `-0.51%`, `-0.68%`) while adjacent points remain
+on R26's dense path.
+
+### NCU and NSYS attribution
+
+An isolated one-rank, 32-expert NCU profile removes distributed spin-wait
+noise while preserving the M32 dispatch choice:
+
+| NCU metric | R26 dense | R27 sparse | change |
+| --- | ---: | ---: | ---: |
+| L1 global atomic sectors | 4,396 | 3,171 | -27.87% |
+| L2 atomic sectors | 6,421 | 4,622 | -28.02% |
+| global-load sectors | 899,720 | 916,889 | +1.91% |
+| `smsp__inst_executed.sum` | 80,210,834 | 80,218,488 | +0.01% |
+| `smsp__thread_inst_executed.sum` | 2,511,739,800 | 2,512,160,440 | +0.02% |
+| local load/store sectors | 0/0 | 0/0 | unchanged |
+
+Sparse completion trades the SM0 rank-count loads for substantially fewer
+global atomics rather than reducing the math instruction body. An eight-rank
+NSYS single-launch capture measures the main kernel at 746.429 us for R26 and
+663.293 us for R27 (`-11.14%`); the repeated cold-L2 measurements above remain
+the acceptance authority.
+
+Screen, formal, confirmation, and profiler artifacts are respectively under
+`/app/deepgemm-auto-results/iter40-flash-sparse-dispatch-screen`,
+`iter41-flash-sparse-dispatch-formal`,
+`iter42-flash-m32-sparse-confirm`, and
+`iter43-flash-m32-sparse-profiles`. Local exports use matching directory names
+below `/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts`.
+
+R27 is retained only for Flash M32. The terminal goal remains unmet; the dense
+path is faster at M8/M16, so their remaining gap requires a different way to
+reduce frontend/barrier latency rather than simply skipping zero-count
+completion atomics.

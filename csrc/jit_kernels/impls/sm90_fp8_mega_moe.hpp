@@ -113,7 +113,8 @@ public:
         const bool swizzle_l2_cd =
             args.num_tokens >= kL2CDSwizzleMinTokens;
         const bool sparse_dispatch_completion =
-            args.hidden == 4096 and args.num_tokens == 1024;
+            args.hidden == 4096 and
+            (args.num_tokens == 32 or args.num_tokens == 1024);
         return fmt::format(R"(
 {}
 #include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
