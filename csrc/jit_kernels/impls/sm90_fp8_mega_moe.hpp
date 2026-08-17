@@ -98,6 +98,10 @@ public:
             args.num_shared_experts == 0 and
             ((args.hidden == 4096 and args.num_tokens <= 32) or
              (args.hidden == 7168 and args.num_tokens <= 64));
+        const bool packed_bf16_swap_epilogue =
+            args.num_shared_experts == 0 and
+            args.hidden == 7168 and
+            (args.num_tokens == 16 or args.num_tokens == 32);
         constexpr int kL2CDSwizzleMinTokens = 1024;
         const bool swizzle_l2_cd =
             args.num_tokens >= kL2CDSwizzleMinTokens;
@@ -122,6 +126,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}, {}, {}
     >);
 }};
@@ -135,6 +140,7 @@ static void __instantiate_kernel() {{
     to_string(args.activation_clamp),
     args.fast_math ? "true" : "false",
     small_m_swap_ab ? "true" : "false",
+    packed_bf16_swap_epilogue ? "true" : "false",
     swizzle_l2_cd ? "true" : "false",
     overlap_mxfp4_scale_path ? "true" : "false",
     use_prmt_mxfp4_exponent ? "true" : "false",

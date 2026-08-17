@@ -193,6 +193,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     float kActivationClamp, \
     bool kFastMath, \
     bool kSmallMSwapAB, \
+    bool kPackedBF16SwapEpilogue, \
     bool kSwizzleL2CD, \
     bool kOverlapMXFP4ScalePath, \
     bool kUsePRMTMXFP4Exponent, \
@@ -267,7 +268,8 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
 #define DG_SM90_FP8_MOE_CORE_TEMPLATE_ARGS \
     kNumMaxTokensPerRank, kHidden, kIntermediateHidden, kNumExperts, kNumTopk, \
     kNumSMs, kNumRanks, \
-    kActivationClamp, kFastMath, kSmallMSwapAB, kSwizzleL2CD, \
+    kActivationClamp, kFastMath, kSmallMSwapAB, \
+    kPackedBF16SwapEpilogue, kSwizzleL2CD, \
     kOverlapMXFP4ScalePath, \
     kUsePRMTMXFP4Exponent, \
     kUseIncrementalMXFP4Descriptor, \
@@ -303,6 +305,10 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                          ((kHidden == 4096 or kHidden == 7168) and
                           not kHasSharedExperts),
                      "Small-M swap-AB is routed-only and model-specific");
+    DG_STATIC_ASSERT(not kPackedBF16SwapEpilogue or
+                         (kSmallMSwapAB and kHidden == 7168 and
+                          not kHasSharedExperts),
+                     "Packed-BF16 swap epilogue is Pro small-M only");
 
     // =====================================================================
     // Template checks
@@ -1485,20 +1491,21 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             // ---------------- GEMM ----------------
             using WGMMA = L1WGMMA;
             constexpr uint32_t kAccumPerThread = WGMMA::kNumAccum;  // 64 for M=64,N=128
-            float final_accum[kAccumPerThread];
+            float final_accum[
+                kPackedBF16SwapEpilogue ? 1 : kAccumPerThread];
             if constexpr (is_shared_phase) {
                 #pragma unroll
                 for (uint32_t i = 0; i < kAccumPerThread; ++ i)
                     final_accum[i] = 0.0f;
             }
             float accum[kAccumPerThread];
+            nv_bfloat162 mxfp4_final_bf16[kAccumPerThread / 2];
 
             const auto run_mxfp4_gemm_loop = [&]() {
                 {
                     constexpr uint32_t kWeightGranK = kMXFP4WeightGranK;
                     constexpr uint32_t kWGThreads = 128;
                     const uint32_t wg_thread_idx = warp_idx_in_wg * 32 + lane_idx;
-                    nv_bfloat162 mxfp4_final_bf16[kAccumPerThread / 2];
                     #pragma unroll
                     for (uint32_t i = 0; i < kAccumPerThread / 2; ++ i)
                         mxfp4_final_bf16[i] =
@@ -2042,14 +2049,16 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         else
                             run_swap_ab.template operator()<64>();
 
-                        #pragma unroll
-                        for (uint32_t i = 0;
-                             i < kAccumPerThread / 2; ++ i) {
-                            const float2 pair =
-                                __bfloat1622float2(
-                                    mxfp4_final_bf16[i]);
-                            final_accum[i * 2] = pair.x;
-                            final_accum[i * 2 + 1] = pair.y;
+                        if constexpr (not kPackedBF16SwapEpilogue) {
+                            #pragma unroll
+                            for (uint32_t i = 0;
+                                 i < kAccumPerThread / 2; ++ i) {
+                                const float2 pair =
+                                    __bfloat1622float2(
+                                        mxfp4_final_bf16[i]);
+                                final_accum[i * 2] = pair.x;
+                                final_accum[i * 2 + 1] = pair.y;
+                            }
                         }
                     } else {
                     for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks;
@@ -2410,10 +2419,26 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             const uint32_t accum_offset =
                                 half * kSwapABHalfAccumPerThread +
                                 chunk * 4;
-                            float gate_0 = final_accum[accum_offset];
-                            float gate_1 = final_accum[accum_offset + 1];
-                            float up_0 = final_accum[accum_offset + 2];
-                            float up_1 = final_accum[accum_offset + 3];
+                            float gate_0, gate_1, up_0, up_1;
+                            if constexpr (kPackedBF16SwapEpilogue) {
+                                const float2 gate_pair =
+                                    __bfloat1622float2(
+                                        mxfp4_final_bf16[
+                                            accum_offset / 2]);
+                                const float2 up_pair =
+                                    __bfloat1622float2(
+                                        mxfp4_final_bf16[
+                                            accum_offset / 2 + 1]);
+                                gate_0 = gate_pair.x;
+                                gate_1 = gate_pair.y;
+                                up_0 = up_pair.x;
+                                up_1 = up_pair.y;
+                            } else {
+                                gate_0 = final_accum[accum_offset];
+                                gate_1 = final_accum[accum_offset + 1];
+                                up_0 = final_accum[accum_offset + 2];
+                                up_1 = final_accum[accum_offset + 3];
+                            }
                             clamp_gate(gate_0);
                             clamp_gate(gate_1);
                             clamp_up(up_0);
@@ -2817,25 +2842,61 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                         half * kSwapABHalfAccumPerThread +
                                         chunk * 4;
                                     const uint32_t col_offset = half * 64u;
-                                    if (token_0 < valid_m) {
-                                        store_l2_scalar(
-                                            token_0 * WG_BLOCK_N +
-                                                col_offset + r_0,
-                                            final_accum[accum_offset]);
-                                        store_l2_scalar(
-                                            token_0 * WG_BLOCK_N +
-                                                col_offset + r_1,
-                                            final_accum[accum_offset + 2]);
-                                    }
-                                    if (token_1 < valid_m) {
-                                        store_l2_scalar(
-                                            token_1 * WG_BLOCK_N +
-                                                col_offset + r_0,
-                                            final_accum[accum_offset + 1]);
-                                        store_l2_scalar(
-                                            token_1 * WG_BLOCK_N +
-                                                col_offset + r_1,
-                                            final_accum[accum_offset + 3]);
+                                    if constexpr (
+                                            kPackedBF16SwapEpilogue) {
+                                        const float2 gate_pair =
+                                            __bfloat1622float2(
+                                                mxfp4_final_bf16[
+                                                    accum_offset / 2]);
+                                        const float2 up_pair =
+                                            __bfloat1622float2(
+                                                mxfp4_final_bf16[
+                                                    accum_offset / 2 + 1]);
+                                        if (token_0 < valid_m) {
+                                            store_l2_scalar(
+                                                token_0 * WG_BLOCK_N +
+                                                    col_offset + r_0,
+                                                gate_pair.x);
+                                            store_l2_scalar(
+                                                token_0 * WG_BLOCK_N +
+                                                    col_offset + r_1,
+                                                up_pair.x);
+                                        }
+                                        if (token_1 < valid_m) {
+                                            store_l2_scalar(
+                                                token_1 * WG_BLOCK_N +
+                                                    col_offset + r_0,
+                                                gate_pair.y);
+                                            store_l2_scalar(
+                                                token_1 * WG_BLOCK_N +
+                                                    col_offset + r_1,
+                                                up_pair.y);
+                                        }
+                                    } else {
+                                        if (token_0 < valid_m) {
+                                            store_l2_scalar(
+                                                token_0 * WG_BLOCK_N +
+                                                    col_offset + r_0,
+                                                final_accum[
+                                                    accum_offset]);
+                                            store_l2_scalar(
+                                                token_0 * WG_BLOCK_N +
+                                                    col_offset + r_1,
+                                                final_accum[
+                                                    accum_offset + 2]);
+                                        }
+                                        if (token_1 < valid_m) {
+                                            store_l2_scalar(
+                                                token_1 * WG_BLOCK_N +
+                                                    col_offset + r_0,
+                                                final_accum[
+                                                    accum_offset + 1]);
+                                            store_l2_scalar(
+                                                token_1 * WG_BLOCK_N +
+                                                    col_offset + r_1,
+                                                final_accum[
+                                                    accum_offset + 3]);
+                                        }
                                     }
                                 }
                             }

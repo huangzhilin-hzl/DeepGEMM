@@ -464,20 +464,163 @@ Both sides used ten cold-L2 observations and 20 launches per observation. The
 source change was reverted; candidate and matched-control logs are under
 `/app/deepgemm-auto-results/iter08-bucket-frames` on the H20 pod.
 
+## Accepted experiment R08: target packed BF16 to Pro M16/M32
+
+### Reason and direction
+
+R06 had a weak but repeatable positive signal at Pro M16/M32 and regressions
+at Pro M8/M64 and Flash. R08 turns that observation into a JIT compile-time
+selector instead of applying the epilogue rewrite globally. The selector is
+true only for routed DSV4 Pro (`hidden=7168`) at exactly M16 or M32. Flash,
+shared experts, Pro M8/M64, and every regular-M kernel retain their original
+compile-time path.
+
+The selected kernel keeps the MXFP4 result as 32 packed BF16x2 values through
+the swap-AB epilogue. It avoids expanding those values into a second 64-FP32
+array, then unpacks only the gate/up pair currently consumed by the L1 SwiGLU
+or L2 store. The 156-CTA, two-resident-CTA topology and four barriers are
+unchanged.
+
+### Correctness and resources
+
+The final synced source passed the eight-rank forced-ring-wrap
+`production.pro_m32` test with `calc_diff=0.006622`, below the 0.01 contract.
+PTXAS for the authoritative
+M8192-capacity benchmark instance reports:
+
+| resource | matched control | R08 | change |
+| --- | ---: | ---: | ---: |
+| stack frame | 488 B | 480 B | -8 B |
+| spill stores | 584 B | 578 B | -6 B |
+| spill loads | 732 B | 724 B | -8 B |
+| registers/thread | 128 | 128 | unchanged |
+| barriers | 4 | 4 | unchanged |
+
+The fixed-register WGMMA serialization warning remains. This is a deliberately
+small resource reduction, but unlike R04 it adds no synchronization, and
+unlike R05 it preserves the second resident CTA.
+
+### Matched screening and formal A/B
+
+The ten-observation screen was positive at both selected points: -1.75% at
+M16 and -1.23% at M32. The result was then repeated with the full contract:
+50 cold-L2 observations and 20 launches per observation on both sides. The
+control differs only by forcing the new template selector to false.
+
+| model | M | matched control us | R08 us | change |
+| --- | ---: | ---: | ---: | ---: |
+| Pro | 16 | 1333.500 | 1312.000 | -1.61% |
+| Pro | 32 | 1390.500 | 1369.000 | -1.55% |
+
+The two independent run lengths agree in sign and magnitude, so R08 is kept.
+The full candidate/control logs are under
+`/app/deepgemm-auto-results/iter09-targeted-bf16`.
+
+### Final DSV4 Flash/Pro matrix
+
+This is the required `tests/bench_mega_moe_sm90.py` matrix after R08. Small-M
+points use 50 observations; large-M points use three. `gap` compares with the
+original PR383 baseline from Iteration 00. Only Pro M16/M32 are source-changed
+by R08; movement at every other point is measurement variance and is not
+credited to this optimization.
+
+| model | M | PR383 us | R08 final us | gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 301.924 | 423.155 | +40.15% |
+| Flash | 16 | 312.858 | 453.093 | +44.82% |
+| Flash | 32 | 328.370 | 453.737 | +38.18% |
+| Flash | 64 | 361.647 | 484.287 | +33.91% |
+| Flash | 128 | 433.330 | 481.499 | +11.12% |
+| Flash | 256 | 518.971 | 514.339 | -0.89% |
+| Flash | 512 | 917.665 | 905.505 | -1.33% |
+| Flash | 1024 | 1526.078 | 1552.000 | +1.70% |
+| Flash | 2048 | 2745.844 | 2844.000 | +3.57% |
+| Flash | 4096 | 5079.000 | 5307.000 | +4.49% |
+| Flash | 8192 | 9808.000 | 10330.000 | +5.32% |
+| Pro | 8 | 693.125 | 1038.500 | +49.83% |
+| Pro | 16 | 971.170 | 1289.000 | +32.73% |
+| Pro | 32 | 1064.547 | 1375.500 | +29.21% |
+| Pro | 64 | 1106.107 | 1442.500 | +30.41% |
+| Pro | 128 | 1228.166 | 1657.000 | +34.92% |
+| Pro | 256 | 1636.918 | 1647.000 | +0.62% |
+| Pro | 512 | 2415.108 | 2572.000 | +6.50% |
+| Pro | 1024 | 4060.000 | 3999.000 | -1.50% |
+| Pro | 2048 | 7025.000 | 7110.000 | +1.21% |
+| Pro | 4096 | 12987.000 | 13358.000 | +2.86% |
+| Pro | 8192 | 25203.000 | 25841.000 | +2.53% |
+
+Against the original PR383 matrix, the geometric-mean gaps are now +15.56%
+over all 22 points, +34.14% for M <= 128, and +2.06% for M >= 256. The prior
+accepted report was +16.19%, +34.99%, and +2.54%, respectively. The matched
+R08 A/B above is the attribution result; the aggregate movement also contains
+unchanged-path node variance.
+
+### R08 NCU comparison with PR383 at Pro M32
+
+Eight independent application-replay reports were collected for each
+implementation. The following launch resources are invariant across ranks:
+
+| implementation/phase | launches | grid | threads/CTA | registers/thread | dynamic SMEM/CTA | barriers |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| R08 fused | 1 | 156 | 256 | 128 | 101600 B | 4 |
+| PR383 L1 | 1 | 78 | 384 | 168 | 212736 B | 3 |
+| PR383 L2 | 1 | 78 | 384 | 168 | 212736 B | 16 |
+
+The counter table reports medians across the eight rank-local reports. Replay
+is strongly rank-skewed, so these values are diagnostic and are not benchmark
+scores.
+
+| NCU counter | R08 fused | PR383 L1 | PR383 L2 |
+| --- | ---: | ---: | ---: |
+| local-load sectors | 449920 | 0 | 0 |
+| local-store sectors | 901248 | 0 | 0 |
+| issue active | 3.315% | 1.545% | 1.030% |
+| tensor-pipe active | 0.050% | 0.025% | 0.065% |
+| barrier stall | 62.410% | 73.380% | 85.675% |
+| long-scoreboard stall | 14.480% | 24.680% | 16.615% |
+
+R08 improves the fused kernel without changing its architecture, but the
+comparison exposes the remaining structural difference: PR383 crosses a hard
+L1/L2 kernel boundary and has no local sectors in either phase, while the
+fused implementation still materializes almost 1.35 million local sectors per
+rank. The fused path has higher sampled issue activity and fewer barriers, yet
+remains 29.21% behind PR383 at the authoritative M32 point. Eliminating the
+cross-phase frame is therefore more important than another small epilogue
+micro-optimization.
+
+### R08 NSYS topology
+
+Low-perturbation rank-0 traces confirm one fused MegaMoE launch for R08 versus
+separate L1 and L2 launches for PR383. The trace also contains one NCCL
+all-reduce and one sub-microsecond fill kernel on both sides. R08's traced main
+kernel is 1.660 ms; PR383's traced L1/L2 kernels are 0.909/1.326 ms. These
+perturbed durations contradict the production benchmark ordering, so they are
+used only as launch-topology evidence, consistent with the measurement
+contract.
+
+Complete profiler reports remain on the H20 pod under
+`/app/deepgemm-auto-results/iter09-targeted-bf16/profiles`. A compact export of
+the benchmark logs, rank-0 NCU text, and NSYS reports is also available locally
+at
+`/Users/huangzhilin/security_inference/DeepGEMM-profile-artifacts/iter09-targeted-bf16`.
+
 ### Recommended next iterations
 
-1. Isolate the packed-BF16 epilogue signal to Pro M16/M32 with a compile-time
-   selector. R06 showed -0.41%/-0.93% versus the earlier accepted result and
-   -1.34%/-1.64% versus the later matched control, while Pro M8 and Flash must
-   retain their original path.
-2. Do not key a maximum N8/N16/N32 bucket only from global M: one expert can
+1. Prototype a true two-phase latency path for M <= 64, with separate L1 and
+   L2 kernels so the L1 accumulator and packed-BF16 frame dies at a hard kernel
+   boundary. R05 proved that merely reducing the fused grid to one CTA per SM
+   is not enough; the lifetime split, not only the register allowance, is the
+   feature to copy from PR383. Keep the current fused kernel for M >= 128.
+2. Preserve R08's exact selector until a matched sweep proves a wider range.
+   Pro M8/M64 and every Flash point regressed under the global packed-BF16
+   rewrite, so they must retain the existing epilogue.
+3. Do not key a maximum N8/N16/N32 bucket only from global M: one expert can
    receive skewed routes aggregated from all ranks, so its runtime `valid_m`
    may require the N64 fallback even when per-rank M is small.
-3. Re-profile local sectors and long-scoreboard stalls after each resource
-   change. If spilling is removed but the small-M gap remains above 20%,
-   prototype a true two-phase L1/L2 latency kernel for M <= 64, matching
-   PR383's one-CTA-per-SM resource allocation while keeping the fused kernel
-   for throughput sizes.
-4. Preserve the measured crossover guards: Flash M <= 32 and Pro M <= 64.
+4. Use NCU source counters on the two-phase prototype to require zero local
+   sectors before a long benchmark. A resource experiment that removes spills
+   but loses the second fused CTA, as R05 did, should be rejected before the
+   full matrix.
+5. Preserve the measured crossover guards: Flash M <= 32 and Pro M <= 64.
    Every future change should rerun M64/M128 boundaries plus the full DSV4
    Flash/Pro matrix so a latency win cannot leak into the throughput path.
