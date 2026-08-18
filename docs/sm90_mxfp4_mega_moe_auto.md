@@ -3759,3 +3759,66 @@ prototype was reverted; only this negative result is retained. Evidence is
 under `iter105-flash-m16-register-a-correctness` through
 `iter107-flash-m16-register-a-single-fence` on the pod and local artifact
 root.
+
+## R56: bank-permute paired packed-weight loads for Flash M16
+
+### Reason and direction
+
+R54 SourceCounters localized all `3,047,424` excessive shared-memory
+wavefronts in the Flash M16 profile to the paired decoder's `LDS.64`
+instructions. Under the packed B64 swizzle, the previous lane assignment gave
+both row `r` and row `r+8` the same adjacent packed-word pair within each half
+warp. Their two 64-bit accesses therefore aliased the same banks even though
+the complete warp touched the right 16-row by 4-word address set.
+
+R56 retains that exact address set, two-word lookahead, x16 decoder, exponent
+lookup, expanded-B STS.128 layout, barriers, WGMMA schedule, and epilogue. It
+only alternates packed-word pairs across each half warp's lower and upper
+eight rows. Each LDS.64 wave now covers every bank evenly. The selector is
+exact for routed DSV4 Flash M16; all other buckets keep their previous lane
+mapping.
+
+Eight-rank forced-ring-wrap correctness passes at the unchanged `0.000645`
+normalized difference. The formal cold-L2 R54/R56/R54 run uses one warmup, 50
+observations, and 20 launches per observation:
+
+| point | first R54 us | R56 us | change | second R54 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M16 | 380.262 | 359.316 | -5.51% | 374.251 | -3.99% |
+
+The same mapping was screened over all Flash swap-AB buckets with 20
+observations before narrowing the selector:
+
+| point | first R54 us | broad candidate us | change | second R54 us | reverse change | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Flash M8 | 322.562 | 321.075 | -0.46% | 317.695 | +1.06% | reject |
+| Flash M16 | 368.073 | 358.178 | -2.69% | 368.002 | -2.67% | accept |
+| Flash M32 | 354.332 | 366.552 | +3.45% | 359.463 | +1.97% | reject |
+| Flash M64 | 395.642 | 398.453 | +0.71% | 385.525 | +3.35% | reject |
+
+Matched one-rank/32-expert NCU confirms that the formal gain is caused by the
+intended shared-memory change:
+
+| Flash M16 NCU metric | R54 | R56 | change |
+| --- | ---: | ---: | ---: |
+| duration us | 304.608 | 297.632 | -2.29% |
+| executed warp instructions | 71,984,926 | 72,365,521 | +0.53% |
+| executed thread instructions | 2,249,845,534 | 2,261,890,430 | +0.54% |
+| LDS.64 excessive wavefronts | 3,047,424 | 0 | -100.00% |
+| shared-load bank conflicts | 3,055,412 | 5,962 | -99.80% |
+| shared-store bank conflicts | 868,602 | 994,785 | +14.53% |
+| global-load sectors | 835,564 | 835,508 | -0.01% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+| barrier-stall ratio | 2.553 | 2.477 | -3.00% |
+| long-scoreboard ratio | 2.214 | 2.159 | -2.47% |
+| short-scoreboard ratio | 0.765 | 0.583 | -23.76% |
+
+The extra half-warp permutation arithmetic explains the `0.53%` instruction
+increase and why the other buckets do not benefit, while removing the exposed
+M16 LDS replay still shortens the critical path. NSYS independently measures
+`283.296 -> 277.409 us` (`-2.08%`). Both cubins use 114 registers/thread,
+zero stack/local storage, 1024 bytes static shared memory, and 110.816 KiB
+dynamic shared memory. Complete source-counter, correctness, screening,
+formal, NCU, and NSYS evidence is under
+`iter108-r54-flash-m16-source-counters` through
+`iter112-flash-small-bank-permuted-screen` on the pod and local artifact root.
