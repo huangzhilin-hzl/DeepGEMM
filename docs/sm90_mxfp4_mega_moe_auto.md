@@ -4382,3 +4382,18 @@ both implementations. The terminal target is not yet met: the total gap is
 positive, with Flash M128/M16 and Pro M8/M512 the largest residual points.
 Complete paired logs are under `iter138-r61-pr383-full-matrix` on the pod and
 local artifact root.
+
+## Rejected R62: sparse dispatch completion for Flash M128
+
+R62 extended the already-correct Flash M32/M1024 sparse dispatch-completion
+path to M128. The candidate replaces one completion atomic per expert per CTA
+with nonzero-count atomics plus the existing SM0 rank-count aggregation; the
+math pipeline and output are unchanged. The production M128 forced-ring-wrap
+correctness case passed.
+
+The 20-observation cold-L2 A/B/A screen measured
+`500.716/502.781/503.255 us` for R61/R62/R61. R62 regressed `0.41%` against
+the first control and improved only `0.09%` against the second. The result is
+both order-dependent and noise-sized, so the selector extension was fully
+reverted before commit and did not enter formal profiling. Evidence is under
+`iter139-sparse-flash-m128-screen` on the pod and local artifact root.
