@@ -3432,3 +3432,44 @@ and `282.273 us` for R51 (`-20.74%`). The agreement among both launch orders,
 NCU, and NSYS makes the mechanism strong enough to retain. Complete artifacts
 are under `iter88-vector-sfb-flash-m16` through `iter91-vector-sfb-nsys` on
 the pod and local artifact root.
+
+## R52: vectorize weight-scale staging for all Flash small-M buckets
+
+### Reason and direction
+
+R51 selected the wider scale transaction only for Flash M16 even though every
+Flash swap-AB specialization has the same coalesced 4096-wide preprocessed
+scale layout. R52 removes the exact-M16 guard and uses the same one-`uint4`
+LDG plus one `STS.128` mapping for M8, M16, M32, and M64. Pro remains on its
+strided scalar path because hidden 7168 does not satisfy the coalesced-layout
+predicate; Flash M128 and larger remain outside the swap-AB selector.
+
+The eight-rank production Flash correctness suite passed all six configured
+shapes (M8, M16, M32, M64, M128, and M1024). Maximum normalized differences
+were between `0.000645` and `0.000671`, including the unchanged M128/M1024
+controls. The complete log is under `iter92-vector-sfb-flash-small`.
+
+The initial 20-observation cold-L2 A/B/A screen retained every newly affected
+point:
+
+| Flash point | first R36 us | R52 us | change | second R36 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| M8 | 388.768 | 321.328 | -17.35% | 395.989 | -18.85% |
+| M32 | 426.876 | 390.405 | -8.54% | 424.663 | -8.06% |
+| M64 | 458.963 | 411.167 | -10.41% | 443.947 | -7.38% |
+
+The formal run used the required cold-L2 contract: one warmup, 50
+observations, and 20 launches per observation, with the maximum-rank median.
+All three wins reproduced against both surrounding controls:
+
+| Flash point | first R36 us | R52 us | change | second R36 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| M8 | 386.710 | 340.652 | -11.91% | 390.076 | -12.67% |
+| M32 | 419.924 | 383.960 | -8.56% | 431.841 | -11.09% |
+| M64 | 451.793 | 385.859 | -14.59% | 458.964 | -15.93% |
+
+Together with R51's profiler attribution, the adjacent-shape consistency
+confirms that the old four-round scale publication was a common Flash
+swap-AB bottleneck rather than an M16-only compiler accident. Complete screen
+and formal logs are under `iter93-vector-sfb-adjacent-screen` and
+`iter94-vector-sfb-adjacent-formal` on the pod and local artifact root.
