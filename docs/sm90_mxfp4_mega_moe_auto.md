@@ -4143,3 +4143,84 @@ comparison does not reproduce the same-session formal A/B/A gain above and is
 treated as epoch variance, not change attribution. The terminal gap remains
 dominated by Flash M8-M128 and Pro M8. Complete paired logs are under
 `iter127-r58-pr383-full-matrix` on the pod and local artifact root.
+
+## R59: use PRMT for selected bank-permuted pair indices
+
+### Reason and direction
+
+R56-R58 removed the dominant packed-weight `LDS.64` replay by assigning the
+two adjacent packed-word pairs to complementary lane groups. The accepted
+address-set permutation was still expressed as two shifts, an XOR, a mask,
+and a multiply in the unrolled decoder. R59 replaces that arithmetic with a
+single byte permutation over the constant lookup word `0x00020200`. Its four
+bytes encode pair indices `0, 2, 2, 0` for the four eight-lane groups, so the
+packed and expanded shared-memory address sets remain identical.
+
+The first prototype applied PRMT to every bank-permuted path. Flash M128
+proved that the shorter static expression is not universally safe: targeted
+NCU measured `462.976 -> 471.936 us` (`+1.94%`) even though warp/thread
+instructions fell `9.88%/10.09%`. Registers rose `126 -> 128` and local
+load/store sectors rose from zero to `2,392,064/7,488`. The regular Flash
+path therefore retains R58's bit expression. This rejected profile is under
+`iter129-prmt-bank-pair-profiles`.
+
+The adjusted screen uses PRMT only for small-M specializations and restores
+the regular path. Its 20-observation cold-L2 A/B/A result was:
+
+| point | first R58 us | R59 us | change | second R58 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M8 | 344.847 | 299.094 | -13.27% | 341.952 | -12.53% |
+| Flash M16 | 380.548 | 381.250 | +0.18% | 358.198 | +6.44% |
+| Flash M32 | 366.900 | 365.789 | -0.30% | 359.410 | +1.78% |
+| Flash M64 | 390.264 | 379.396 | -2.78% | 389.217 | -2.52% |
+| Pro M8 | 802.935 | 786.372 | -2.06% | 810.288 | -2.95% |
+| Pro M32 | 1083.000 | 1046.000 | -3.42% | 1078.000 | -2.97% |
+| Pro M64 | 1127.000 | 1085.000 | -3.73% | 1128.000 | -3.81% |
+| Pro M128 | 1284.000 | 1241.000 | -3.35% | 1283.000 | -3.27% |
+
+Only double-positive points are retained. Flash M8/M64 and Pro
+M8/M32/M64/M128 use PRMT. Flash M16 keeps R56's bank permutation with the
+original bit expression, and Flash M32 keeps its original pair mapping. All
+28 full-suite correctness scenarios pass, including forced ring wrap, with
+no numerical change beyond the existing tolerance.
+
+### Formal A/B/A performance
+
+The selected six points were rerun with one warmup, 50 observations, 20
+launches per observation, maximum-rank median, and an explicit L2 flush:
+
+| point | first R58 us | R59 us | change | second R58 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M8 | 322.295 | 295.376 | -8.35% | 317.716 | -7.03% |
+| Flash M64 | 379.826 | 369.758 | -2.65% | 389.968 | -5.18% |
+| Pro M8 | 805.698 | 770.571 | -4.36% | 794.110 | -2.96% |
+| Pro M32 | 1064.500 | 1037.500 | -2.54% | 1066.500 | -2.72% |
+| Pro M64 | 1123.000 | 1101.500 | -1.91% | 1127.000 | -2.26% |
+| Pro M128 | 1306.000 | 1233.000 | -5.59% | 1272.000 | -3.07% |
+
+The six-point geometric mean improves `4.26%/3.89%` against the first and
+second controls. Every retained point is double-positive in both the screen
+and formal run.
+
+Matched one-rank profiles preserve each production expert shard: 32 experts
+for Flash and 48 for Pro. Flash M8 directly confirms both intended effects:
+
+| Flash M8 NCU metric | R58 | R59 | change |
+| --- | ---: | ---: | ---: |
+| duration us | 239.712 | 222.400 | -7.22% |
+| executed warp instructions | 52,588,063 | 47,446,789 | -9.78% |
+| executed thread instructions | 1,640,308,174 | 1,475,871,922 | -10.03% |
+| shared-load bank conflicts | 2,364,982 | 3,682 | -99.84% |
+| shared-store bank conflicts | 735,098 | 937,651 | +27.56% |
+| global-load sectors | 647,578 | 644,477 | -0.48% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+| tensor-pipe active | 3.833% | 4.123% | +7.56% |
+
+Both Flash cubins use 114 registers/thread and 110.816 KiB dynamic shared
+memory. NSYS independently measures `223.488 -> 206.656 us` (`-7.53%`). For
+Pro M8, NCU measures `744.704 -> 715.808 us` (`-3.88%`), with warp/thread
+instructions down `10.24%/10.47%`, no local traffic, and 107 registers/thread.
+Matched 48-expert NSYS measures `684.512 -> 666.431 us` (`-2.64%`). Screen,
+formal, correctness, NCU, and NSYS evidence is under
+`iter128-prmt-bank-pair-selector` through
+`iter132-prmt-selected-profiles` on the pod and local artifact root.
