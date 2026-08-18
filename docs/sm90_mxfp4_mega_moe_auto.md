@@ -4845,3 +4845,31 @@ All polling changes were reverted; R67's 64-cycle path remains production.
 Complete logs are under `iter167` through `iter173` on the pod and local
 artifact root. The terminal goal remains unmet, and the next structural target
 returns to the stable Flash M16 residual instead of further sleep tuning.
+
+## Rejected R76: PRMT pair indexing for regular Pro M512+
+
+R66's bank-permuted regular Pro decoder still expresses the pair index with
+two shifts, XOR, mask, and multiply, while selected small-M buckets use one
+`PRMT`. R76 extended that PRMT expression to the existing Pro M512+ selector,
+without changing the loaded address set, scale lookup, expanded tile, WGMMA,
+or epilogue. Exact eight-rank Pro M512 correctness passed at `diff=0.000708`.
+Both the eight-rank and matched one-rank cubins remained at 128 registers,
+zero stack/local storage, and 100.576 KiB dynamic shared memory.
+
+The matched one-rank/48-expert NCU gate showed that PTXAS had already reduced
+the regular-path expression to equivalent machine work:
+
+| metric | R67 bit expression | R76 PRMT source | change |
+| --- | ---: | ---: | ---: |
+| NCU duration ms | 2.22 | 2.24 | +0.90% |
+| executed warp instructions | 513,925,905 | 513,932,492 | +0.0013% |
+| executed thread instructions | 16,134,575,840 | 16,134,624,475 | +0.0003% |
+| shared-load bank conflicts | 125,498 | 122,844 | -2.11% |
+| shared-store bank conflicts | 8,871,142 | 8,835,135 | -0.41% |
+| global-load sectors | 4,896,455 | 4,899,161 | +0.06% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+
+The intended instruction reduction is absent and the measured duration moves
+in the wrong direction. R76 was therefore stopped at the profiler gate before
+distributed timing or NSYS, fully reverted, and is not part of R67. Evidence
+is under `iter174` and `iter175` on the pod and local artifact root.
