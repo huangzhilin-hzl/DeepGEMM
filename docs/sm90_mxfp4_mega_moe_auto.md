@@ -5334,3 +5334,66 @@ attributing the full `0.145` percentage-point change solely to M8. The priority
 remains Flash small M: M8 and M16 are the two largest current deficits. Raw
 logs are archived in `iter206-r84-pr383-full-matrix` on the pod and local
 artifact root.
+
+## R85: extend direct source-rank lookup to Flash M16
+
+### Reason and direction
+
+R84's full matrix left Flash M16 `7.507%` behind PR383, the second-largest
+Flash small-M deficit. With 16 tokens per rank, a particular expert still
+usually receives no more than one route from each source rank. R85 therefore
+extends R84's exact compile-time guard from `kMaxSwapABTokens == 8` to
+`kMaxSwapABTokens == 8 or 16`. The runtime ballot is unchanged: it selects the
+source directly only when every source count is at most one, and otherwise
+falls back to the original round-robin reconstruction. Pro and Flash M32+
+remain byte-for-byte on their old compile-time path.
+
+The exact eight-rank forced-wrap Flash M16 gate passes at `diff=0.000654`.
+Resource use is unchanged at 118 registers, zero stack/local storage, 1024
+bytes static shared memory, and 110.816 KiB dynamic shared memory.
+
+### Screening and formal acceptance
+
+The initial 20-observation cold-L2 screen straddled the two R84 controls, so it
+was escalated rather than judged from one side:
+
+| point | first R84 us | R85 us | change | second R84 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M16 max rank | 373.9255 | 361.4620 | -3.33% | 345.0805 | +4.75% |
+| Flash M16 rank 0 | 354.8805 | 343.5240 | -3.20% | 328.0350 | +4.72% |
+
+The authoritative 50-observation A/B/A is double-positive at max rank and
+rank 0:
+
+| point | first R84 us | R85 us | change | second R84 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M16 max rank | 361.9330 | 326.3015 | -9.84% | 332.2255 | -1.78% |
+| Flash M16 rank 0 | 340.8110 | 313.3395 | -8.06% | 321.9545 | -2.68% |
+
+All 13 production scenarios pass, including every forced ring-wrap case.
+
+### Profiler attribution and PR383 comparison
+
+The one-rank/32-expert NCU comparison intentionally exercises the general
+fallback because one source rank contributes duplicate routes. R84/R85 move
+`273.15 -> 274.24 us` (`+0.40%`), with warp instructions
+`63,116,003 -> 63,121,399`, thread instructions
+`1,966,339,347 -> 1,966,491,432`, 118 registers, and zero local traffic on
+both. Shared-load/store bank conflicts move `6,214/1,450,083` to
+`5,843/1,434,713`, global-load sectors `831,516 -> 828,927`, and global-store
+sectors stay `29,369`. The essentially flat local profile is expected: the
+production gain comes from the eight-source common case, not matrix math.
+
+Low-perturbation eight-rank rank-0-only NSYS records one instrumented launch
+at `644.192 us` for R84 and `664.576 us` for R85 (`+3.16%`). As in earlier
+iterations, tracing only one participant perturbs cooperative wait time and a
+single launch is not an acceptance statistic. It is retained as topology
+evidence; the 50-observation A/B/A remains authoritative.
+
+A same-session PR383/R85/PR383 50-observation comparison measures max-rank
+medians `333.2465/346.5730/322.9320 us`; R85 is still `4.00%/7.32%` behind
+PR383. Rank-0 medians are `324.3175/336.5480/303.6290 us`, leaving
+`3.77%/10.84%`. Thus R85 is accepted because it is double-positive against
+its frozen R84 parent, but it does not close Flash M16 outright. Build,
+correctness, screen, formal, NCU, NSYS, full-production, and PR383 evidence is
+archived under `iter207` through `iter212` on the pod and local artifact root.
