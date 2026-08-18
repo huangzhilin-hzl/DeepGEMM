@@ -4968,3 +4968,50 @@ formal, and full-production evidence is under `iter178` through `iter182` on
 the pod and local artifact root. The isolated R78 point gain is large enough
 to erase the prior `+0.296%` 22-point estimate, but a fresh complete PR383
 matrix remains the terminal authority.
+
+### R78 authoritative DSV4 matrix against PR383
+
+The fresh same-session run uses the complete requested contract: Flash and
+Pro, M=`8,16,32,64,128,256,512,1024,2048,4096,8192`, one warmup, 50
+observations for M<=128, three for M>=256, 20 launches per observation,
+cold L2, and the maximum-rank median. PR383 is again the sum of its native FP8
+L1 and L2 kernels.
+
+| model | M | R78 us | PR383 us | R78 gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 309.790 | 294.170 | +5.31% |
+| Flash | 16 | 330.545 | 304.229 | +8.65% |
+| Flash | 32 | 340.234 | 328.157 | +3.68% |
+| Flash | 64 | 371.803 | 370.305 | +0.40% |
+| Flash | 128 | 433.155 | 443.427 | -2.32% |
+| Flash | 256 | 502.117 | 502.806 | -0.14% |
+| Flash | 512 | 903.750 | 941.889 | -4.05% |
+| Flash | 1024 | 1493.000 | 1523.372 | -1.99% |
+| Flash | 2048 | 2738.000 | 2736.756 | +0.05% |
+| Flash | 4096 | 5161.000 | 5079.000 | +1.61% |
+| Flash | 8192 | 9943.000 | 9853.000 | +0.91% |
+| Pro | 8 | 762.394 | 718.736 | +6.07% |
+| Pro | 16 | 993.188 | 1006.552 | -1.33% |
+| Pro | 32 | 1032.000 | 1103.037 | -6.44% |
+| Pro | 64 | 1070.500 | 1175.370 | -8.92% |
+| Pro | 128 | 1218.500 | 1278.790 | -4.71% |
+| Pro | 256 | 1650.000 | 1669.937 | -1.19% |
+| Pro | 512 | 2569.000 | 2405.394 | +6.80% |
+| Pro | 1024 | 3918.000 | 4008.000 | -2.25% |
+| Pro | 2048 | 6893.000 | 7014.000 | -1.73% |
+| Pro | 4096 | 13001.000 | 12901.000 | +0.78% |
+| Pro | 8192 | 25288.000 | 25092.000 | +0.78% |
+
+R78's 22-point geometric gap is `-0.088%`: this is the first complete matrix
+on the branch to beat PR383. Small and large subsets lead by `0.113%` and
+`0.067%`. Pro leads by `1.207%` overall (`3.202%` small), while Flash trails
+by `1.043%` overall (`3.075%` small) despite leading by `0.619%` at large M.
+The source-attributed M16 gain is the formal A/B/A above; its fresh PR383 gap
+contracts from R67's `+9.99%` to `+8.65%` in this independent matrix. Complete
+logs are under `iter183-r78-pr383-full-matrix` on the pod and local artifact
+root.
+
+The aggregate target has crossed zero, but the `0.088%` lead is smaller than
+observed cross-epoch variance and is not yet treated as robust theoretical
+headroom. The next iteration targets the remaining Flash M8/M16 and Pro
+M8/M512 residuals while preserving R78's measured M16 selector.
