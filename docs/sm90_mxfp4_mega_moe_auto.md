@@ -4772,3 +4772,34 @@ formal sign reversal therefore reflects a gain smaller than distributed
 scheduling variance, not spill damage. The source change was fully reverted
 and is not part of R67. Evidence is under `iter159` through `iter162` on the
 pod and local artifact root.
+
+## Rejected R69: extend L2 C/D swizzle to M512
+
+R69 lowered the existing B128-swizzled L2 C/D epilogue threshold from M1024
+to M512, targeting the simultaneous Flash/Pro M512 residuals. The swizzle
+preserves every BF16 value and final NVLink address while spreading epilogue
+stores across shared-memory banks. New exact Flash M512 coverage and the
+existing Pro M512 scenario both passed on eight ranks; Flash also verified
+physical-ring reuse at `diff=0.000662`.
+
+The five-observation broad R67/R69/R67 screen measured Flash M512 at
+`952.286/932.095/939.286 us` (`-2.12%/-0.77%`) and Pro M512 at
+`2591/2554/2536 us` (`-1.43%/+0.71%`). Pro was immediately excluded. The
+selector was narrowed to routed Flash M512, then rerun with the authoritative
+three-observation large-M contract:
+
+| point | first R67 us | R69 us | change | second R67 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M512 | 937.935 | 947.976 | +1.07% | 1034.000 | -8.32% |
+
+The candidate rank-0 median beat both controls, but the required maximum-rank
+median changed sign and the second control was visibly slow. One-rank NCU
+confirms a real but noise-sized mechanism: shared-store bank conflicts fall
+`3,517,322 -> 2,375,929` (`-32.45%`), while executed warp instructions rise
+`185,673,652 -> 187,308,560` (`+0.88%`) and duration moves only
+`906.016 -> 903.392 us` (`-0.29%`). NSYS similarly moves
+`831.007 -> 827.871 us` (`-0.38%`); both paths use 126 registers, 110.816 KiB
+dynamic shared memory, and zero local sectors. The local benefit is too small
+to control the production max-rank score, so the selector and temporary test
+were fully reverted. Evidence is under `iter163` through `iter166` on the pod
+and local artifact root.
