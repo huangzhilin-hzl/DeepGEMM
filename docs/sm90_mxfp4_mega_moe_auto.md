@@ -5015,3 +5015,53 @@ The aggregate target has crossed zero, but the `0.088%` lead is smaller than
 observed cross-epoch variance and is not yet treated as robust theoretical
 headroom. The next iteration targets the remaining Flash M8/M16 and Pro
 M8/M512 residuals while preserving R78's measured M16 selector.
+
+## Rejected R79-R80: incremental WGMMA descriptors for Pro M512+
+
+R79 extended the regular mainloop's existing base-plus-increment WGMMA
+descriptor path from large Flash batches to Pro M512 and above. The intended
+mechanism was to replace repeated `make_smem_desc` address construction in
+each K-stage without changing tile shapes, loads, WGMMA issue order, or the
+epilogue. Exact eight-rank Pro M512 correctness passed at `diff=0.000708`.
+Both eight-rank and matched one-rank cubins used 128 registers, zero
+stack/local storage, and 100.576 KiB dynamic shared memory.
+
+The matched one-rank/48-expert NCU gate confirmed a real instruction-count
+reduction, but not a wall-clock reduction:
+
+| metric | R78 | R79 | change |
+| --- | ---: | ---: | ---: |
+| NCU duration ms | 2.25 | 2.24 | about -0.4% |
+| executed warp instructions | 513,923,706 | 507,901,882 | -1.17% |
+| executed thread instructions | 16,134,509,700 | 15,941,793,737 | -1.19% |
+| shared-load bank conflicts | 123,871 | 120,657 | -2.59% |
+| shared-store bank conflicts | 8,878,362 | 9,404,249 | +5.92% |
+| global-load sectors | 4,898,617 | 4,901,467 | +0.06% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+
+Tensor-pipe activity is effectively unchanged (`23.25% -> 23.22%`), while
+barrier and long-scoreboard ratios rise slightly (`4.06/2.47% ->
+4.14/2.49%`). NSYS measures `2.236093 -> 2.240125 ms` (`+0.18%`), showing
+that fewer integer instructions are offset by scheduling or shared-store
+pressure.
+
+The five-point, five-observation, one-warmup, 20-launch, cold-L2 A/B/A screen
+made the over-broad selector visible:
+
+| Pro M | first R78 us | R79 us | change | second R78 us | reverse change |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 | 2576 | 2547 | -1.13% | 2571 | -0.93% |
+| 1024 | 3926 | 3926 | 0.00% | 3876 | +1.29% |
+| 2048 | 6985 | 6943 | -0.60% | 6917 | +0.38% |
+| 4096 | 13017 | 13004 | -0.10% | 13016 | -0.09% |
+| 8192 | 25246 | 25317 | +0.28% | 25288 | +0.11% |
+
+The five-point geometric mean is `-0.310%` against the first control but
+`+0.148%` against the second. R80 therefore narrowed the selector to exact
+Pro M512 and applied the requested authoritative large-M repeat count of
+three. The formal maximum-rank medians were `2550 us` (first R78), `2564 us`
+(R80), and `2574 us` (second R78): R80 is `+0.55%` slower than the first
+control and `-0.39%` faster than the second. This sign reversal fails the
+two-sided acceptance contract. Both selectors were fully reverted; R78 is
+unchanged. Evidence is under `iter184` through `iter187` on the pod and local
+artifact root.
