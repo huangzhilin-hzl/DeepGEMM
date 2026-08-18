@@ -110,6 +110,15 @@ public:
             args.num_shared_experts == 0 and
             args.hidden == 7168 and
             (args.num_tokens == 16 or args.num_tokens == 32);
+        const bool bank_permute_mxfp4_pair_loads =
+            args.hidden == 4096 or
+            (args.hidden == 7168 and
+             ((small_m_swap_ab and
+               (args.num_tokens == 8 or
+                args.num_tokens == 32 or
+                args.num_tokens == 64 or
+                args.num_tokens == 128)) or
+              (not small_m_swap_ab and args.num_tokens >= 512)));
         constexpr int kL2CDSwizzleMinTokens = 1024;
         const bool swizzle_l2_cd =
             args.num_tokens >= kL2CDSwizzleMinTokens;
@@ -128,6 +137,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {}, {},
+        {},
         {},
         {},
         {},
@@ -156,6 +166,7 @@ static void __instantiate_kernel() {{
     overlap_mxfp4_scale_path ? "true" : "false",
     use_prmt_mxfp4_exponent ? "true" : "false",
     use_incremental_mxfp4_descriptor ? "true" : "false",
+    bank_permute_mxfp4_pair_loads ? "true" : "false",
     args.num_ring_tokens, args.num_sf_ring_tokens, args.num_shared_experts);
     }
 

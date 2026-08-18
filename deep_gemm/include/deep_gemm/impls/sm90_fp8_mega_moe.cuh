@@ -264,6 +264,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     bool kOverlapMXFP4ScalePath, \
     bool kUsePRMTMXFP4Exponent, \
     bool kUseIncrementalMXFP4Descriptor, \
+    bool kBankPermuteMXFP4PairLoads, \
     uint32_t kNumRingTokens, \
     uint32_t kNumSFRingTokens, \
     uint32_t kNumSharedExperts
@@ -340,6 +341,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     kOverlapMXFP4ScalePath, \
     kUsePRMTMXFP4Exponent, \
     kUseIncrementalMXFP4Descriptor, \
+    kBankPermuteMXFP4PairLoads, \
     kNumRingTokens, kNumSFRingTokens, kNumSharedExperts
 
 template <DG_SM90_FP8_MOE_TEMPLATE_PARAMS>
@@ -1651,7 +1653,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 const uint32_t pair_row_in_decode_group =
                                     lane_idx % 16;
                                 // For the conflict-heavy Flash and selected
-                                // Pro swap-AB buckets,
+                                // Pro swap-AB/regular buckets,
                                 // alternate the two adjacent word pairs across
                                 // each half warp's lower and upper eight rows.
                                 // Under the packed B64 swizzle this covers every
@@ -1660,11 +1662,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 // full warp still owns the identical 16-row x
                                 // 4-word address set.
                                 constexpr bool kBankPermutedPairLoads =
-                                    kHidden == 4096 or
-                                    (kHidden == 7168 and kSmallMSwapAB and
-                                     (kMaxSwapABTokens == 8 or
-                                      kMaxSwapABTokens == 32 or
-                                      kMaxSwapABTokens == 64));
+                                    kBankPermuteMXFP4PairLoads;
                                 constexpr bool kPrmtPairLoads =
                                     kSmallMSwapAB and
                                     ((kHidden == 4096 and

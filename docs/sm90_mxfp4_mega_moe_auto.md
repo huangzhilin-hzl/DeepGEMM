@@ -4508,3 +4508,82 @@ A/B/A timing remains the authority for acceptance. Reports and failed-profiler
 logs are under `iter145-flash-m128-short-poll-profiles`. The terminal aggregate
 target remains unmet, so the next iteration targets larger weighted residuals
 rather than extrapolating this point gain.
+
+## R66: bank-permute Pro M512+ packed-weight loads
+
+### Attribution and selector
+
+R61's full matrix left Pro M512 `4.17%` behind PR383. A matched one-rank,
+48-expert profile shows that the fused arithmetic path itself is already
+competitive: NCU measures `2.442 ms` versus PR383's
+`1.636 + 0.852 = 2.488 ms`, and NSYS measures `2.242 ms` versus
+`1.487 + 0.786 = 2.273 ms`. The eight-rank deficit is therefore dominated by
+work that is amplified by the persistent multi-rank schedule rather than by a
+fundamental tensor-core throughput shortfall.
+
+The same profile exposes `18,223,366` shared-load bank conflicts in the fused
+kernel versus only `1,959 + 13,479` across PR383's two phases. R66 extends the
+address-set-preserving paired-word lane permutation already validated for
+Flash and Pro small-M to regular Pro M512 and above. A dedicated generated
+template boolean keeps Pro M256 on its old mapping after a broad screen found
+that point order-dependent; all previously accepted selectors are unchanged.
+The full warp still loads the identical 16-row by four-word set, so packed
+weights, scale lookup, expanded-B addresses, WGMMA, and numerical behavior do
+not change. A new `production.pro_m512` regression scenario covers the exact
+selector and passes on eight ranks with `diff=0.000708`. The rebuilt extension
+also passes all 13 eight-rank production scenarios, including every forced ring
+wrap case; that complete log is under `iter152-r66-production-correctness`.
+
+The first broad five-observation R61/R66/R61 screen measured the six regular
+Pro points as follows. M256 used the broad prototype and was removed before
+the final run; the remaining five points were double-positive as a set.
+
+| M | first R61 us | broad R66 us | change | second R61 us | reverse change |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 | 1620 | 1639 | +1.17% | 1663 | -1.44% |
+| 512 | 2578 | 2560 | -0.70% | 2562 | -0.08% |
+| 1024 | 3950 | 3926 | -0.61% | 3927 | -0.03% |
+| 2048 | 6960 | 6903 | -0.82% | 6996 | -1.33% |
+| 4096 | 13113 | 13017 | -0.73% | 13123 | -0.81% |
+| 8192 | 25549 | 25314 | -0.92% | 25444 | -0.51% |
+
+After narrowing the JIT selector to M512+, the requested three-observation,
+20-launch, cold-L2 formal A/B/A result is:
+
+| M | first R61 us | R66 us | change | second R61 us | reverse change |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 | 2721 | 2571 | -5.51% | 2598 | -1.04% |
+| 1024 | 3918 | 3890 | -0.71% | 3963 | -1.84% |
+| 2048 | 7041 | 6918 | -1.75% | 6987 | -0.99% |
+| 4096 | 13226 | 12994 | -1.75% | 13168 | -1.32% |
+| 8192 | 25472 | 25274 | -0.78% | 25580 | -1.20% |
+
+The five-point geometric mean improves `2.12%/1.28%` against the two
+controls. M512's first control is visibly noisy, but its reverse comparison
+and all eight other affected-point comparisons remain favorable.
+
+### NCU and NSYS confirmation
+
+Matched one-rank Pro M512 profiling before and after R66 confirms the intended
+mechanism:
+
+| metric | R65 | R66 | change |
+| --- | ---: | ---: | ---: |
+| NCU duration ms | 2.442016 | 2.428736 | -0.54% |
+| executed warp instructions | 520,691,733 | 513,922,278 | -1.30% |
+| executed thread instructions | 16,351,510,982 | 16,134,537,441 | -1.33% |
+| shared-load bank conflicts | 18,223,366 | 122,939 | -99.33% |
+| shared-store bank conflicts | 8,442,903 | 8,425,886 | -0.20% |
+| global-load sectors | 4,899,826 | 4,899,089 | -0.02% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+| tensor-pipe active | 23.128% | 23.249% | +0.52% |
+| short-scoreboard ratio | 0.425 | 0.332 | -21.71% |
+
+Both cubins retain 128 registers/thread and 100.576 KiB dynamic shared
+memory. NSYS independently measures `2.242493 -> 2.215009 ms` (`-1.23%`).
+The first post-selector correctness launch also documented the expected stale
+host-extension template mismatch; rebuilding `_C.so` produced the successful
+run above. PR383 attribution, broad screen, correctness/build, formal A/B/A,
+and final NCU/NSYS evidence are under `iter146` through `iter152` on the pod
+and local artifact root. The aggregate terminal target still requires a fresh
+full matrix and further iteration.

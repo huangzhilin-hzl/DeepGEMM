@@ -785,6 +785,16 @@ def _full_scenarios(
             fast_math=True,
             activation_clamp=10.0,
         )),
+        ('production.pro_m512', dict(
+            num_max_tokens_per_rank=512,
+            num_tokens=512,
+            hidden=7168,
+            intermediate_hidden=3072,
+            num_experts=48 * num_ranks,
+            num_topk=6,
+            fast_math=True,
+            activation_clamp=10.0,
+        )),
         ('production.pro_m8', dict(
             num_max_tokens_per_rank=128,
             num_tokens=8,
