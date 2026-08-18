@@ -5470,3 +5470,32 @@ The common-case ballot and branch cost more than the eliminated round-robin
 work on this longer Pro kernel. R86 was reverted in full and not committed.
 Gate and screening evidence is archived under `iter214` and `iter215` on the
 pod and local artifact root.
+
+## Rejected R87: two-layer direct source lookup for Flash M32
+
+R87 generalized the direct source selector to Flash M32 without using R84's
+too-narrow all-counts-at-most-one condition. If every source-rank/expert count
+was at most two, it selected first-round tokens from the nonempty mask and
+second-round tokens from the count-greater-than-one mask. Any count above two
+fell back to the original loop. This was expected to cover roughly 70% of
+experts at M32 while leaving M8/M16 unchanged.
+
+Forced-wrap correctness passed at `diff=0.000656`. Resources stayed at 125
+registers, zero stack/local storage, and 1024 bytes static shared memory. The
+20-observation screen was double-positive:
+
+| point | first R85 us | R87 us | change | second R85 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M32 max rank | 365.0535 | 361.7645 | -0.90% | 363.1140 | -0.37% |
+| Flash M32 rank 0 | 347.9640 | 341.1055 | -1.97% | 352.8795 | -3.34% |
+
+The required 50-observation A/B/A reversed the result:
+
+| point | first R85 us | R87 us | change | second R85 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M32 max rank | 364.0560 | 368.2355 | +1.15% | 353.1875 | +4.26% |
+| Flash M32 rank 0 | 351.4065 | 354.5830 | +0.90% | 325.4075 | +8.97% |
+
+The additional ballots, popcount, second-round branch, and frequent fallback
+do not amortize at M32. R87 was reverted in full and not committed. Evidence
+is archived under `iter216` through `iter218`.
