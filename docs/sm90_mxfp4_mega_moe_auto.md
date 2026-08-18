@@ -3723,3 +3723,39 @@ gap from `+3.317%` to `+1.979%` and brings the aggregate large-M comparison to
 parity. The remaining dominant cluster is Flash M8-M128, especially M16 and
 M128. Complete logs are under `iter104-r54-pr383-full-matrix` on the pod and
 local artifact root.
+
+## Rejected R55: direct register-source WGMMA A for Flash M16
+
+### Reason and direction
+
+R54's remaining largest point is Flash M16, where the MXFP4 path is still
+`16.26%` behind PR383. R55 prototyped Hopper's
+`wgmma.mma_async.m64n{8,16}k32.f32.e4m3.e4m3` register-source-A form for only
+the `kHidden=4096`, `kMaxSwapABTokens=16` specialization. The prototype
+decoded each packed weight tile directly into CUTE's four-register
+`ALayout_64x32` fragment and used staged activations as shared-memory B. Its
+goal was to remove expanded-weight STS.128, the decoder rendezvous, and the
+subsequent shared-memory WGMMA A reads without changing TMA input, scale
+values, promotion, or epilogue semantics.
+
+The eight-rank forced-ring-wrap Flash M16 correctness gate passed at the
+unchanged `0.000645` normalized difference. PTXAS also reported zero stack and
+zero local storage, but register allocation rose from 114 to 128 registers per
+thread. The authoritative 50-observation, 20-launch, cold-L2 R54/RS/R54 screen
+was an unambiguous regression:
+
+| point | first R54 us | RS candidate us | change | second R54 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M16 | 368.050 | 552.976 | +50.24% | 364.379 | +51.76% |
+
+A follow-up kept only the first `wgmma.fence` rather than fencing every K32
+register fragment. It remained correct at `0.000645` but regressed further to
+`564.599 us` (`+53.40%/+54.95%` versus the same controls). This rules out the
+extra fence count as the main cause. Moving MXFP4 decode from the existing
+double-buffered shared-memory preparation into the WGMMA issue path exposes
+the full load/decode latency on the tensor-core critical path, and the larger
+live register footprint removes compiler scheduling freedom. The entire code
+prototype was reverted; only this negative result is retained. Evidence is
+under `iter105-flash-m16-register-a-correctness` through
+`iter107-flash-m16-register-a-single-fence` on the pod and local artifact
+root.
