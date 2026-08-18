@@ -375,9 +375,10 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                           not kHasSharedExperts),
                      "Small-M swap-AB is routed-only and model-specific");
     DG_STATIC_ASSERT(not kPackedBF16SwapEpilogue or
-                         (kSmallMSwapAB and kHidden == 7168 and
+                         (kSmallMSwapAB and
+                          (kHidden == 4096 or kHidden == 7168) and
                           not kHasSharedExperts),
-                     "Packed-BF16 swap epilogue is Pro small-M only");
+                     "Packed-BF16 swap epilogue is routed small-M only");
     DG_STATIC_ASSERT(
         kMaxSwapABTokens == 8 or kMaxSwapABTokens == 16 or
             kMaxSwapABTokens == 32 or kMaxSwapABTokens == 64,

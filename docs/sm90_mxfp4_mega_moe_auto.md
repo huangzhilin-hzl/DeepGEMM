@@ -5065,3 +5065,90 @@ control and `-0.39%` faster than the second. This sign reversal fails the
 two-sided acceptance contract. Both selectors were fully reverted; R78 is
 unchanged. Evidence is under `iter184` through `iter187` on the pod and local
 artifact root.
+
+## Rejected R81: single-block owner lookup for mature Flash M16
+
+R81 retested R29's direct nonempty-mask owner lookup at exact Flash M16 on top
+of R78's PRMT/HFMA2 mainloop. The scheduler replaces each task's general warp
+prefix reconstruction with one multi-block safety ballot followed by a
+nonempty mask and `__fns`; any expert owning more than M64 retains the general
+fallback. Exact eight-rank correctness passed at `diff=0.000654`. The cubin
+remained at 115 registers, zero stack/local storage, and 110.816 KiB dynamic
+shared memory.
+
+The 20-observation, one-warmup, 20-launch, cold-L2 screen rejected it before
+profiling:
+
+| point | first R78 us | R81 us | change | second R78 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M16 | 337.938 | 355.485 | +5.19% | 339.225 | +4.79% |
+
+This reproduces the direction that made the same M16 scheduler selector fail
+R29, now without resource or arithmetic confounders. The shorter uniform
+lookup does not improve this bucket's dynamic task stream and was fully
+reverted. Evidence is under `iter188` and `iter189` on the pod and local
+artifact root.
+
+## R82: direct packed-BF16 epilogue on the R78 Flash M16 path
+
+### Reason and implementation
+
+R77 tested the packed swap epilogue before Flash M16 had R78's packed HFMA2
+promotion and found no measurable gain. R82 tests the missing composition:
+the PRMT decoder and HFMA2 promotion remain unchanged, but the accumulated
+BF16 pairs now feed the L1/L2 swap epilogues directly instead of first
+expanding all 32 pairs to a 64-float `final_accum` array. The generator selects
+this only for routed `hidden=4096, M=16`; the existing Pro M16/M32 packed
+selectors and all other specializations are unchanged. The template safety
+assertion was generalized from Pro-only to the two supported DSV4 hidden
+sizes. Its first stale assertion failure is retained in `iter190`; the fresh
+build passes exact eight-rank correctness at `diff=0.000654`.
+
+The production cubin uses 118 registers, zero stack/local storage, and
+110.816 KiB dynamic shared memory, compared with R78's 115 registers and
+otherwise identical resources. The three-register increase does not alter
+the fixed two-CTA-per-SM topology. All 13 eight-rank production scenarios
+pass after selection, including every forced ring-wrap case.
+
+### Screening and authoritative performance
+
+The initial 20-observation A/B/A screen was double-positive:
+
+| point | first R78 us | R82 us | change | second R78 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M16 | 371.530 | 343.136 | -7.64% | 356.930 | -3.86% |
+
+The requested small-M contract then uses one warmup, 50 observations, 20
+launches per observation, cold L2, and maximum-rank median:
+
+| point | first R78 us | R82 us | change | second R78 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M16 | 337.242 | 331.751 | -1.63% | 348.071 | -4.69% |
+
+Rank-0 medians move from `328.678/328.592 us` to `317.965 us`
+(`-3.26%/-3.23%`), confirming that the accepted max-rank improvement is not a
+single-peer artifact.
+
+### NCU and NSYS attribution
+
+Matched one-rank/32-expert profiling shows a shorter dependency path rather
+than an instruction-count reduction:
+
+| metric | R78 | R82 | change |
+| --- | ---: | ---: | ---: |
+| NCU duration us | 279.36 | 273.66 | -2.04% |
+| executed warp instructions | 61,700,057 | 63,112,924 | +2.29% |
+| executed thread instructions | 1,921,278,147 | 1,966,441,116 | +2.35% |
+| shared-load bank conflicts | 6,182 | 5,508 | -10.90% |
+| shared-store bank conflicts | 1,166,083 | 1,428,718 | +22.52% |
+| global-load sectors | 835,041 | 834,062 | -0.12% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+| tensor-pipe active | 4.24% | 4.34% | +2.36% |
+
+Barrier/long-/short-scoreboard ratios move from `2.74/2.45/0.82` to
+`2.73/2.37/0.56`; the short-scoreboard reduction offsets the extra packed
+epilogue instructions and shared-store conflicts. NSYS independently
+measures `261.632 -> 257.056 us` (`-1.75%`). Correctness, screen, formal,
+NCU, and NSYS evidence is under `iter190` through `iter195` on the pod and
+local artifact root. R82 requires a fresh complete PR383 matrix before its
+aggregate headroom is claimed.

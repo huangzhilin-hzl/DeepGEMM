@@ -110,8 +110,9 @@ public:
             args.num_tokens <= 32 ? 32 : 64;
         const bool packed_bf16_swap_epilogue =
             args.num_shared_experts == 0 and
-            args.hidden == 7168 and
-            (args.num_tokens == 16 or args.num_tokens == 32);
+            ((args.hidden == 4096 and args.num_tokens == 16) or
+             (args.hidden == 7168 and
+              (args.num_tokens == 16 or args.num_tokens == 32)));
         const bool bank_permute_mxfp4_pair_loads =
             args.hidden == 4096 or
             (args.hidden == 7168 and
