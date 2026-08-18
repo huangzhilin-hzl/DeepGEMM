@@ -3974,3 +3974,50 @@ zero stack/local storage, 1024 bytes static shared memory, and 100.576 KiB
 dynamic shared memory. Correctness, formal, broad-screen, NCU, SourceCounters,
 and NSYS artifacts are under `iter116-pro-m8-bank-permuted-lds` through
 `iter120-pro-bank-permuted-formal` on the pod and local artifact root.
+
+### R57 authoritative DSV4 matrix against PR383
+
+The post-R57 paired run again uses the full requested eight-H20 cold-L2
+contract: Flash and Pro, all 11 M values, one warmup, 50 observations for
+M<=128, three for M>=256, 20 launches per observation, and maximum-rank
+median. PR383 is the sum of its native L1 and L2 phase times.
+
+| model | M | R57 us | PR383 us | R57 gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 327.500 | 306.927 | +6.70% |
+| Flash | 16 | 350.680 | 310.526 | +12.93% |
+| Flash | 32 | 366.886 | 329.569 | +11.32% |
+| Flash | 64 | 397.852 | 374.104 | +6.35% |
+| Flash | 128 | 480.700 | 436.814 | +10.05% |
+| Flash | 256 | 489.670 | 511.772 | -4.32% |
+| Flash | 512 | 904.737 | 898.654 | +0.68% |
+| Flash | 1024 | 1498.000 | 1527.997 | -1.96% |
+| Flash | 2048 | 2772.000 | 2716.000 | +2.06% |
+| Flash | 4096 | 5194.000 | 5064.000 | +2.57% |
+| Flash | 8192 | 10013.000 | 9834.000 | +1.82% |
+| Pro | 8 | 770.116 | 709.014 | +8.62% |
+| Pro | 16 | 1026.000 | 1004.356 | +2.15% |
+| Pro | 32 | 1059.000 | 1103.813 | -4.06% |
+| Pro | 64 | 1126.500 | 1153.130 | -2.31% |
+| Pro | 128 | 1268.500 | 1280.499 | -0.94% |
+| Pro | 256 | 1639.000 | 1654.341 | -0.93% |
+| Pro | 512 | 2577.000 | 2417.766 | +6.59% |
+| Pro | 1024 | 3947.000 | 4027.000 | -1.99% |
+| Pro | 2048 | 6948.000 | 7035.000 | -1.24% |
+| Pro | 4096 | 13121.000 | 12875.000 | +1.91% |
+| Pro | 8192 | 25554.000 | 25102.000 | +1.80% |
+
+The geometric gaps are `+2.513%` over all 22 points, `+4.925%` over the ten
+small-M points, and `+0.546%` over the 12 large-M points. Flash is `+4.248%`
+overall (`+9.440%` small, `+0.110%` large); Pro is `+0.808%` overall
+(`+0.597%` small, `+0.984%` large). The four R57-changed Pro points have only
+a `+0.211%` geometric gap to PR383; M32/M64/M128 now lead PR383 by
+`4.06%/2.31%/0.94%`, while Pro M8 remains `8.62%` behind.
+
+Compared with the R56 candidate matrix, the changed four-point geometric mean
+improves `2.23%`, agreeing with the formal A/B/A evidence. The all-point
+candidate geometric mean improves `0.82%`; movements in unchanged Flash and
+large-M points remain run variance. The dominant remaining stable cluster is
+Flash M8-M128, especially M16/M32/M128, followed by Pro M8. Complete paired
+logs are under `iter121-r57-pr383-full-matrix` on the pod and local artifact
+root.
