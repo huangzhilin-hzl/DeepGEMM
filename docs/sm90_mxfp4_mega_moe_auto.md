@@ -4587,3 +4587,49 @@ run above. PR383 attribution, broad screen, correctness/build, formal A/B/A,
 and final NCU/NSYS evidence are under `iter146` through `iter152` on the pod
 and local artifact root. The aggregate terminal target still requires a fresh
 full matrix and further iteration.
+
+### R66 authoritative DSV4 matrix against PR383
+
+The fresh same-session comparison uses the requested
+`tests/bench_mega_moe_sm90.py` contract: Flash and Pro, M=
+8/16/32/64/128/256/512/1024/2048/4096/8192, one warmup, 50 observations for
+M<=128, three observations for M>=256, 20 launches per observation, explicit
+cold-L2 flushing, and the maximum-rank median. PR383 remains the sum of its
+native FP8 L1 and L2 kernels; R66 is the fused MXFP4 persistent kernel.
+
+| model | M | R66 us | PR383 us | R66 gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 302.762 | 301.160 | +0.53% |
+| Flash | 16 | 354.725 | 314.010 | +12.97% |
+| Flash | 32 | 344.835 | 329.506 | +4.65% |
+| Flash | 64 | 366.872 | 361.210 | +1.57% |
+| Flash | 128 | 475.981 | 435.668 | +9.25% |
+| Flash | 256 | 485.714 | 493.876 | -1.65% |
+| Flash | 512 | 888.185 | 900.257 | -1.34% |
+| Flash | 1024 | 1490.000 | 1506.433 | -1.09% |
+| Flash | 2048 | 2743.000 | 2722.000 | +0.77% |
+| Flash | 4096 | 5147.000 | 5060.000 | +1.72% |
+| Flash | 8192 | 9934.000 | 9825.000 | +1.11% |
+| Pro | 8 | 751.436 | 709.835 | +5.86% |
+| Pro | 16 | 1021.500 | 1007.957 | +1.34% |
+| Pro | 32 | 1034.000 | 1103.014 | -6.26% |
+| Pro | 64 | 1063.500 | 1156.148 | -8.01% |
+| Pro | 128 | 1227.000 | 1284.181 | -4.45% |
+| Pro | 256 | 1668.000 | 1633.804 | +2.09% |
+| Pro | 512 | 2530.000 | 2401.817 | +5.34% |
+| Pro | 1024 | 3905.000 | 4018.000 | -2.81% |
+| Pro | 2048 | 6948.000 | 7048.000 | -1.42% |
+| Pro | 4096 | 13002.000 | 12908.000 | +0.73% |
+| Pro | 8192 | 25293.000 | 24989.000 | +1.22% |
+
+The 22-point geometric gap is `+0.901%`. Pro now leads PR383 by `0.672%`
+overall and its small-M subset leads by `2.438%`, confirming that R66 did not
+disturb the already strong Pro small-M specializations. Flash large M is at
+effective parity (`-0.089%`), but Flash small M trails by `5.691%`, making it
+the dominant aggregate residual. Across both models, small and large M trail
+by `1.545%` and `0.366%`, respectively. The largest individual deficits are
+Flash M16 (`+12.97%`), Flash M128 (`+9.25%`), Pro M8 (`+5.86%`), and Pro M512
+(`+5.34%`). The terminal goal remains unmet; the next iteration targets the
+Flash M16/M128 critical paths without modifying the already-leading Pro
+small-M or Flash M256-M1024 buckets. Complete logs are under
+`iter153-r66-pr383-full-matrix` on the pod and local artifact root.
