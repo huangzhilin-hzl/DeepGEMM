@@ -5638,3 +5638,44 @@ poll traffic does not repay the added detection latency. R90 was reverted in
 full, and further sleep-value sweeps at this barrier are not justified.
 SourceCounters, gate, screen, and formal evidence are under `iter230` through
 `iter233`; R85 remains the accepted implementation.
+
+## Rejected R91: direct packed-BF16 epilogue for Flash M32
+
+R91 extended the direct packed-BF16 swap epilogue already retained at Flash
+M16 and Pro M16/M32 to exact Flash M32. The candidate consumed the 32 packed
+BF16x2 persistent values directly instead of expanding them into a 64-float
+temporary before the L1/L2 epilogue. No decoder, WGMMA, dispatch, or other
+specialization changed.
+
+Forced-ring-wrap correctness passed at `diff=0.000656`; the cubin retained 125
+registers/thread, zero stack/local allocation, and 1024 bytes static shared
+memory. The 20-observation screen was double-positive:
+
+| point | first R85 us | R91 us | change | second R85 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M32 max rank | 361.7120 | 351.7945 | -2.74% | 361.2450 | -2.62% |
+| Flash M32 rank 0 | 342.8745 | 333.6985 | -2.68% | 346.6350 | -3.73% |
+
+The first authoritative 50-observation A/B/A did not reproduce the result:
+
+| point | first R85 us | R91 us | change | second R85 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M32 max rank | 370.8065 | 360.4900 | -2.78% | 347.8355 | +3.64% |
+| Flash M32 rank 0 | 348.4845 | 333.7745 | -4.22% | 341.3965 | -2.23% |
+
+Matched one-rank NCU then rejected the intended instruction reduction:
+
+| metric | R85 | R91 | change |
+| --- | ---: | ---: | ---: |
+| duration us | 301.73 | 301.79 | +0.02% |
+| executed warp instructions | 72,077,051 | 73,466,457 | +1.93% |
+| executed thread instructions | 2,251,467,356 | 2,295,700,615 | +1.96% |
+| shared-store bank conflicts | 1,068,364 | 1,181,304 | +10.57% |
+| global-load sectors | 897,572 | 894,455 | -0.35% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+
+The direct path increases dynamic epilogue work at M32 and has no isolated
+latency benefit. The screen was distributed drift, so no third formal run was
+performed. R91 was reverted and the candidate extension rebuilt to R85.
+Correctness, screen, formal, and NCU evidence are under `iter234` through
+`iter237`.
