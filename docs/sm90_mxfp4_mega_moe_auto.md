@@ -5397,3 +5397,53 @@ PR383. Rank-0 medians are `324.3175/336.5480/303.6290 us`, leaving
 its frozen R84 parent, but it does not close Flash M16 outright. Build,
 correctness, screen, formal, NCU, NSYS, full-production, and PR383 evidence is
 archived under `iter207` through `iter212` on the pod and local artifact root.
+
+### R85 full Flash/Pro matrix versus PR383
+
+The committed R85 kernel was remeasured over the complete frozen 22-point
+matrix, followed immediately by PR383 on the same pod. Both logs contain all
+expected summaries.
+
+| model | M | R85 us | PR383 us | R85 gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 305.4725 | 305.1085 | +0.119% |
+| Flash | 16 | 324.1490 | 311.0770 | +4.202% |
+| Flash | 32 | 337.6540 | 325.3660 | +3.777% |
+| Flash | 64 | 360.9805 | 361.6625 | -0.189% |
+| Flash | 128 | 438.9910 | 429.8255 | +2.132% |
+| Flash | 256 | 489.7440 | 503.8010 | -2.790% |
+| Flash | 512 | 922.5290 | 900.8760 | +2.404% |
+| Flash | 1024 | 1495.0000 | 1509.8240 | -0.982% |
+| Flash | 2048 | 2728.0000 | 2745.7360 | -0.646% |
+| Flash | 4096 | 5143.0000 | 5053.0000 | +1.781% |
+| Flash | 8192 | 9896.0000 | 9875.0000 | +0.213% |
+| Pro | 8 | 759.7415 | 715.6680 | +6.158% |
+| Pro | 16 | 999.9960 | 1004.3380 | -0.432% |
+| Pro | 32 | 1031.0000 | 1100.8815 | -6.348% |
+| Pro | 64 | 1063.5000 | 1156.4840 | -8.040% |
+| Pro | 128 | 1218.5000 | 1281.8180 | -4.940% |
+| Pro | 256 | 1621.0000 | 1632.3780 | -0.697% |
+| Pro | 512 | 2504.0000 | 2402.4260 | +4.228% |
+| Pro | 1024 | 3882.0000 | 4019.0000 | -3.409% |
+| Pro | 2048 | 6879.0000 | 7026.0000 | -2.092% |
+| Pro | 4096 | 12966.0000 | 12892.0000 | +0.574% |
+| Pro | 8192 | 25288.0000 | 25096.0000 | +0.765% |
+
+| geometric-mean slice | R85 gap versus PR383 |
+| --- | ---: |
+| all 22 points | -0.250478% |
+| Flash | +0.890508% |
+| Pro | -1.378560% |
+| small M (`<=128`) | -0.458868% |
+| large M (`>=256`) | -0.076487% |
+| Flash small M | +1.992352% |
+| Flash large M | -0.018597% |
+| Pro small M | -2.851176% |
+| Pro large M | -0.134343% |
+
+R85 remains ahead in the all-point and small-M aggregates. The all-point lead
+is smaller than R84's prior-session `-0.512243%`, but untouched three-sample
+large-M points moved by several percent in both directions, so the difference
+cannot be attributed to the M16-only change. The reliable next target is the
+50-observation Pro M8 deficit at `+6.158%`; raw evidence is archived in
+`iter213-r85-pr383-full-matrix`.
