@@ -2199,9 +2199,14 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                             weight_half *
                                                 (kSwapABHalfAccumPerThread / 2) +
                                             chunk * 2;
+                                        // Matched cold-L2 A/B selects the
+                                        // endpoint buckets for both routed
+                                        // DSV4 models; M16/M32 retain scalar
+                                        // FP32 promotion.
                                         if constexpr (
                                                 kFastMath and
-                                                kHidden == 4096 and
+                                                (kHidden == 4096 or
+                                                 kHidden == 7168) and
                                                 kSmallMSwapAB and
                                                 (kMaxSwapABTokens == 8 or
                                                  kMaxSwapABTokens == 64)) {

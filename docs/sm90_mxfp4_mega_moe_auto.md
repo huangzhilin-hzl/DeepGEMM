@@ -3157,3 +3157,86 @@ future conversion experiment must reduce the packed E2M1-to-E4M3 bit path
 without adding per-row address or load instructions. Complete evidence is
 under `iter80-scale-byte-immediate-flash-m16` on the pod and local artifact
 root.
+
+## R48: packed BF16 HFMA2 promotion for Pro M8/M64/M128
+
+### Reason and direction
+
+R36 proved that swap-AB promotion can accumulate the packed BF16 persistent
+state with two `HFMA2` instructions instead of unpacking two BF16x2 values,
+issuing four scalar FP32 FMAs, and packing them again. Its final selector was
+restricted to Flash M8/M64; the equivalent Pro swap-AB path still used the
+scalar sequence. R48 extends the packed promotion only to routed Pro buckets
+with `kMaxSwapABTokens` 8 or 64. Those buckets correspond to the authoritative
+Pro M8, M64, and M128 points. Pro M16/M32 keep their existing packed epilogue
+and scalar promotion, while strict math and every regular-orientation kernel
+remain unchanged.
+
+The original H20 node became occupied by an unrelated long-lived inference
+process, so R48 used the idle eight-H20 node hosting
+`molou-deepgemm-sm90-h20-2050-0810`. Every comparison below is matched on that
+node with separate control/candidate JIT caches. No cross-node timing is used.
+
+### Correctness and resources
+
+All six Pro production scenarios pass on eight ranks. The changed points are:
+
+| Pro point | calc diff | ring-wrap check |
+| --- | ---: | --- |
+| M8 | 0.000734 | not required |
+| M64 | 0.000720 | pass |
+| M128 | 0.000709 | pass |
+
+The generated M8 cubin uses 107 registers/thread; M64 and M128 use 128. All
+three report `STACK=0`, `LOCAL=0`, and 1024 bytes of static shared memory.
+
+### Screening and formal performance
+
+The 20-observation, ten-warmup, 20-launch cold-L2 screen selected all three
+points against both R36 controls:
+
+| Pro point | first R36 us | R48 us | change | second R36 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| M8 | 841.450 | 836.696 | -0.57% | 857.706 | -2.45% |
+| M64 | 1222.0 | 1199.0 | -1.88% | 1219.0 | -1.64% |
+| M128 | 1413.0 | 1325.0 | -6.23% | 1406.0 | -5.76% |
+
+The formal run raises each point to 50 observations while retaining ten
+warmups, 20 launches per observation, cold L2, and maximum-rank medians:
+
+| Pro point | first R36 us | R48 us | change | second R36 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| M8 | 843.399 | 833.309 | -1.20% | 859.197 | -3.01% |
+| M64 | 1204.5 | 1180.0 | -2.03% | 1220.5 | -3.32% |
+| M128 | 1396.5 | 1308.5 | -6.30% | 1406.5 | -6.97% |
+
+The three-point geometric mean improves by `-3.20%` against the first control
+and `-4.45%` against the second. Complete screen and formal logs are under
+`iter81-pro-hfma2-screen` and `iter82-pro-hfma2-formal` on the pod and local
+artifact root.
+
+### NCU and NSYS attribution
+
+Matched one-rank, 48-expert Pro M128 profiling preserves the changed
+specialization while removing distributed replay skew:
+
+| NCU metric | R36 | R48 | change |
+| --- | ---: | ---: | ---: |
+| duration us | 1425.568 | 1351.392 | -5.20% |
+| executed warp instructions | 400,954,627 | 361,698,793 | -9.79% |
+| executed thread instructions | 12,647,261,800 | 11,390,901,496 | -9.93% |
+| shared-load bank conflicts | 12,425,066 | 12,431,216 | +0.05% |
+| global-load sectors | 24,957,733 | 24,957,489 | unchanged |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+
+Low-perturbation NSYS reports one 156-CTA fused kernel on both sides and a
+single-launch duration of `1322.750 us` for R36 versus `1244.382 us` for R48
+(`-5.93%`). The profiler evidence isolates the intended arithmetic reduction:
+roughly ten percent fewer executed instructions with unchanged global and
+shared traffic and no spill cost. Complete reports are under
+`iter83-pro-m128-hfma2-profiles` on the pod and local artifact root.
+
+R48 is retained. It materially closes the largest small-Pro gap without
+changing topology, communication, memory traffic, or the numerical contract.
+The terminal goal remains unmet; the next full candidate/PR383 matrix must
+measure the updated Flash and Pro gaps before selecting the next target.
