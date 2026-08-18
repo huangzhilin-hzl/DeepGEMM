@@ -3341,3 +3341,33 @@ The next experiment therefore targets the B128 expanded-tile publication,
 not launch topology, scale addressing, or local spill. Complete NCU reports,
 raw CSV, NSYS reports, and kernel summaries are under
 `iter85-r48-pr383-flash-m16-profiles` on the pod and local artifact root.
+
+## Rejected experiment R49: split Flash M16 expanded-B stores
+
+### Reason and direction
+
+R49 tested whether each lane's wide `STS.128` publication caused the measured
+expanded-B replay. Exact Flash M16 retained the same decoder, B128 byte layout,
+addresses, CTA topology, and barriers, but split every 16-byte store into two
+adjacent `STS.64` instructions. Eight-rank forced-ring-wrap correctness passed
+at `0.000645`; the official cubin remained spill-free at 114 registers/thread.
+
+Static SASS changed from 148 `STS.128` and two `STS.64` instructions to 20 and
+258 respectively. Matched one-rank/32-expert targeted NCU rejected the
+mechanism before distributed timing:
+
+| Flash M16 NCU metric | R48 | R49 | change |
+| --- | ---: | ---: | ---: |
+| duration us | 357.056 | 363.584 | +1.83% |
+| executed warp instructions | 73,211,822 | 74,745,571 | +2.10% |
+| executed thread instructions | 2,288,346,146 | 2,337,318,609 | +2.14% |
+| shared-load bank conflicts | 3,052,150 | 3,052,505 | +0.01% |
+| shared-store bank conflicts | 1,883,753 | 8,443,400 | +348.22% |
+| global-load sectors | 845,089 | 847,211 | +0.25% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+
+The wide store was not the source of replay; splitting it exposes more shared
+transactions and multiplies conflicts. R49 was fully reverted. Future layout
+work must change the lane-to-bank mapping or use a collective matrix store,
+not merely narrow the existing per-lane transaction. Complete evidence is
+under `iter86-split-sts64-flash-m16` on the pod and local artifact root.
