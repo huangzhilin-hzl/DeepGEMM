@@ -135,7 +135,7 @@ def _restore_sm90_mxfp4_scale_layout(
     hidden: int,
 ) -> torch.Tensor:
     """Restore the processed ``[K128,N,4]`` payload to logical scale rows."""
-    if hidden > 4096:
+    if hidden > 8192:
         return tensor
     num_experts, num_rows, num_k32_groups = tensor.shape
     assert num_k32_groups % 4 == 0

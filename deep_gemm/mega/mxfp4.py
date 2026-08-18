@@ -12,7 +12,7 @@ import torch
 
 MXFP4CheckpointWeights = Tuple[torch.Tensor, torch.Tensor]
 MXFP4ProcessedWeights = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-_SM90_MXFP4_COALESCED_SCALE_MAX_HIDDEN = 4096
+_SM90_MXFP4_COALESCED_SCALE_MAX_HIDDEN = 8192
 
 
 def _is_valid_sm90_mxfp4_hidden_size(hidden: int) -> bool:
@@ -331,7 +331,7 @@ def transform_weights_for_fp8_mxfp4_fused_mega_moe_sm90(
 
     Each result is ``(processed_e2m1, relative_ue8m0, weight_scale_2)``.
     ``weight_scale_2`` is FP32 ``[E]`` and includes the optional Humming
-    checkpoint secondary scale. For hidden sizes up to 4096, the scale tensor
+    checkpoint secondary scale. For hidden sizes up to 8192, the scale tensor
     keeps its public ``[E, N, K/32]`` shape but stores an opaque physical
     ``[E, K/128, N, 4]`` payload for coalesced producer-warp loads. Larger
     hidden sizes retain natural row-major storage. This is the only routed

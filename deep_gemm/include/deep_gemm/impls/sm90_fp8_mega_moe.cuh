@@ -547,11 +547,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr uint32_t SMEM_SFA_SIZE_PER_STAGE =
         kNumL2SFAKGroups * kL2SFAHalfStride * sizeof(float);
     // MXFP4 relative scales contain one UE8M0 byte per logical (N, K32)
-    // group. Small-hidden preprocessing stores K128 words contiguously across
-    // N; larger compute-bound shapes retain natural row-major storage. The B
+    // group. Preprocessing stores K128 words contiguously across N for the
+    // supported DSV4 hidden sizes; larger shapes retain natural row-major
+    // storage. The B
     // producer stages one word per output row alongside each packed-B tile.
     constexpr uint32_t kMXFP4WeightGranK = 32;
-    constexpr uint32_t kMXFP4CoalescedScaleMaxHidden = 4096;
+    constexpr uint32_t kMXFP4CoalescedScaleMaxHidden = 8192;
     constexpr uint32_t kNumMXFP4SFBKGroups = BLOCK_K / kMXFP4WeightGranK;
     constexpr uint32_t kL1MXFP4WeightSFStrideK = kHidden / kMXFP4WeightGranK;
     constexpr uint32_t kL2MXFP4WeightSFStrideK =

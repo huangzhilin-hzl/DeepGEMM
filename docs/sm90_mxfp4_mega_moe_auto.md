@@ -3516,3 +3516,67 @@ gap from `+6.963%` to `+3.420%` and the Flash small-M gap from `+25.220%` to
 where natural row-major scale storage still prevents the successful vector
 publication path. Complete logs are under `iter95-r52-pr383-full-matrix` on
 the pod and local artifact root.
+
+## R53: coalesce Pro weight-scale layout and vectorize publication
+
+### Reason and direction
+
+R51/R52 proved that four scalar scale transfers were a common small-M
+bottleneck, but the preprocessing contract limited K128-by-N coalescing to
+hidden sizes at or below 4096. R53 raises that limit to 8192, covering DSV4
+Pro hidden 7168. Its transformed scale payload is now physically
+`[E,K/128,N,4]`, so the existing small-M selector automatically replaces four
+strided scalar LDG/STS rounds with one `uint4` LDG and one `STS.128` per lane.
+The logical tensor shape, scale values, packed weights, decoder, WGMMA,
+scheduler, and epilogue are unchanged. Hidden sizes above 8192 retain the
+natural layout.
+
+All 14 CPU preprocessing contract tests pass. The eight-rank production Pro
+correctness suite passes M8, M16, M32, M64, M128, and M256, including forced
+ring wrap, with maximum normalized differences from `0.000704` to `0.000716`.
+The official one-rank M16 profiler cubins remain identical in resources at
+110 registers/thread, zero stack, zero local storage, and 1024 bytes static
+shared memory. The correctness log is under
+`iter96-coalesced-pro-sf-correctness`.
+
+The 20-observation cold-L2 screen retained every affected production point:
+
+| Pro point | first R52 us | R53 us | change | second R52 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| M8 | 867.307 | 842.593 | -2.85% | 877.141 | -3.94% |
+| M16 | 1099.500 | 1031.500 | -6.18% | 1102.000 | -6.40% |
+| M32 | 1138.500 | 1115.000 | -2.06% | 1135.000 | -1.76% |
+| M64 | 1189.500 | 1144.500 | -3.78% | 1198.000 | -4.47% |
+| M128 | 1334.000 | 1310.500 | -1.76% | 1323.000 | -0.94% |
+
+The formal A/B/A run uses one warmup, 50 observations, 20 launches per
+observation, cold L2, and the maximum-rank median:
+
+| Pro point | first R52 us | R53 us | change | second R52 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| M8 | 839.680 | 808.904 | -3.67% | 835.956 | -3.24% |
+| M16 | 1067.500 | 1027.000 | -3.79% | 1067.000 | -3.75% |
+| M32 | 1134.000 | 1088.000 | -4.06% | 1130.500 | -3.76% |
+| M64 | 1179.500 | 1132.500 | -3.98% | 1178.500 | -3.90% |
+| M128 | 1317.000 | 1288.000 | -2.20% | 1314.000 | -1.98% |
+
+Matched one-rank/48-expert Pro M16 profiling attributes the gain to the scale
+layout rather than launch noise:
+
+| NCU metric | R52 | R53 | change |
+| --- | ---: | ---: | ---: |
+| duration us | 1007.584 | 972.064 | -3.53% |
+| executed warp instructions | 264,581,994 | 262,632,129 | -0.74% |
+| executed thread instructions | 8,306,056,968 | 8,225,890,065 | -0.97% |
+| shared-load bank conflicts | 10,858,497 | 10,857,608 | -0.01% |
+| shared-store bank conflicts | 4,392,846 | 3,880,380 | -11.67% |
+| global-load sectors | 21,768,527 | 2,804,888 | -87.12% |
+| global-store sectors | 51,625 | 51,625 | unchanged |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+| barrier-stall ratio | 2.348 | 2.266 | -3.50% |
+| long-scoreboard ratio | 1.951 | 1.913 | -1.92% |
+
+NSYS independently measures the same launch at 929.890 us for R52 and
+894.466 us for R53 (`-3.81%`). Complete screening, formal, NCU, NSYS, and
+resource evidence is under `iter97-coalesced-pro-sf-screen` through
+`iter99-coalesced-pro-sf-profiles` on the pod and local artifact root.

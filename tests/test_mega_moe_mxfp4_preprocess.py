@@ -124,7 +124,7 @@ def test_canonical_transform_returns_processed_triples_and_interleaves_l1():
 
 
 def test_large_hidden_preserves_natural_scale_layout():
-    (l1_w, l1_sf), (l2_w, l2_sf) = _valid_checkpoint_weights(hidden=4608)
+    (l1_w, l1_sf), (l2_w, l2_sf) = _valid_checkpoint_weights(hidden=9216)
     l1_sf.copy_((
         109 + torch.arange(l1_sf.numel(), dtype=torch.int32).reshape(l1_sf.shape) % 4
     ).to(torch.uint8))
@@ -160,7 +160,8 @@ def test_hidden_size_contract_matches_vectorized_combine_chunks():
     assert not mxfp4._is_valid_sm90_mxfp4_hidden_size(8704)
     assert mxfp4._is_valid_sm90_mxfp4_hidden_size(9216)
     assert mxfp4._uses_coalesced_mxfp4_scales_sm90(4096)
-    assert not mxfp4._uses_coalesced_mxfp4_scales_sm90(4608)
+    assert mxfp4._uses_coalesced_mxfp4_scales_sm90(8192)
+    assert not mxfp4._uses_coalesced_mxfp4_scales_sm90(9216)
 
 
 def test_processed_sign_layout_is_invertible_and_has_golden_word():
