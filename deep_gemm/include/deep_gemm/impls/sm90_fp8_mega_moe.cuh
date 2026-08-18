@@ -1183,6 +1183,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         if (num_tokens <= BLOCK_M)
                             __nanosleep(64);
                     }
+                    // Flash M128 wraps padded expert blocks onto a second ring
+                    // generation. Briefly back off contending dispatch lanes.
+                    if constexpr (kNumRanks > 1 and kHidden == 4096) {
+                        if (num_tokens == 2 * BLOCK_M)
+                            __nanosleep(16);
+                    }
                 }
             }
 

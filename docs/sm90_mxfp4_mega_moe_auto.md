@@ -4459,3 +4459,52 @@ fully reverted before commit. Formal logs and the exact rejected source are
 under `iter142-flash-m128-poll-backoff-formal` on the pod and local artifact
 root. The terminal goal remains unmet; shorter polling or a schedule change
 must be measured independently rather than inferred from instruction counts.
+
+## R65: short Flash M128 ring-poll backoff
+
+### Reason and implementation
+
+R65 revisits the R64-attributed dispatch wait with a much shorter delay. Only
+the eight-rank Flash M128 specialization executes `__nanosleep(16)` after an
+unsuccessful acquire load of `l1_empty_count`; all Pro shapes, other Flash M,
+and one-rank profiling builds retain the original tight loop. The intent is to
+reduce redundant cross-rank polling traffic without withholding dispatch long
+enough to starve the next activation generation, as R64's 64-cycle delay did.
+
+The production forced-ring-wrap correctness scenario passes with the unchanged
+`diff=0.000658`. Two independent cold-L2 A/B/A runs were directionally
+consistent:
+
+| sample count | first R61 us | R65 us | change | second R61 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 20-observation screen | 515.198 | 512.308 | -0.56% | 514.350 | -0.40% |
+| 50-observation formal | 493.279 | 492.384 | -0.18% | 501.039 | -1.73% |
+
+The absolute gain is small, but four comparisons against independently placed
+controls have the same sign, so the narrowly selected change is retained.
+Correctness and timing logs are under
+`iter143-flash-m128-short-poll-backoff-screen` and
+`iter144-flash-m128-short-poll-backoff-formal`.
+
+### NCU and NSYS mechanism check
+
+Multi-process NCU replay cannot safely profile this persistent collective: it
+replays one rank while peers wait at a barrier, so both the application-replay
+and NVTX-range attempts were terminated without treating their partial output
+as evidence. Eight-rank NSYS also strongly perturbs rank scheduling: R61 and
+R65 totals were `93.305/244.737 ms`, with wide per-rank spreads. Those totals
+are intentionally excluded from the performance decision.
+
+Instead, a diagnostic one-rank build enabled the same 16-cycle delay at Flash
+M128 so the exact poll mechanism could be measured without collective replay.
+NCU shows global-load sectors falling from `1,062,666` to `1,034,466`
+(`-2.65%`), while executed warp/thread instructions rise only
+`0.36%/0.36%`; both variants use 126 registers, 110.816 KiB dynamic shared
+memory, and zero local load/store sectors. NCU duration moves
+`460.832 -> 462.816 us` (`+0.43%`), while NSYS measures
+`423.647 -> 423.167 us` (`-0.11%`). The diagnostic therefore confirms reduced
+poll traffic rather than a faster arithmetic path; the production eight-rank
+A/B/A timing remains the authority for acceptance. Reports and failed-profiler
+logs are under `iter145-flash-m128-short-poll-profiles`. The terminal aggregate
+target remains unmet, so the next iteration targets larger weighted residuals
+rather than extrapolating this point gain.
