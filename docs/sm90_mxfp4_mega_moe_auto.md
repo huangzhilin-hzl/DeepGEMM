@@ -4803,3 +4803,45 @@ dynamic shared memory, and zero local sectors. The local benefit is too small
 to control the production max-rank score, so the selector and temporary test
 were fully reverted. Evidence is under `iter163` through `iter166` on the pod
 and local artifact root.
+
+## Rejected R70-R75: retune Pro M8 ring-poll backoff
+
+R67's fresh matrix leaves Pro M8 `5.95%` behind PR383. Its one-block dispatch
+can wrap an L1 ring slot while the previous generation is still live, and the
+dispatch lanes then poll the cross-block empty counter. The production path
+already sleeps for 64 cycles inside that loop. R70-R75 isolated exact M8 and
+swept 16, 128, 256, 512, and 1024 cycles while leaving Pro M16-M64 and all
+Flash specializations unchanged. Every header-only variant used a fresh JIT
+cache. Exact eight-rank Pro M8 correctness passed at `diff=0.000716`.
+
+The first fresh-cache attempt failed before kernel generation because pod sync
+had copied host-absolute CUTLASS/CUTE symlinks. Restoring the pod-local links
+made the unchanged test pass; this environment failure is retained in the
+R70 artifact directory and is not counted as a kernel failure. The
+20-observation, one-warmup, 20-launch, cold-L2 A/B/A screens were:
+
+| M8 sleep cycles | first R67 us | candidate us | change | second R67 us | reverse change |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 | 781.166 | 795.726 | +1.86% | 776.644 | +2.46% |
+| 128 | 793.716 | 773.331 | -2.57% | 780.795 | -0.96% |
+| 256 | 794.429 | 766.031 | -3.57% | 784.375 | -2.34% |
+| 512 | 777.500 | 764.561 | -1.66% | 809.134 | -5.51% |
+| 1024 | 792.874 | 765.639 | -3.44% | 778.000 | -1.59% |
+
+Sixteen cycles is insufficient to suppress polling traffic. The 256-1024
+cycle results form a noise-sized plateau near `765 us`; 256 has the strongest
+two-sided screen lower bound and is the shortest delay, so R75 selected it
+for the authoritative 50-observation run:
+
+| point | first R67 us | R75 us | change | second R67 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pro M8 | 780.290 | 767.350 | -1.66% | 763.224 | +0.54% |
+
+The formal maximum-rank result changes sign against the faster reverse
+control, so the apparent screen gain is not reproducible under the acceptance
+contract. The candidate's rank-0 median (`751.060 us`) beats both controls
+(`756.952/752.388 us`), but the required maximum-rank score remains mixed.
+All polling changes were reverted; R67's 64-cycle path remains production.
+Complete logs are under `iter167` through `iter173` on the pod and local
+artifact root. The terminal goal remains unmet, and the next structural target
+returns to the stable Flash M16 residual instead of further sleep tuning.
