@@ -4697,3 +4697,47 @@ screening, formal timing, NCU, and NSYS artifacts are under `iter154` through
 `iter157` on the pod and local artifact root. The terminal aggregate target is
 still not assumed complete; R67 requires a fresh 22-point PR383 matrix before
 the next residual is selected.
+
+### R67 authoritative DSV4 matrix against PR383
+
+The fresh same-session matrix repeats the exact R66 contract on the same idle
+eight-H20 pod. Only Flash M128 has different generated source; movement at the
+other 21 points is retained for honest epoch pairing but is not attributed to
+R67.
+
+| model | M | R67 us | PR383 us | R67 gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 309.230 | 313.736 | -1.44% |
+| Flash | 16 | 348.065 | 316.442 | +9.99% |
+| Flash | 32 | 340.196 | 336.476 | +1.11% |
+| Flash | 64 | 371.346 | 366.626 | +1.29% |
+| Flash | 128 | 439.849 | 437.834 | +0.46% |
+| Flash | 256 | 518.505 | 502.696 | +3.14% |
+| Flash | 512 | 917.623 | 906.578 | +1.22% |
+| Flash | 1024 | 1493.000 | 1546.808 | -3.48% |
+| Flash | 2048 | 2804.000 | 2720.567 | +3.07% |
+| Flash | 4096 | 5120.000 | 5082.000 | +0.75% |
+| Flash | 8192 | 9959.000 | 9819.000 | +1.43% |
+| Pro | 8 | 754.309 | 711.933 | +5.95% |
+| Pro | 16 | 1033.500 | 1008.123 | +2.52% |
+| Pro | 32 | 1027.500 | 1105.444 | -7.05% |
+| Pro | 64 | 1071.000 | 1162.555 | -7.88% |
+| Pro | 128 | 1228.500 | 1277.919 | -3.87% |
+| Pro | 256 | 1622.000 | 1618.674 | +0.21% |
+| Pro | 512 | 2526.000 | 2415.377 | +4.58% |
+| Pro | 1024 | 3909.000 | 4010.000 | -2.52% |
+| Pro | 2048 | 6872.000 | 7033.000 | -2.29% |
+| Pro | 4096 | 12968.000 | 12956.000 | +0.09% |
+| Pro | 8192 | 25297.000 | 25066.000 | +0.92% |
+
+The 22-point geometric gap falls from R66's `+0.901%` to `+0.296%`. Small M
+across both models now leads by `0.027%`, while large M trails by `0.566%`.
+Flash remains `+1.545%` overall (`+2.207%` small, `+0.996%` large); Pro leads
+by `0.938%` overall and `2.213%` at small M, with large Pro at effective
+parity (`+0.138%`). The changed Flash M128 point closes from `+9.25%` to
+`+0.46%`, consistent with the direct A/B/A and profiler evidence. Flash
+M16 (`+9.99%`), Pro M8 (`+5.95%`), and Pro M512 (`+4.58%`) are the largest
+stable residuals. Flash M256/M2048 moved in source-identical code and remain
+epoch-sensitive, so they are not selected from one three-observation matrix.
+The terminal goal is still unmet by `0.296%`; complete paired logs are under
+`iter158-r67-pr383-full-matrix` on the pod and local artifact root.
