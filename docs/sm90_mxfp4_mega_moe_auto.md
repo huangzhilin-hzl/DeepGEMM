@@ -2960,3 +2960,53 @@ Future small-M work should preserve two independent resident CTAs and reduce
 per-CTA fixed work, or move work onto currently underused producer/dispatch
 warps without reducing the number of resident WGMMA owners. Complete evidence
 is under `iter75-wide-flash-m16` on the pod and local artifact root.
+
+## Rejected experiment R44: producer-warp Flash M16 decode
+
+### Reason and direction
+
+R44 preserved R36's 156 independent M64N128 CTAs and moved exact Flash M16
+packed-B expansion from the 128-thread math warpgroup to the two 32-thread TMA
+producer warps. Each producer owned 64 B rows and published completion through
+a per-stage barrier. The intent was to overlap stage N+1 decode with stage N
+WGMMA and promotion while keeping two resident WGMMA owners per H20 SM.
+
+The fully unrolled decoder passed eight-rank forced-ring-wrap correctness but
+compiled at `REG=128, STACK=136`. A lower-live-range single-word version was
+worse at `STACK=144`. Serializing its three small source loops finally produced
+an official eight-rank cubin at `REG=128, STACK=0, LOCAL=0`; correctness still
+passed at `0.000645`. Only this zero-stack form entered distributed timing.
+
+### Performance and profiler result
+
+The 20-observation, ten-warmup, 20-launch cold-L2 A/B/A screen was decisive:
+
+| Flash point | first R36 us | R44 us | change | second R36 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| M16 | 439.522 | 1519.000 | +245.6% | 428.021 | +254.9% |
+
+The official cubin's zero stack rules out local-memory spill as the cause of
+this regression. An isolated one-rank NCU comparison also showed that the
+looped producer implementation nearly doubled dynamic work:
+
+| isolated Flash M16 metric | R36 | R44 | change |
+| --- | ---: | ---: | ---: |
+| duration | 367.616 us | 1.738944 ms | +373.0% |
+| executed warp instructions | 73,208,071 | 141,328,773 | +93.0% |
+| executed thread instructions | 2,288,416,839 | 4,452,359,001 | +94.6% |
+| global-load sectors | 844,605 | 944,829 | +11.9% |
+| local load/store sectors | 0 / 0 | 13,184 / 13,696 | isolated candidate only |
+
+The one-rank specialization did spill, so its absolute NCU duration is not
+used as the acceptance result. A separate eight-rank NSYS capture exercised
+the official zero-stack specialization and measured the fastest captured
+kernel instance at `473.631 us` for R36 versus `1786.152 us` for R44
+(`+277.1%`); slower child-process instances were profiler-serialized.
+
+Moving expansion to two producer warps therefore traded four-way math-WG
+decode parallelism for two serial loop nests and placed decode directly in
+front of the producer pipeline's next TMA issue. The intended overlap did not
+materialize. R44 was fully reverted. Future producer assistance must split a
+small, independently useful fraction of decode without serializing the full
+tile or delaying producer advance. Complete evidence is under
+`iter76-producer-decode-flash-m16` on the pod and local artifact root.
