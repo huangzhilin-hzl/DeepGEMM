@@ -5195,3 +5195,25 @@ R78's `-0.088%` aggregate lead, validates keeping R82, and identifies Flash
 M8/M16/M32 plus Pro M8/M512 as the next optimization targets. Raw evidence is
 archived under `iter196-r82-pr383-full-matrix` on the pod and local artifact
 root.
+
+## Rejected R83: extend the packed epilogue to Flash M8
+
+R83 tested whether R82's packed-BF16 epilogue benefit transfers to the largest
+remaining Flash deficit. The only generator change selected the packed path
+for routed `hidden=4096, M=8`; all other specializations remained identical to
+R82. Exact eight-rank correctness passed at `diff=0.000671`. The cubin used 118
+registers, zero stack/local storage, and 110.816 KiB dynamic shared memory, so
+the three-register increase over the unpacked path did not change occupancy.
+
+The 20-observation, one-warmup, 20-launch, cold-L2 A/B/A screen was negative in
+both directions:
+
+| point | first R78/R82 us | R83 us | change | second R78/R82 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M8 | 320.1905 | 331.0175 | +3.38% | 326.3920 | +1.42% |
+
+Unlike M16, eliminating the float expansion does not shorten the M8 critical
+path. The extra packed-epilogue instructions/registers instead add work to a
+bucket dominated by cross-rank tail latency. R83 was fully reverted before
+commit. Build, correctness, resource, and screen evidence is archived under
+`iter197` and `iter198` on the pod and local artifact root.
