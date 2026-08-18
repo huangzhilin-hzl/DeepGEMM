@@ -5527,3 +5527,81 @@ Even at high count-at-most-two coverage, the extra popcount and per-token
 round branch cost more than retaining the R85 fallback for duplicate routes.
 R88 was reverted in full and not committed. Evidence is archived under
 `iter219` through `iter221`.
+
+## R85 fresh Pro M8 profile versus PR383
+
+R85's complete matrix left exact Pro M8 `+6.158%` behind PR383 under the
+authoritative eight-rank, 50-observation, 20-launch, cold-L2 maximum-rank
+contract. A fresh matched one-rank profile keeps the production shard size at
+48 experts and removes distributed replay noise. The PR383 values below sum
+its native FP8 L1 and L2 kernels:
+
+| metric | R85 fused | PR383 L1+L2 | R85 excess |
+| --- | ---: | ---: | ---: |
+| NCU duration us | 715.04 | 707.74 | +1.03% |
+| executed warp instructions | 172,497,197 | 125,804,562 | +37.11% |
+| executed thread instructions | 5,380,206,390 | 3,753,162,184 | +43.35% |
+| global-load sectors | 2,202,710 | 1,736,854 | +26.82% |
+| shared-load bank conflicts | 7,864 | 27,895 | -71.81% |
+| shared-store bank conflicts | 3,843,854 | 30,741 | +12,404.34% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+
+The remaining local latency gap is only about one percent despite the much
+larger instruction and load counts, so the six-percent production residual is
+not explained by one-rank arithmetic alone. Rank-0-only eight-rank NSYS is
+kept as qualitative evidence: R85 records one `1176.703 us` fused kernel,
+whereas PR383 records `689.344 + 624.223 = 1313.567 us`. The profiler changes
+cross-rank arrival and even makes the fused compute interval appear faster;
+it is therefore not used for acceptance. Reports and traces are under
+`iter222-r85-pr383-pro-m8-profiles`.
+
+## Rejected R89: sparse dispatch completion for Pro M8
+
+R89 tested the existing sparse dispatch-completion protocol at exact Pro M8.
+The dense path issues one completion atomic for every expert from every CTA,
+including zero local counts. The sparse path issues only nonzero-count
+atomics, uses the existing grid/NVLink rendezvous for completion, then lets
+SM0 aggregate the eight rank-local counts. Flash M32 and M1024 already use
+this protocol, but Pro M8 had not been tested. The host selector was exact, so
+the other 21 authoritative points were unchanged.
+
+The first screen accidentally used the stale pre-R89 Python extension. Its
+generated `kernel.cu` did not contain `DG_SM90_SPARSE_DISPATCH_COMPLETION`, so
+the apparent `2.79%/1.74%` improvement in `iter223` and the matching formal
+run in `iter224` are explicitly invalid and retained only as an environment
+audit. The old extension was then copied to an immutable R85 control path,
+the candidate extension was rebuilt, and a fresh JIT cache verified the macro
+in generated source. Exact eight-rank correctness passed at `diff=0.000716`.
+
+The valid 20-observation screen was double-positive at maximum rank:
+
+| point | first R85 us | R89 us | change | second R85 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pro M8 max rank | 774.1740 | 770.2425 | -0.51% | 799.1375 | -3.62% |
+| Pro M8 rank 0 | 759.5080 | 768.5690 | +1.19% | 784.2485 | -2.00% |
+
+The authoritative 50-observation A/B/A did not retain the screen gain:
+
+| point | first R85 us | R89 us | change | second R85 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pro M8 max rank | 765.2960 | 765.5465 | +0.033% | 765.5160 | +0.004% |
+| Pro M8 rank 0 | 746.0815 | 750.4770 | +0.59% | 744.7555 | +0.77% |
+
+Matched one-rank NCU confirms that the intended atomic reduction is real but
+offset elsewhere:
+
+| metric | R85 dense | R89 sparse | change |
+| --- | ---: | ---: | ---: |
+| NCU duration us | 714.59 | 719.90 | +0.74% |
+| L1 global atomic sectors | 6,408 | 4,536 | -29.21% |
+| L2 atomic sectors | 9,359 | 6,631 | -29.15% |
+| global-load sectors | 2,204,909 | 2,215,307 | +0.47% |
+| executed warp instructions | 172,492,160 | 172,491,772 | -0.0002% |
+| executed thread instructions | 5,380,201,593 | 5,380,115,550 | -0.0016% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+
+The added count aggregation and rendezvous loads consume the atomic saving;
+the formal maximum-rank result is exactly flat and rank 0 regresses against
+both controls. R89 was reverted in source and the candidate extension was
+rebuilt byte-identical to the frozen R85 extension. Valid evidence is under
+`iter226` through `iter229`; R85 remains the accepted implementation.
