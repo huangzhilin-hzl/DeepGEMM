@@ -4416,3 +4416,46 @@ gap. All selector plumbing was reverted and the original R61 extension ABI
 restored. Evidence, including the initial stale-extension compile failure and
 the successful matched rerun, is under
 `iter140-single-block-flash-m128-screen` on the pod and local artifact root.
+
+## Rejected R64: back off Flash M128 ring-reuse polling
+
+### R61 versus PR383 attribution
+
+A matched one-rank, 32-expert profile first compared the fused R61 Flash M128
+kernel with PR383's native L1 and L2 kernels. NCU measured R61 at `460.448 us`
+versus `259.744 + 163.104 = 422.848 us` for PR383 (`+8.89%`); NSYS measured
+`423.391 us` versus `244.160 + 150.719 = 394.879 us` (`+7.22%`). R61 executes
+`90,812,797` warp instructions and `2,843,464,552` thread instructions versus
+PR383's summed `76,008,346` and `2,330,575,415` (`+19.48%/+22.01%`). Both
+paths remain spill-free.
+
+SourceCounters then localized the largest extra instruction stream to a
+single acquire-poll loop: `LDG.E.STRONG.GPU`, `CCTL.IVALL`, `YIELD`, compare,
+and branch execute `566,230` times. The loop is dispatch's wait for
+`l1_empty_count` before overwriting a previous ring generation. Its 768 loop
+entries match the 768 Flash M128 routed tokens that wrap onto the second
+physical-ring generation. This is a stronger attribution than the remaining
+shared-memory conflicts: R61 has only `14,723` shared-load conflicts, while
+its shared-store conflicts (`1,437,753`) are concentrated in the BF16 L2
+epilogue materialization shared with the output path. The matched NCU/NSYS
+reports are under `iter141-flash-m128-pr383-profiles`.
+
+### Experiment and rejection
+
+R64 added `__nanosleep(64)` only inside that Flash M128 ring-reuse poll;
+every other Flash M and every Pro specialization retained R61 source. The
+eight-rank forced-wrap correctness case passed with the unchanged
+`diff=0.000658`. The authoritative one-warmup, 50-observation, 20-launch,
+cold-L2 A/B/A result was:
+
+| point | first R61 us | R64 us | change | second R61 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M128 | 494.484 | 505.188 | +2.16% | 497.108 | +1.63% |
+
+The double regression shows that this spin traffic is a symptom of the live
+ring dependency, not latency that a 64-cycle sleep can hide: delaying dispatch
+also delays the next generation's activation supply. The source change was
+fully reverted before commit. Formal logs and the exact rejected source are
+under `iter142-flash-m128-poll-backoff-formal` on the pod and local artifact
+root. The terminal goal remains unmet; shorter polling or a schedule change
+must be measured independently rather than inferred from instruction counts.
