@@ -4873,3 +4873,35 @@ The intended instruction reduction is absent and the measured duration moves
 in the wrong direction. R76 was therefore stopped at the profiler gate before
 distributed timing or NSYS, fully reverted, and is not part of R67. Evidence
 is under `iter174` and `iter175` on the pod and local artifact root.
+
+## Rejected R77: pipelined packed-BF16 epilogue for Flash M16
+
+R06's old Flash packed-epilogue prototype regressed M16 while also disabling
+the later accepted separate-commit-group weight-half pipeline. R77 tested the
+previously uncovered combination: exact routed Flash M16 consumed the packed
+BF16 persistent result directly in both epilogues, but retained two compact
+weight-half fragments, separate WGMMA commit groups, `wait<1>` overlap, and
+the current bank-permuted decoder. Eight-rank correctness passed at
+`diff=0.000645`. Both the production and matched one-rank cubins remained at
+114 registers, zero stack/local storage, and 110.816 KiB dynamic shared
+memory, so the combination avoided R06's historical spill/scheduling issue.
+
+Matched one-rank/32-expert NCU nevertheless showed that compiler motion had
+already eliminated nearly all of the intended explicit BF16x2-to-FP32
+expansion cost:
+
+| metric | R67 | R77 | change |
+| --- | ---: | ---: | ---: |
+| NCU duration us | 276.54 | 276.32 | -0.08% |
+| executed warp instructions | 72,364,043 | 72,316,358 | -0.066% |
+| executed thread instructions | 2,261,797,640 | 2,260,417,397 | -0.061% |
+| shared-load bank conflicts | 6,054 | 5,814 | -3.96% |
+| shared-store bank conflicts | 1,021,743 | 1,042,610 | +2.04% |
+| global-load sectors | 837,015 | 833,381 | -0.43% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+
+Tensor-pipe activity (`3.94% -> 3.96%`) and barrier/long-/short-scoreboard
+ratios (`2.49/2.20/0.58 -> 2.50/2.20/0.58`) are also unchanged. With neither
+a material instruction reduction nor a profiler time signal, R77 was stopped
+before distributed timing or NSYS and fully reverted. Evidence is under
+`iter176` and `iter177` on the pod and local artifact root.
