@@ -3622,3 +3622,63 @@ with M32 and M64 now faster than PR383. The dominant next targets are Flash
 M16/M32/M128 and Pro M8. Complete logs, including the harmless failed nested
 launcher attempt that exited before measurement, are under
 `iter100-r53-pr383-full-matrix` on the pod and local artifact root.
+
+## R54: vectorize coalesced scale publication for regular buckets
+
+### Reason and direction
+
+R51/R52 restricted the 128-word vector scale transfer to swap-AB small-M
+buckets even though the R53 preprocessing contract makes the same contiguous
+K128-by-N payload available to every DSV4 routed bucket. R54 removes that
+selector restriction. The B producer now uses 32 aligned `uint4` loads and
+32 `STS.128` stores instead of 128 scalar load/store pairs whenever the scale
+payload is coalesced, including regular M128 and compute-bound buckets. Tensor
+contents, shared-memory addresses, barriers, decoder math, WGMMA, scheduler,
+and epilogue are unchanged.
+
+The eight-rank production correctness suite passes all 12 Flash and Pro
+scenarios, including forced ring wrap and Flash M1024, with maximum normalized
+differences from `0.000645` to `0.000716`.
+
+The cold-L2 R53/R54/R53 screen uses one warmup, 20 observations, 20 launches
+per observation, and the maximum-rank median:
+
+| point | first R53 us | R54 us | change | second R53 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M128 | 501.841 | 502.085 | +0.05% | 504.548 | -0.49% |
+| Flash M256 | 519.997 | 513.417 | -1.27% | 506.169 | +1.43% |
+| Flash M512 | 907.300 | 891.237 | -1.77% | 909.517 | -2.01% |
+| Flash M1024 | 1519.500 | 1502.000 | -1.15% | 1515.500 | -0.89% |
+| Flash M2048 | 2775.000 | 2762.500 | -0.45% | 2777.500 | -0.54% |
+| Pro M128 | 1333.000 | 1312.500 | -1.54% | 1297.500 | +1.16% |
+| Pro M256 | 1685.500 | 1613.000 | -4.30% | 1673.500 | -3.62% |
+| Pro M512 | 2610.500 | 2545.000 | -2.51% | 2624.000 | -3.01% |
+| Pro M1024 | 3988.000 | 3926.000 | -1.55% | 3998.500 | -1.81% |
+| Pro M2048 | 7044.500 | 6951.500 | -1.32% | 7031.000 | -1.13% |
+
+Flash M128 is neutral and Flash M256/Pro M128 are noisy, but both controls
+confirm the gains at Flash M512-M2048 and Pro M256-M2048.
+
+Matched one-rank/48-expert Pro M256 profiling confirms that the regular-bucket
+gain comes from cheaper scale publication:
+
+| NCU metric | R53 | R54 | change |
+| --- | ---: | ---: | ---: |
+| duration us | 1707.136 | 1683.648 | -1.38% |
+| executed warp instructions | 360,929,083 | 355,936,482 | -1.38% |
+| executed thread instructions | 11,332,121,648 | 11,174,378,476 | -1.39% |
+| shared-load bank conflicts | 12,453,519 | 12,449,291 | -0.03% |
+| shared-store bank conflicts | 6,779,777 | 5,141,683 | -24.16% |
+| global-load sectors | 3,321,830 | 3,317,405 | -0.13% |
+| global-store sectors | 792,460 | 792,454 | unchanged |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+| barrier-stall ratio | 3.627 | 4.034 | +11.22% |
+| long-scoreboard ratio | 2.717 | 2.447 | -9.93% |
+
+NSYS independently measures the same launch at 1605.827 us for R53 and
+1540.579 us for R54 (`-4.06%`). Exact profiler cubins remain identical in
+resources at 128 registers/thread, zero stack, zero local storage, and 1024
+bytes static shared memory. Complete correctness, screen, NCU, NSYS, and
+resource evidence is under `iter101-vector-all-coalesced-sf-correctness`
+through `iter103-vector-all-coalesced-sf-profiles` on the pod and local
+artifact root.

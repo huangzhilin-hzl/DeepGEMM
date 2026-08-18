@@ -1472,12 +1472,11 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     const auto* weight_sf_base = (is_linear1_phase ?
                         l1_mxfp4_weights_sf : l2_mxfp4_weights_sf) +
                         local_expert_idx * weight_sf_per_expert;
-                    if constexpr (kCoalescedMXFP4WeightSF and
-                                  kSmallMSwapAB) {
-                        // The preprocessed Flash layout makes all 128 K128
-                        // scale words contiguous in N. Coalesce the producer's
-                        // four scalar transfers into one 16-byte transaction
-                        // per lane for the latency-critical small-M buckets.
+                    if constexpr (kCoalescedMXFP4WeightSF) {
+                        // The preprocessed layout makes all 128 K128 scale
+                        // words contiguous in N. Coalesce the producer's four
+                        // scalar transfers into one 16-byte transaction per
+                        // lane for every routed bucket.
                         const auto* weight_sf_words =
                             reinterpret_cast<const uint32_t*>(weight_sf_base) +
                             k_block_idx * shape_n + local_n_idx;
