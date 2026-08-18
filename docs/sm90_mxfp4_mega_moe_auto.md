@@ -4741,3 +4741,34 @@ stable residuals. Flash M256/M2048 moved in source-identical code and remain
 epoch-sensitive, so they are not selected from one three-observation matrix.
 The terminal goal is still unmet by `0.296%`; complete paired logs are under
 `iter158-r67-pr383-full-matrix` on the pod and local artifact root.
+
+## Rejected R68: mature-path Flash M16 HFMA2 promotion
+
+R68 retested packed BF16 HFMA2 promotion at exact Flash M16. The old R36
+experiment was mixed before M16 gained vectorized scale staging and the
+bank-permuted decoder, so this run asked whether the current register schedule
+could finally benefit from replacing unpack, four scalar FP32 FMAs, and repack
+with two packed operations. A dedicated JIT cache forced recompilation of the
+header-only prototype. Eight-rank forced-ring-wrap correctness passed at
+`diff=0.000654`.
+
+The 20-observation R67/R68/R67 screen was positive at
+`354.249/336.460/361.978 us` (`-5.02%/-7.05%`). The authoritative
+50-observation run did not reproduce it:
+
+| point | first R67 us | R68 us | change | second R67 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M16 | 371.614 | 377.333 | +1.54% | 387.561 | -2.64% |
+
+Matched one-rank/32-expert profiling shows that the local arithmetic change is
+real but too small to control the eight-rank maximum. NCU duration moves
+`299.424 -> 292.768 us` (`-2.22%`), warp/thread instructions fall
+`72,366,234 -> 68,741,400` (`-5.01%`) and
+`2,261,847,566 -> 2,145,999,348` (`-5.12%`), and NSYS moves
+`277.952 -> 270.592 us` (`-2.65%`). Both variants remain at 114 registers,
+110.816 KiB dynamic shared memory, and zero local load/store sectors; shared
+store conflicts increase from `994,555` to `1,065,178` (`+7.10%`). The
+formal sign reversal therefore reflects a gain smaller than distributed
+scheduling variance, not spill damage. The source change was fully reverted
+and is not part of R67. Evidence is under `iter159` through `iter162` on the
+pod and local artifact root.
