@@ -1116,17 +1116,36 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 }
             }
 
-            // Round-robin rank selection (identical to SM100)
-            uint32_t current_rank_in_expert_idx;
+            uint32_t current_rank_in_expert_idx = 0;
+            uint32_t token_idx_in_rank = 0;
+            const uint32_t token_idx_in_expert = token_idx - expert_start_idx;
+
+            // At Flash M8, almost every expert receives at most one route from
+            // each source rank. Select the source directly from the nonempty
+            // mask in that common case; preserve the general round-robin path
+            // for duplicate routes from any rank.
+            bool used_single_slot_rank_selection = false;
+            if constexpr (kSmallMSwapAB and kHidden == 4096 and
+                          kMaxSwapABTokens == 8 and kNumRanks <= 32) {
+                const uint32_t multi_slot_rank_mask = __ballot_sync(
+                    0xffffffff, stored_rank_count[0] > 1);
+                if (multi_slot_rank_mask == 0) {
+                    const uint32_t nonempty_rank_mask = __ballot_sync(
+                        0xffffffff, stored_rank_count[0] != 0);
+                    current_rank_in_expert_idx = __fns(
+                        nonempty_rank_mask, 0, token_idx_in_expert + 1);
+                    used_single_slot_rank_selection = true;
+                }
+            }
+
+            // General round-robin rank selection (identical to SM100).
             uint32_t remaining[kNumRanksPerLane];
             #pragma unroll
             for (uint32_t i = 0; i < kNumRanksPerLane; ++ i)
                 remaining[i] = stored_rank_count[i];
             uint32_t offset = 0;
-            uint32_t token_idx_in_expert = token_idx - expert_start_idx;
             uint32_t slot_idx = token_idx_in_expert;
-            uint32_t token_idx_in_rank;
-            while (true) {
+            while (not used_single_slot_rank_selection) {
                 uint32_t num_actives_in_lane = 0;
                 uint32_t min_in_lane = 0xffffffff;
                 #pragma unroll

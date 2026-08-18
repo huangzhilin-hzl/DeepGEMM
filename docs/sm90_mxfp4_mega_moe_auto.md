@@ -5217,3 +5217,67 @@ path. The extra packed-epilogue instructions/registers instead add work to a
 bucket dominated by cross-rank tail latency. R83 was fully reverted before
 commit. Build, correctness, resource, and screen evidence is archived under
 `iter197` and `iter198` on the pod and local artifact root.
+
+## R84: direct source-rank lookup for Flash M8 dispatch pull
+
+### Fresh diagnosis and implementation direction
+
+Fresh matched profiling first separated local compute from distributed tail
+latency. One-rank/32-expert NCU measured the unchanged R82 Flash M8 kernel at
+`224.064 us`, versus `253.568 us` for the sum of PR383 L1 and L2 (`-11.64%`).
+Low-perturbation one-rank NSYS agreed at `208.096 us` versus `245.632 us`
+(`-15.28%`). In contrast, rank-0-only tracing in a real eight-rank launch
+measured `703.136 us` for R82 and `441.888 + 130.815 = 572.703 us` for PR383
+(`+22.78%`). R82 also executes 47.43M warp instructions versus PR383's 38.38M,
+but the local-time lead shows that the remaining production deficit is in the
+distributed frontend/tail rather than MXFP4 matrix throughput. Complete R82
+and PR383 NCU/NSYS evidence is under `iter199`.
+
+The dispatch pull loop previously reconstructed round-robin source ownership
+for every received token using warp reductions, division, and a decrementing
+loop. At Flash M8, a local expert normally receives at most one token from any
+one of the eight source ranks. R84 detects that common case with a ballot and
+selects the source directly from the nonempty-rank mask. If any source rank
+contributed more than one token to the current expert, the code falls back to
+the byte-for-byte general round-robin path. The compile-time guard is exact for
+routed `hidden=4096`, swap-AB M8, and at most 32 ranks, so M16+, Pro, shared
+experts, and larger-rank configurations retain the old path.
+
+Exact eight-rank Flash M8 correctness passes at `diff=0.000671`. The cubin is
+unchanged at 114 registers, zero stack/local storage, and 110.816 KiB dynamic
+shared memory. All 13 production scenarios subsequently pass, including every
+forced ring-wrap case.
+
+### Screening and formal performance
+
+The 20-observation screen straddled the two controls at max rank but improved
+rank 0 against both, so it was escalated rather than accepted:
+
+| point | first R82 us | R84 us | change | second R82 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M8 max rank | 303.4205 | 306.1375 | +0.90% | 314.0120 | -2.51% |
+| Flash M8 rank 0 | 291.8550 | 289.7255 | -0.73% | 304.1305 | -4.74% |
+
+The authoritative one-warmup, 50-observation, 20-launch, cold-L2 A/B/A run is
+double-positive at both max rank and rank 0:
+
+| point | first R82 us | R84 us | change | second R82 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M8 max rank | 302.1180 | 291.9370 | -3.37% | 311.3570 | -6.24% |
+| Flash M8 rank 0 | 297.8795 | 282.6225 | -5.12% | 289.7120 | -2.45% |
+
+One-rank NCU only partially exercises the new common case because duplicate
+routes from its sole source rank intentionally select the fallback. It
+therefore shows the safety-path cost rather than the eight-rank gain: duration
+moves `224.064 -> 223.488 us` (`-0.26%`), warp/thread instructions are flat at
+47.43M/1.476B, local traffic remains zero, and registers are unchanged. A real
+eight-rank rank-0-only NSYS launch moves `703.136 -> 701.728 us` (`-0.20%`);
+the profiler-induced cross-rank wait makes this single launch topology
+evidence, while the formal A/B/A above remains the acceptance authority.
+
+A same-session PR383/R84/PR383 50-observation comparison measures
+`297.2525/315.0020/299.6185 us`. R84 remains `5.97%/5.13%` behind PR383 at
+Flash M8, but approximately halves R82's fresh `+10.23%` full-matrix deficit.
+The remaining M8 gap is still distributed synchronization/tail latency. Gate,
+screen, formal, profiler, full-production, and PR383 evidence is archived
+under `iter200` through `iter205` on the pod and local artifact root.
