@@ -1471,27 +1471,50 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     const auto* weight_sf_base = (is_linear1_phase ?
                         l1_mxfp4_weights_sf : l2_mxfp4_weights_sf) +
                         local_expert_idx * weight_sf_per_expert;
-                    #pragma unroll
-                    for (uint32_t local_n = lane_idx; local_n < BLOCK_N;
-                         local_n += 32) {
-                        uint32_t scale_word;
-                        if constexpr (kCoalescedMXFP4WeightSF) {
-                            const auto* weight_sf_words =
-                                reinterpret_cast<const uint32_t*>(weight_sf_base) +
-                                k_block_idx * shape_n;
-                            scale_word = __ldg(
-                                weight_sf_words + local_n_idx + local_n);
-                        } else {
-                            scale_word = __ldg(
-                                reinterpret_cast<const uint32_t*>(
-                                    weight_sf_base +
-                                    (local_n_idx + local_n) * weight_sf_stride_k +
-                                    k_block_idx * kNumMXFP4SFBKGroups));
-                        }
+                    if constexpr (kCoalescedMXFP4WeightSF and
+                                  kSmallMSwapAB and
+                                  kMaxSwapABTokens == 16) {
+                        // The preprocessed Flash layout makes all 128 K128
+                        // scale words contiguous in N. Coalesce the producer's
+                        // four scalar transfers into one 16-byte transaction
+                        // per lane for the latency-critical M16 bucket.
+                        const auto* weight_sf_words =
+                            reinterpret_cast<const uint32_t*>(weight_sf_base) +
+                            k_block_idx * shape_n + local_n_idx;
+                        const uint4 scale_words = __ldg(
+                            reinterpret_cast<const uint4*>(weight_sf_words) +
+                            lane_idx);
                         ptx::st_shared(
-                            reinterpret_cast<uint32_t*>(smem_sfb[stage_idx]) +
-                                local_n,
-                            scale_word);
+                            reinterpret_cast<uint4*>(smem_sfb[stage_idx]) +
+                                lane_idx,
+                            scale_words.x, scale_words.y,
+                            scale_words.z, scale_words.w);
+                    } else {
+                        #pragma unroll
+                        for (uint32_t local_n = lane_idx; local_n < BLOCK_N;
+                             local_n += 32) {
+                            uint32_t scale_word;
+                            if constexpr (kCoalescedMXFP4WeightSF) {
+                                const auto* weight_sf_words =
+                                    reinterpret_cast<const uint32_t*>(
+                                        weight_sf_base) +
+                                    k_block_idx * shape_n;
+                                scale_word = __ldg(
+                                    weight_sf_words + local_n_idx + local_n);
+                            } else {
+                                scale_word = __ldg(
+                                    reinterpret_cast<const uint32_t*>(
+                                        weight_sf_base +
+                                        (local_n_idx + local_n) *
+                                            weight_sf_stride_k +
+                                        k_block_idx *
+                                            kNumMXFP4SFBKGroups));
+                            }
+                            ptx::st_shared(
+                                reinterpret_cast<uint32_t*>(
+                                    smem_sfb[stage_idx]) + local_n,
+                                scale_word);
+                        }
                     }
                     __syncwarp();
                 }

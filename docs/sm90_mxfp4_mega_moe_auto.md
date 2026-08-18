@@ -3388,3 +3388,47 @@ combination is therefore not legal for this packed tile as currently shaped;
 no profiler or timing result can be accepted. R50 was fully reverted before
 any further experiment. The complete failure log is under
 `iter87-b32-packed-flash-m16` on the pod and local artifact root.
+
+## R51: vectorize Flash M16 weight-scale staging
+
+### Reason and direction
+
+Flash preprocessing already stores each K128 group as 128 contiguous scale
+words across N, but the B producer still issued four separate scalar LDG/STS
+rounds to stage those words. R51 is exact for routed Flash M16 and assigns
+four adjacent rows to each lane, replacing the four scalar transfers with one
+16-byte global load and one 16-byte shared store. It does not change the
+processed-weight format, packed-B TMA, decoder, WGMMA, synchronization, CTA
+topology, or numerical operations.
+
+The production eight-rank forced-ring-wrap correctness case passes at
+`0.000645`. The official cubin remains spill-free at 114 registers/thread.
+Matched one-rank/32-expert NCU shows that the wider producer transaction
+substantially improves the generated schedule rather than merely reducing
+source statements:
+
+| Flash M16 NCU metric | R48 | R51 | change |
+| --- | ---: | ---: | ---: |
+| duration us | 357.056 | 304.576 | -14.70% |
+| executed warp instructions | 73,211,822 | 71,983,933 | -1.68% |
+| executed thread instructions | 2,288,346,146 | 2,249,823,179 | -1.68% |
+| shared-load bank conflicts | 3,052,150 | 3,055,680 | +0.12% |
+| shared-store bank conflicts | 1,883,753 | 876,071 | -53.49% |
+| global-load sectors | 845,089 | 835,314 | -1.16% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+
+The 20-observation cold-L2 screen measured R48/R51/R48 at
+`456.802/451.434/466.272 us`, or `-1.18%/-3.18%`. The formal run raises each
+side to 50 observations, ten warmups, and 20 launches per observation:
+
+| Flash point | first R48 us | R51 us | change | second R48 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| M16 | 432.983 | 364.307 | -15.86% | 429.151 | -15.11% |
+
+The run contained transient multi-millisecond outliers on both implementations,
+but the maximum-rank median selects the same large win against both controls.
+Low-perturbation one-rank NSYS independently measures `356.129 us` for R48
+and `282.273 us` for R51 (`-20.74%`). The agreement among both launch orders,
+NCU, and NSYS makes the mechanism strong enough to retain. Complete artifacts
+are under `iter88-vector-sfb-flash-m16` through `iter91-vector-sfb-nsys` on
+the pod and local artifact root.
