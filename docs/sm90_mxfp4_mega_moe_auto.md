@@ -3296,3 +3296,48 @@ The next iteration must preserve the two-independent-CTA topology proven by
 R43 and reduce the fixed packed-B decode/synchronization critical path rather
 than revisit direct scale loads ruled out by R45-R47. Complete logs are under
 `iter84-r48-pr383-full-matrix` on the pod and local artifact root.
+
+## R48 versus PR383 matched Flash M16 profiler decomposition
+
+The post-matrix profiler run uses one H20, one rank, and 32 experts for both
+implementations. This preserves one production expert shard while avoiding
+distributed replay skew. NCU uses the same input seed and M16 shape; NSYS
+captures exactly the profiler-delimited production launch. These timings are
+diagnostic and do not replace the eight-rank score above.
+
+NSYS attributes the gap inside the GPU kernels:
+
+| NSYS kernel | duration us |
+| --- | ---: |
+| R48 fused MXFP4 | 358.368 |
+| PR383 FP8 L1 | 168.960 |
+| PR383 FP8 L2 | 94.080 |
+| PR383 L1 + L2 | 263.040 |
+
+The fused candidate is `+36.24%` slower than the two PR383 kernels combined;
+its approximately 95.3-us excess is therefore not a second-launch artifact.
+Targeted NCU reproduces the same direction at 357.056 versus 266.656 us and
+identifies the additional work:
+
+| additive NCU metric | R48 fused | PR383 L1 + L2 | excess |
+| --- | ---: | ---: | ---: |
+| executed warp instructions | 73,211,822 | 41,097,573 | +78.14% |
+| executed thread instructions | 2,288,346,146 | 1,247,705,433 | +83.40% |
+| shared-load bank conflicts | 3,052,150 | 71,816 | +4149.96% |
+| shared-store bank conflicts | 1,883,753 | 75,861 | +2383.16% |
+| global-load sectors | 845,089 | 672,643 | +25.64% |
+| global-store sectors | 29,369 | 29,135 | +0.80% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+
+The candidate has 114 registers/thread, 110.816 KiB dynamic shared memory per
+CTA, 3.106 resident warps stalled on barriers per active issue cycle, and
+4.084 stalled on long scoreboards. PR383 L1/L2 use 168 registers/thread and
+230.672 KiB each; their respective barrier ratios are 1.296/3.697 and long-
+scoreboard ratios are 3.170/2.693. Ratios are not additive across sequential
+kernels, but they confirm that the fused kernel's 16 active warps/SM do not
+hide its packed-B expansion dependency chain.
+
+The next experiment therefore targets the B128 expanded-tile publication,
+not launch topology, scale addressing, or local spill. Complete NCU reports,
+raw CSV, NSYS reports, and kernel summaries are under
+`iter85-r48-pr383-flash-m16-profiles` on the pod and local artifact root.
