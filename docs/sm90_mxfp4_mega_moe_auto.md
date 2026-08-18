@@ -3872,3 +3872,105 @@ though those specializations compile the unchanged path; they are treated as
 inter-run variance and require a same-session control before choosing the
 next code direction. Complete paired logs are under
 `iter113-r56-pr383-full-matrix` on the pod and local artifact root.
+
+### R56 same-path variance control and next target
+
+Because the R56 selector is compile-time false for Flash M32/M64, those two
+specializations are code-equivalent to the retained R53 control. A same-session
+20-observation R56/R53/R56 run nevertheless measured M32 at
+`411.147/402.071/375.388 us` and M64 at `442.161/416.373/401.238 us`.
+The middle control falls between the two equivalent candidate runs at both
+points, demonstrating that the large movement in the R56 full matrix was
+node/run drift rather than an R56 side effect. Evidence is under
+`iter114-flash-m32-m64-r56-r53-control`.
+
+The next matched profile therefore targeted Pro M8, which remained `11.10%`
+behind PR383 in the R56 matrix. One rank and 48 experts preserve Pro's local
+expert shard. NCU captures the candidate's one fused launch and both PR383
+phase launches; PR383 values below are the L1+L2 sums.
+
+| Pro M8 NCU metric | R56 fused | PR383 L1+L2 | excess |
+| --- | ---: | ---: | ---: |
+| duration us | 757.824 | 708.736 | +6.93% |
+| executed warp instructions | 191,104,980 | 125,792,381 | +51.92% |
+| executed thread instructions | 5,975,644,679 | 3,752,731,091 | +59.23% |
+| shared-load bank conflicts | 8,526,723 | 27,897 | +30,465.02% |
+| shared-store bank conflicts | 3,083,496 | 30,826 | +9,902.91% |
+| global-load sectors | 2,207,037 | 1,736,337 | +27.11% |
+| global-store sectors | 26,775 | 26,014 | +2.93% |
+
+NSYS measures `699.776 us` for R56 and `684.704 us` for PR383 L1+L2
+(`+2.20%`). SourceCounters localizes `8,519,429` excessive shared wavefronts
+to the paired decoder's 16 dynamic `LDS.64` sites: eight L1 sites contribute
+`696,960` each and eight L2 sites contribute `340,032` each, with the small
+remainder in shorter paths. This is the same two-wave replay mechanism removed
+from Flash M16 by R56. Complete paired NCU, SourceCounters, and NSYS evidence
+is under `iter115-pro-m8-pr383-profiles`.
+
+## R57: bank-permute paired packed-weight loads for selected Pro buckets
+
+### Reason and direction
+
+R57 extends R56's address-set-preserving half-warp permutation to the Pro
+swap-AB buckets that pass independent timing. The mapping changes only which
+lane loads each adjacent packed-word pair; the complete warp still owns the
+same 16-row by 4-word set, and decode, scale values, expanded-B addresses,
+WGMMA, scheduler, and epilogue remain unchanged. The final selector includes
+Pro `kMaxSwapABTokens=8/32/64`, corresponding to production M8, M32, M64, and
+M128, while explicitly excluding the mixed M16 bucket.
+
+Eight-rank Pro M8 correctness first passed at `0.000716`. The broad selector
+then passed all six production Pro scenarios, including forced ring wrap for
+M16/M32/M64/M128, with differences from `0.000704` to `0.000716`. The 14 CPU
+preprocessing contract tests also pass.
+
+The exact Pro M8 formal R56/R57/R56 test uses one warmup, 50 observations, 20
+launches per observation, cold L2, and maximum-rank median:
+
+| point | first R56 us | R57 us | change | second R56 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pro M8 | 820.531 | 799.677 | -2.54% | 827.003 | -3.30% |
+
+The 20-observation broad screen separates the remaining Pro buckets:
+
+| point | first R56 us | broad us | change | second R56 us | reverse change | decision |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Pro M16 | 1047.500 | 1064.000 | +1.58% | 1066.000 | -0.19% | reject |
+| Pro M32 | 1098.000 | 1085.000 | -1.18% | 1130.000 | -3.98% | accept |
+| Pro M64 | 1142.500 | 1128.000 | -1.27% | 1171.500 | -3.71% | accept |
+| Pro M128 | 1328.500 | 1302.500 | -1.96% | 1328.000 | -1.92% | accept |
+
+The retained M32/M64/M128 selector then passes the full 50-observation formal
+R56/R57/R56 test:
+
+| point | first R56 us | R57 us | change | second R56 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pro M32 | 1114.500 | 1086.500 | -2.51% | 1108.500 | -1.98% |
+| Pro M64 | 1141.500 | 1125.000 | -1.45% | 1139.000 | -1.23% |
+| Pro M128 | 1300.500 | 1277.000 | -1.81% | 1304.000 | -2.07% |
+
+The three-point geometric mean improves by `-1.92%` versus the first control
+and `-1.76%` versus the second. Matched Pro M8 profiling confirms the intended
+mechanism:
+
+| Pro M8 NCU metric | R56 | R57 | change |
+| --- | ---: | ---: | ---: |
+| duration us | 757.824 | 744.704 | -1.73% |
+| executed warp instructions | 191,104,980 | 192,184,807 | +0.57% |
+| executed thread instructions | 5,975,644,679 | 6,009,560,094 | +0.57% |
+| excessive shared wavefronts | 8,519,429 | 3,845 | -99.95% |
+| shared-load bank conflicts | 8,526,723 | 8,262 | -99.90% |
+| shared-store bank conflicts | 3,083,496 | 3,937,409 | +27.69% |
+| global-load sectors | 2,207,037 | 2,206,593 | -0.02% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+| barrier-stall ratio | 2.385 | 2.302 | -3.50% |
+| long-scoreboard ratio | 2.058 | 1.996 | -3.03% |
+| short-scoreboard ratio | 0.737 | 0.591 | -19.80% |
+
+Tensor-pipe active rises `2.36%`, eligible warps/cycle rises `5.32%`, and
+issue-active rises `4.08%`. NSYS independently measures
+`699.776 -> 679.424 us` (`-2.91%`). Both cubins retain 107 registers/thread,
+zero stack/local storage, 1024 bytes static shared memory, and 100.576 KiB
+dynamic shared memory. Correctness, formal, broad-screen, NCU, SourceCounters,
+and NSYS artifacts are under `iter116-pro-m8-bank-permuted-lds` through
+`iter120-pro-bank-permuted-formal` on the pod and local artifact root.
