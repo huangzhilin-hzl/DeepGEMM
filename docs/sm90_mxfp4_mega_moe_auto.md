@@ -3580,3 +3580,45 @@ NSYS independently measures the same launch at 929.890 us for R52 and
 894.466 us for R53 (`-3.81%`). Complete screening, formal, NCU, NSYS, and
 resource evidence is under `iter97-coalesced-pro-sf-screen` through
 `iter99-coalesced-pro-sf-profiles` on the pod and local artifact root.
+
+### R53 authoritative DSV4 matrix versus PR383
+
+The fresh same-node comparison uses the required 8-rank DSV4 Flash and Pro
+matrix, one warmup, 50 small-M observations, three large-M observations, 20
+launches per observation, cold L2, and the maximum-rank median. PR383 uses its
+native two-phase FP8 driver and the reported time is L1 plus L2.
+
+| model | M | R53 MXFP4 us | PR383 FP8 us | gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 316.942 | 304.397 | +4.12% |
+| Flash | 16 | 361.037 | 314.023 | +14.97% |
+| Flash | 32 | 365.460 | 331.830 | +10.14% |
+| Flash | 64 | 388.386 | 368.547 | +5.38% |
+| Flash | 128 | 483.836 | 435.046 | +11.22% |
+| Flash | 256 | 516.622 | 488.635 | +5.73% |
+| Flash | 512 | 892.305 | 918.021 | -2.80% |
+| Flash | 1024 | 1500.000 | 1550.606 | -3.26% |
+| Flash | 2048 | 2770.000 | 2703.962 | +2.44% |
+| Flash | 4096 | 5177.000 | 5054.000 | +2.43% |
+| Flash | 8192 | 9999.000 | 9847.000 | +1.54% |
+| Pro | 8 | 786.810 | 718.405 | +9.52% |
+| Pro | 16 | 1023.000 | 1001.898 | +2.11% |
+| Pro | 32 | 1084.500 | 1100.803 | -1.48% |
+| Pro | 64 | 1131.000 | 1148.729 | -1.54% |
+| Pro | 128 | 1285.500 | 1280.647 | +0.38% |
+| Pro | 256 | 1694.000 | 1638.885 | +3.36% |
+| Pro | 512 | 2592.000 | 2412.803 | +7.43% |
+| Pro | 1024 | 3997.000 | 4052.000 | -1.36% |
+| Pro | 2048 | 7049.000 | 7029.000 | +0.28% |
+| Pro | 4096 | 13229.000 | 12938.000 | +2.25% |
+| Pro | 8192 | 25626.000 | 25019.000 | +2.43% |
+
+Geometric gaps are `+3.317%` over all 22 points, `+5.340%` over the ten
+small-M points, and `+1.661%` over the 12 large-M points. Flash is `+4.581%`
+overall (`+9.093%` small, `+0.965%` large); Pro is `+2.068%` overall
+(`+1.717%` small, `+2.363%` large). The coalesced Pro scale change therefore
+reduces the previous Pro small-M geometric gap from `+6.076%` to `+1.717%`,
+with M32 and M64 now faster than PR383. The dominant next targets are Flash
+M16/M32/M128 and Pro M8. Complete logs, including the harmless failed nested
+launcher attempt that exited before measurement, are under
+`iter100-r53-pr383-full-matrix` on the pod and local artifact root.
