@@ -5281,3 +5281,56 @@ Flash M8, but approximately halves R82's fresh `+10.23%` full-matrix deficit.
 The remaining M8 gap is still distributed synchronization/tail latency. Gate,
 screen, formal, profiler, full-production, and PR383 evidence is archived
 under `iter200` through `iter205` on the pod and local artifact root.
+
+### R84 full Flash/Pro matrix versus PR383
+
+The accepted R84 source-rank change was then measured over the complete frozen
+comparison matrix: DSV4 Flash and Pro, M=`8..8192`, one warmup, 50 observations
+through M128 and three observations from M256, 20 launches per observation,
+cold L2, seed 0, and max-rank median. PR383 uses the same script's built-in one
+warmup and its native L1+L2 sum. Both sides ran serially on the same eight-H20
+pod. All 22 summaries were present.
+
+| model | M | R84 us | PR383 us | R84 gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 319.7965 | 292.1045 | +9.480% |
+| Flash | 16 | 330.8025 | 307.7040 | +7.507% |
+| Flash | 32 | 341.6230 | 329.5740 | +3.656% |
+| Flash | 64 | 366.3955 | 367.0040 | -0.166% |
+| Flash | 128 | 427.6085 | 434.9930 | -1.698% |
+| Flash | 256 | 506.6590 | 503.6590 | +0.596% |
+| Flash | 512 | 873.6950 | 927.7890 | -5.830% |
+| Flash | 1024 | 1478.0000 | 1542.8360 | -4.202% |
+| Flash | 2048 | 2746.0000 | 2745.7520 | +0.009% |
+| Flash | 4096 | 5120.0000 | 5056.0000 | +1.266% |
+| Flash | 8192 | 9895.0000 | 9830.0000 | +0.661% |
+| Pro | 8 | 751.2215 | 718.9905 | +4.483% |
+| Pro | 16 | 986.4710 | 1012.6985 | -2.590% |
+| Pro | 32 | 1021.0000 | 1112.8290 | -8.252% |
+| Pro | 64 | 1065.0000 | 1159.6160 | -8.159% |
+| Pro | 128 | 1214.0000 | 1281.9265 | -5.299% |
+| Pro | 256 | 1619.0000 | 1647.6390 | -1.738% |
+| Pro | 512 | 2510.0000 | 2396.7040 | +4.727% |
+| Pro | 1024 | 3886.0000 | 4004.0000 | -2.947% |
+| Pro | 2048 | 6900.0000 | 7030.0000 | -1.849% |
+| Pro | 4096 | 12964.0000 | 12883.0000 | +0.629% |
+| Pro | 8192 | 25286.0000 | 25123.0000 | +0.649% |
+
+| geometric-mean slice | R84 gap versus PR383 |
+| --- | ---: |
+| all 22 points | -0.512243% |
+| Flash | +0.934110% |
+| Pro | -1.937870% |
+| small M (`<=128`) | -0.279466% |
+| large M (`>=256`) | -0.705809% |
+| Flash small M | +3.667286% |
+| Flash large M | -1.288411% |
+| Pro small M | -4.075961% |
+| Pro large M | -0.119768% |
+
+R84 therefore widens the all-point lead from R82's `-0.367338%` to
+`-0.512243%`, while the session-to-session noise in untouched points prevents
+attributing the full `0.145` percentage-point change solely to M8. The priority
+remains Flash small M: M8 and M16 are the two largest current deficits. Raw
+logs are archived in `iter206-r84-pr383-full-matrix` on the pod and local
+artifact root.
