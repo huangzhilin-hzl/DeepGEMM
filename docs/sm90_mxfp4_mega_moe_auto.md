@@ -2797,3 +2797,55 @@ negligible, R38 was rejected before a noisy distributed A/B/A run and fully
 reverted. Evidence is under `iter68-flash-hfma2-live-range`. The next spill
 experiment must be driven by the actual spilled values in SASS rather than by
 CUDA source-level variable names.
+
+## Rejected experiment R39: compact persistent pipeline state
+
+### Reason and direction
+
+R39 targeted the 16-byte Flash M8/M64 HFMA2 spill by shortening state that
+crosses the persistent mainloop. The first prototype packed the circular
+`stage_idx` and `phase` variables into one three-bit value and decoded them at
+their use sites. Flash M64 ring-wrap correctness passed at `0.000660`, but the
+isolated cubin remained at `REG=128, STACK=16` with six `LDL` and five `STL`
+instructions. The packed state therefore did not contain the spilled values.
+
+A second prototype also rematerialized the epilogue warp index from `%tid.x`
+at its phase-local use sites. Correctness again passed at `0.000660`, but the
+cubin worsened to `STACK=24` with eleven `LDL` and nine `STL` instructions.
+Both variants were fully reverted without a distributed timing run. Static
+evidence is under `iter69-packed-pipeline-state`.
+
+## Rejected experiment R40: skip inactive swap-epilogue token chunks
+
+### Reason and direction
+
+The L1 swap-AB epilogue executed clamp, exponent, SwiGLU, and reduction work
+for all compile-time token chunks, while inactive chunks merely loaded zero
+top-k weights and suppressed the scratch store. R40 made the whole inactive
+body warp-uniformly conditional. Eight-rank correctness passed six Flash
+points from M8 through M1024 and the exact Pro M32 point; the latter reported
+`0.000715` error.
+
+The broad 20-observation screen did not support Flash:
+
+| Flash point | R36 us | broad R40 us | change |
+| --- | ---: | ---: | ---: |
+| M16 | 428.556 | 431.738 | +0.74% |
+| M32 | 432.121 | 431.568 | -0.13% |
+| M64 | 449.785 | 455.793 | +1.34% |
+
+The Pro screen selected only M32. Its broad candidate was `1151.0 us` versus
+two 20-observation controls at `1162.5/1171.5 us`, so the compile-time selector
+was narrowed to exactly `hidden=7168, M=32` and rerun under the formal
+50-observation cold-L2 A/B/A contract. The result was:
+
+| Pro point | first R36 us | exact R40 us | change | second R36 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| M32 | 1174.0 | 1168.0 | -0.51% | 1155.0 | +1.13% |
+
+The candidate failed the second control and was fully reverted. The wide
+spread between identical controls again demonstrates why one short screen is
+insufficient for sub-percent decisions. Evidence is under
+`iter70-active-swap-chunks-screen`,
+`iter71-pro-active-swap-chunks-screen`, and
+`iter72-pro-m32-active-chunks-formal` on the pod and local artifact root.
