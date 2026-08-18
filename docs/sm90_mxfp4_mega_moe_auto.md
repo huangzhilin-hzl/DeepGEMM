@@ -5605,3 +5605,36 @@ the formal maximum-rank result is exactly flat and rank 0 regresses against
 both controls. R89 was reverted in source and the candidate extension was
 rebuilt byte-identical to the frozen R85 extension. Valid evidence is under
 `iter226` through `iter229`; R85 remains the accepted implementation.
+
+## Rejected R90: back off the final Pro M8 NVLink barrier
+
+Fresh R85 Pro M8 SourceCounters localized the largest sampled stall to the
+dispatch/epilogue rendezvous immediately before workspace cleanup and the
+final cross-rank barrier. Decoder shared-load replay remained negligible; the
+largest dynamic opcode groups were the intrinsic MXFP4 conversion operations
+(`27.32M` LOP3 and `21.38M` PRMT warp instructions). R90 therefore left the
+math and dispatch paths unchanged and added a 64-cycle sleep only while SM0
+polled the final workspace-clean NVLink signal at eight-rank Pro M8. All other
+NVLink barriers and specializations compiled with no sleep.
+
+Exact eight-rank correctness passed at `diff=0.000716`. The cubin retained 107
+registers/thread, zero stack/local allocation, and 1024 bytes static shared
+memory. The 20-observation cold-L2 A/B/A screen was double-positive:
+
+| point | first R85 us | R90 us | change | second R85 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pro M8 max rank | 793.9675 | 760.4100 | -4.23% | 774.7930 | -1.86% |
+| Pro M8 rank 0 | 771.7615 | 748.2370 | -3.05% | 759.7130 | -1.51% |
+
+The authoritative 50-observation run reversed the result:
+
+| point | first R85 us | R90 us | change | second R85 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pro M8 max rank | 761.5280 | 776.8300 | +2.01% | 769.2520 | +0.99% |
+| Pro M8 rank 0 | 740.1605 | 761.7805 | +2.92% | 747.2055 | +1.95% |
+
+The final barrier benefits from detecting the last rank immediately; reducing
+poll traffic does not repay the added detection latency. R90 was reverted in
+full, and further sleep-value sweeps at this barrier are not justified.
+SourceCounters, gate, screen, and formal evidence are under `iter230` through
+`iter233`; R85 remains the accepted implementation.
