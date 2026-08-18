@@ -4021,3 +4021,84 @@ large-M points remain run variance. The dominant remaining stable cluster is
 Flash M8-M128, especially M16/M32/M128, followed by Pro M8. Complete paired
 logs are under `iter121-r57-pr383-full-matrix` on the pod and local artifact
 root.
+
+## R58: bank-permute regular Flash packed-weight loads
+
+### Reason and direction
+
+After R57, Flash M32 remained `11.32%` behind PR383. Its matched one-rank,
+32-expert profile measures `324.864 us` for the fused candidate versus
+`296.384 us` for PR383 L1+L2 (`+9.61%`) and `299.008/291.200 us` under NSYS.
+The candidate executes `75.22%` more warp instructions, `80.80%` more thread
+instructions, and has `3.16M` shared-load conflicts. SourceCounters localizes
+`3,145,728` excessive wavefronts to paired-decoder `LDS.64`. However, R56's
+earlier broad screen already showed that applying the permutation to Flash M32
+regresses timing; removing replay does not repay the extra scheduling cost in
+that swap-AB bucket. This profile is retained under
+`iter122-flash-m32-pr383-profiles`, but no M32 code change is made.
+
+Flash M128 is the first regular-orientation point and was still `10.05%`
+behind PR383. Its R57 SourceCounters profile has the same `3,145,728`
+excessive decoder `LDS.64` wavefronts (`3,553,072` excessive shared
+wavefronts overall), 128 registers/thread, and zero local traffic. Because all
+regular Flash M values share one JIT specialization, R58 enables the existing
+address-set-preserving bank permutation for the entire regular Flash path and
+evaluates M128-M8192 as a unit. No data, scale, expanded-B address, WGMMA,
+scheduler, or epilogue semantics change. The baseline profile is under
+`iter123-flash-m128-source-counters`.
+
+All six production Flash correctness scenarios pass, including forced ring
+wrap at M128 and the regular M1024 case; normalized differences remain
+`0.000645` to `0.000671`. The initial screen uses 20 observations at M128 and
+five at every larger M:
+
+| point | first R57 us | R58 us | change | second R57 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M128 | 519.744 | 500.260 | -3.75% | 505.887 | -1.11% |
+| Flash M256 | 560.758 | 507.323 | -9.53% | 518.449 | -2.15% |
+| Flash M512 | 911.687 | 914.143 | +0.27% | 905.970 | +0.90% |
+| Flash M1024 | 1542.000 | 1501.000 | -2.66% | 1512.000 | -0.73% |
+| Flash M2048 | 2801.000 | 2780.000 | -0.75% | 2777.000 | +0.11% |
+| Flash M4096 | 5183.000 | 5128.000 | -1.06% | 5194.000 | -1.27% |
+| Flash M8192 | 9989.000 | 9915.000 | -0.74% | 10038.000 | -1.23% |
+
+The seven-point geometric mean improves `2.65%/0.79%` against the two
+controls. The formal run uses the authoritative 50 observations at M128 and
+three observations for larger M:
+
+| point | first R57 us | R58 us | change | second R57 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M128 | 509.186 | 505.036 | -0.82% | 495.622 | +1.90% |
+| Flash M256 | 528.685 | 480.897 | -9.04% | 496.425 | -3.13% |
+| Flash M512 | 949.545 | 924.335 | -2.65% | 922.429 | +0.21% |
+| Flash M1024 | 1513.000 | 1505.000 | -0.53% | 1539.000 | -2.21% |
+| Flash M2048 | 2759.000 | 2723.000 | -1.30% | 2774.000 | -1.84% |
+| Flash M4096 | 5191.000 | 5134.000 | -1.10% | 5182.000 | -0.93% |
+| Flash M8192 | 10023.000 | 9934.000 | -0.89% | 10025.000 | -0.91% |
+
+The formal seven-point geometric mean improves `2.37%/1.00%`; the six large-M
+points improve `2.63%/1.47%`. M128 is mixed and M512's `+0.21%` reverse result
+is noise-sized, but the indivisible specialization improves the affected set
+against both controls and every remaining large point is double-positive.
+
+Matched M128 profiling confirms the mechanism and no resource penalty:
+
+| Flash M128 NCU metric | R57 | R58 | change |
+| --- | ---: | ---: | ---: |
+| duration us | 464.672 | 462.976 | -0.37% |
+| executed warp instructions | 92,008,020 | 90,849,995 | -1.26% |
+| executed thread instructions | 2,881,690,645 | 2,844,322,562 | -1.30% |
+| excessive shared wavefronts | 3,553,072 | 407,344 | -88.54% |
+| shared-load bank conflicts | 3,162,206 | 14,229 | -99.55% |
+| shared-store bank conflicts | 1,322,953 | 1,409,686 | +6.56% |
+| global-load sectors | 1,064,556 | 1,064,788 | +0.02% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+| short-scoreboard ratio | 0.417 | 0.317 | -23.88% |
+
+NSYS independently measures `425.088 -> 420.256 us` (`-1.14%`). Registers
+fall from 128 to 126 per thread; both cubins retain zero stack/local storage,
+1024 bytes static shared memory, and 110.816 KiB dynamic shared memory. Screen,
+formal, NCU, SourceCounters, and NSYS artifacts are under
+`iter124-flash-regular-bank-permuted-screen` through
+`iter126-flash-regular-bank-permuted-profiles` on the pod and local artifact
+root.

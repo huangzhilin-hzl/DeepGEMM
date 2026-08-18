@@ -1644,22 +1644,25 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 constexpr uint32_t kPairRowsPerDecodeGroup = 16;
                                 const uint32_t pair_row_in_decode_group =
                                     lane_idx % 16;
-                                // For the conflict-heavy Flash M16 and selected
-                                // Pro swap-AB buckets, alternate the two adjacent
-                                // word pairs across each half warp's lower and
-                                // upper eight rows. Under the packed B64 swizzle
-                                // this covers every bank once per LDS.64 wave
-                                // instead of aliasing rows r and r+8 onto the
-                                // same bank pair. The full warp still owns the
-                                // identical 16-row x 4-word address set.
+                                // For the conflict-heavy Flash M16, regular
+                                // Flash, and selected Pro swap-AB buckets,
+                                // alternate the two adjacent word pairs across
+                                // each half warp's lower and upper eight rows.
+                                // Under the packed B64 swizzle this covers every
+                                // bank once per LDS.64 wave instead of aliasing
+                                // rows r and r+8 onto the same bank pair. The
+                                // full warp still owns the identical 16-row x
+                                // 4-word address set.
                                 constexpr bool kBankPermutedPairLoads =
-                                    kSmallMSwapAB and
-                                    ((kHidden == 4096 and
-                                      kMaxSwapABTokens == 16) or
-                                     (kHidden == 7168 and
-                                      (kMaxSwapABTokens == 8 or
-                                       kMaxSwapABTokens == 32 or
-                                       kMaxSwapABTokens == 64)));
+                                    (kHidden == 4096 and
+                                     not kSmallMSwapAB) or
+                                    (kSmallMSwapAB and
+                                     ((kHidden == 4096 and
+                                       kMaxSwapABTokens == 16) or
+                                      (kHidden == 7168 and
+                                       (kMaxSwapABTokens == 8 or
+                                        kMaxSwapABTokens == 32 or
+                                        kMaxSwapABTokens == 64))));
                                 const uint32_t packed_k_pair_in_k32 =
                                     kBankPermutedPairLoads ?
                                         (((lane_idx >> 3) ^
