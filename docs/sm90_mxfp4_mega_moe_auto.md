@@ -4905,3 +4905,66 @@ ratios (`2.49/2.20/0.58 -> 2.50/2.20/0.58`) are also unchanged. With neither
 a material instruction reduction nor a profiler time signal, R77 was stopped
 before distributed timing or NSYS and fully reverted. Evidence is under
 `iter176` and `iter177` on the pod and local artifact root.
+
+## R78: combine PRMT pair indexing and HFMA2 promotion for Flash M16
+
+### Reason and implementation
+
+Flash M16 remained R67's largest stable deficit at `+9.99%`. R61's PRMT pair
+index and R68's packed HFMA2 promotion each removed local instructions but
+were individually too small to control the eight-rank maximum. They shorten
+independent portions of every K-stage critical path, however: PRMT replaces
+the bank-permuted packed-word pair arithmetic, while HFMA2 replaces scalar
+unpack, four FP32 FMAs, and repack during accumulator promotion. R78 enables
+both existing implementations only for `hidden=4096,
+kMaxSwapABTokens=16`. Every other selector remains byte-for-byte unchanged.
+
+Exact eight-rank Flash M16 correctness passes at `diff=0.000654`. The
+production and matched one-rank cubins use 115 registers, zero stack/local
+storage, and 110.816 KiB dynamic shared memory, compared with R67's 114
+registers and otherwise identical resources. The one-register increase does
+not alter the two-CTA-per-SM launch topology.
+
+### Screening and formal performance
+
+The one-warmup, 20-observation, 20-launch, cold-L2 screen was double-positive:
+
+| point | first R67 us | R78 us | change | second R67 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M16 | 363.168 | 357.418 | -1.58% | 360.297 | -0.80% |
+
+The authoritative 50-observation A/B/A amplified the same direction:
+
+| point | first R67 us | R78 us | change | second R67 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M16 | 356.204 | 332.478 | -6.66% | 357.266 | -6.94% |
+
+Rank-0 medians also move from `350.483/336.730 us` to `318.835 us`, so the
+accepted maximum-rank gain is not produced by moving one slow peer. All 13
+eight-rank production scenarios pass after selection, including every forced
+ring-wrap Flash/Pro case.
+
+### NCU and NSYS attribution
+
+Matched one-rank/32-expert profiling confirms that the joint selector crosses
+the mechanism threshold missed by either component alone:
+
+| metric | R67 | R78 | change |
+| --- | ---: | ---: | ---: |
+| NCU duration us | 277.54 | 262.43 | -5.44% |
+| executed warp instructions | 72,360,705 | 61,702,788 | -14.73% |
+| executed thread instructions | 2,261,903,345 | 1,921,229,504 | -15.06% |
+| shared-load bank conflicts | 6,400 | 5,987 | -6.45% |
+| shared-store bank conflicts | 1,021,449 | 1,205,729 | +18.04% |
+| global-load sectors | 835,059 | 832,670 | -0.29% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+| tensor-pipe active | 3.97% | 4.21% | +6.05% |
+
+The shorter decode/promotion body wins despite higher shared-store conflicts
+and higher barrier/long-/short-scoreboard ratios
+(`2.48/2.19/0.58 -> 2.76/2.50/0.82`). NSYS independently measures
+`278.464 -> 263.712 us` (`-5.30%`). Correctness, resource, NCU, NSYS, screen,
+formal, and full-production evidence is under `iter178` through `iter182` on
+the pod and local artifact root. The isolated R78 point gain is large enough
+to erase the prior `+0.296%` 22-point estimate, but a fresh complete PR383
+matrix remains the terminal authority.
