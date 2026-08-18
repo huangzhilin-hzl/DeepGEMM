@@ -3240,3 +3240,59 @@ R48 is retained. It materially closes the largest small-Pro gap without
 changing topology, communication, memory traffic, or the numerical contract.
 The terminal goal remains unmet; the next full candidate/PR383 matrix must
 measure the updated Flash and Pro gaps before selecting the next target.
+
+## R48 same-node full matrix against PR383
+
+The authoritative post-R48 comparison ran both implementations on the same
+eight-H20 pod, with cold L2, 20 launches per observation, maximum-rank
+medians, 50 observations for M <= 128, and three observations for M >= 256.
+The candidate used one explicit warmup. PR383 used its native two-phase FP8
+driver and reports the sum of L1 and L2. Both logs contain all 22 requested
+DSV4 Flash and Pro summaries.
+
+| model | M | R48 MXFP4 us | PR383 us | gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 386.983 | 302.332 | +28.00% |
+| Flash | 16 | 422.599 | 312.559 | +35.21% |
+| Flash | 32 | 435.637 | 338.162 | +28.83% |
+| Flash | 64 | 457.105 | 366.440 | +24.74% |
+| Flash | 128 | 487.960 | 440.793 | +10.70% |
+| Flash | 256 | 522.551 | 508.985 | +2.67% |
+| Flash | 512 | 912.641 | 909.921 | +0.30% |
+| Flash | 1024 | 1507.000 | 1544.968 | -2.46% |
+| Flash | 2048 | 2765.000 | 2758.600 | +0.23% |
+| Flash | 4096 | 5221.000 | 5118.000 | +2.01% |
+| Flash | 8192 | 10013.000 | 9837.000 | +1.79% |
+| Pro | 8 | 842.128 | 712.988 | +18.11% |
+| Pro | 16 | 1067.500 | 1014.713 | +5.20% |
+| Pro | 32 | 1136.000 | 1103.769 | +2.92% |
+| Pro | 64 | 1198.000 | 1157.868 | +3.47% |
+| Pro | 128 | 1312.000 | 1292.149 | +1.54% |
+| Pro | 256 | 1627.000 | 1643.809 | -1.02% |
+| Pro | 512 | 2537.000 | 2434.415 | +4.21% |
+| Pro | 1024 | 3919.000 | 4029.000 | -2.73% |
+| Pro | 2048 | 6933.000 | 7019.000 | -1.23% |
+| Pro | 4096 | 13118.000 | 12965.000 | +1.18% |
+| Pro | 8192 | 25499.000 | 25145.000 | +1.41% |
+
+The same-epoch geometric gaps are:
+
+- all 22 points: `+6.96%`;
+- M <= 128: `+15.26%`;
+- M >= 256: `+0.51%`;
+- all Flash points: `+11.21%`;
+- Flash small-M: `+25.22%`;
+- Flash large-M: `+0.74%`;
+- all Pro points: `+2.88%`;
+- Pro small-M: `+6.08%`;
+- Pro large-M: `+0.28%`.
+
+Compared with R32's fresh matrix, the all-point gap falls from `+8.61%` to
+`+6.96%`, and the Pro small-M gap falls from `+12.02%` to `+6.08%`. In
+particular, Pro M128 falls from `+16.38%` to `+1.54%`, validating R48's
+instruction-count mechanism. The terminal goal is still unmet: Flash M8-M64
+now dominate the aggregate loss, with Flash M16 the worst point at `+35.21%`.
+The next iteration must preserve the two-independent-CTA topology proven by
+R43 and reduce the fixed packed-B decode/synchronization critical path rather
+than revisit direct scale loads ruled out by R45-R47. Complete logs are under
+`iter84-r48-pr383-full-matrix` on the pod and local artifact root.
