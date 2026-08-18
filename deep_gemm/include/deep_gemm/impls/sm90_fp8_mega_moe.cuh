@@ -1654,11 +1654,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 // full warp still owns the identical 16-row x
                                 // 4-word address set.
                                 constexpr bool kBankPermutedPairLoads =
-                                    (kHidden == 4096 and
-                                     (not kSmallMSwapAB or
-                                      kMaxSwapABTokens == 8 or
-                                      kMaxSwapABTokens == 16 or
-                                      kMaxSwapABTokens == 64)) or
+                                    kHidden == 4096 or
                                     (kHidden == 7168 and kSmallMSwapAB and
                                      (kMaxSwapABTokens == 8 or
                                       kMaxSwapABTokens == 32 or
@@ -1667,6 +1663,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                     kSmallMSwapAB and
                                     ((kHidden == 4096 and
                                       (kMaxSwapABTokens == 8 or
+                                       kMaxSwapABTokens == 32 or
                                        kMaxSwapABTokens == 64)) or
                                      (kHidden == 7168 and
                                       (kMaxSwapABTokens == 8 or

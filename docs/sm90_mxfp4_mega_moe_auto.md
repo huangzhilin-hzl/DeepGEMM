@@ -4297,3 +4297,47 @@ formal timing gate. Correctness, screen, and formal logs are under
 `iter134-incremental-desc-regular-flash-screen` and
 `iter135-incremental-desc-flash-m128-formal` on the pod and local artifact
 root.
+
+## R61: extend PRMT bank-permuted pairs to Flash M32
+
+### Reason and selection
+
+After R59, Flash M16/M32 remained `10.09%/10.79%` behind PR383. Both execute
+the paired packed-word decoder, but R59 retained the old M16 bit expression
+and the original conflict-heavy M32 pair assignment because the earlier
+20-observation screen was mixed. R61 reran both points directly at the formal
+50-observation sample count. M16 used the byte-permutation form of its already
+accepted address mapping; M32 used the same `0,2,2,0` bank permutation and
+PRMT lookup accepted at Flash M8/M64.
+
+All six production Flash correctness scenarios pass. The cold-L2 A/B/A result
+was:
+
+| point | first R59 us | R61 us | change | second R59 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M16 | 345.088 | 365.712 | +5.98% | 380.761 | -3.95% |
+| Flash M32 | 359.600 | 338.182 | -5.96% | 358.520 | -5.67% |
+
+M16 remains order-dependent and is rejected; it keeps R56's bit expression.
+M32 is strongly double-positive and is the only retained specialization.
+
+### NCU and NSYS attribution
+
+The matched one-rank profile uses the production Flash shard of 32 experts:
+
+| Flash M32 NCU metric | R59 | R61 | change |
+| --- | ---: | ---: | ---: |
+| duration us | 323.328 | 302.368 | -6.48% |
+| executed warp instructions | 78,961,660 | 72,075,009 | -8.72% |
+| executed thread instructions | 2,471,627,807 | 2,251,317,121 | -8.91% |
+| shared-load bank conflicts | 3,156,785 | 8,069 | -99.74% |
+| shared-store bank conflicts | 868,621 | 1,062,417 | +22.31% |
+| global-load sectors | 906,736 | 904,783 | -0.22% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+| tensor-pipe active | 4.109% | 4.414% | +7.42% |
+
+Registers rise from 122 to 125 per thread, but both cubins remain spill-free
+and use 110.816 KiB dynamic shared memory. NSYS independently measures
+`301.536 -> 282.816 us` (`-6.21%`). Correctness and formal timing are under
+`iter136-prmt-flash-m16-m32-formal`; matched NCU/NSYS evidence is under
+`iter137-prmt-flash-m32-profiles` on the pod and local artifact root.
