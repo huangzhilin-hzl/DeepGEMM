@@ -3109,3 +3109,51 @@ four unrolled byte loads use immediate offsets; recomputing a generic address
 at every K32 loses more instructions than the PRMT path removes. Complete
 evidence is under `iter79-direct-scale-byte-flash-m16` on the pod and local
 artifact root.
+
+## Rejected experiment R47: immediate-offset Flash M16 scale-byte loads
+
+### Reason and direction
+
+R47 tested the remaining viable form of R46's byte-load idea. Exact Flash M16
+formed the shared-memory base address once per decoded row, then selected four
+inline `LDS.U8 [base + immediate]` instructions for the unrolled K32 groups.
+This was intended to retain the eliminated scale-word shuffle and exponent
+PRMTs without rebuilding a generic shared address at every K32. The packed-B
+layout, CTA topology, barriers, and numeric path were unchanged.
+
+Eight-rank forced-ring-wrap correctness passed at `0.000645`. The test cubin
+remained spill-free but used 115 registers per thread versus R36's 114. Static
+SASS shows that immediate offsets recovered only 16 `IADD3` instructions from
+R46 and did not remove the 128 added `IMAD.IADD` instructions:
+
+| static opcode | R36 | R47 | change |
+| --- | ---: | ---: | ---: |
+| `PRMT` | 761 | 632 | -129 |
+| `SHFL.IDX` | 45 | 10 | -35 |
+| `IMAD` | 365 | 303 | -62 |
+| `LDS.U8` | 0 | 128 | +128 |
+| `IADD3` | 237 | 280 | +43 |
+| `IMAD.IADD` | 34 | 162 | +128 |
+
+### Profiler gate result
+
+Matched isolated source-counter NCU confirms that R47 still executes more
+work than R36:
+
+| isolated Flash M16 metric | R36 | R47 | change |
+| --- | ---: | ---: | ---: |
+| duration us | 370.912 | 585.344 | +57.81% |
+| executed warp instructions | 73,213,070 | 74,013,852 | +1.09% |
+| executed thread instructions | 2,288,544,046 | 2,312,801,743 | +1.06% |
+| shared-load bank conflicts | 3,052,993 | 3,050,939 | -0.07% |
+| global-load sectors | 844,360 | 865,055 | +2.45% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+
+R47 failed the pre-benchmark requirement that both static and dynamic
+instruction counts beat R36, so it was deliberately not admitted to the
+distributed cold-L2 A/B/A or NSYS stages. It was fully reverted. Together,
+R45-R47 rule out direct shared-memory scale addressing for this decoder: a
+future conversion experiment must reduce the packed E2M1-to-E4M3 bit path
+without adding per-row address or load instructions. Complete evidence is
+under `iter80-scale-byte-immediate-flash-m16` on the pod and local artifact
+root.
