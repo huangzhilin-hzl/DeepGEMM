@@ -4341,3 +4341,44 @@ and use 110.816 KiB dynamic shared memory. NSYS independently measures
 `301.536 -> 282.816 us` (`-6.21%`). Correctness and formal timing are under
 `iter136-prmt-flash-m16-m32-formal`; matched NCU/NSYS evidence is under
 `iter137-prmt-flash-m32-profiles` on the pod and local artifact root.
+
+### R61 authoritative DSV4 matrix against PR383
+
+The full post-R61 matrix uses the same eight-H20 cold-L2 contract and a fresh
+same-session PR383 baseline:
+
+| model | M | R61 us | PR383 us | R61 gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 303.287 | 311.990 | -2.79% |
+| Flash | 16 | 341.587 | 323.428 | +5.62% |
+| Flash | 32 | 340.203 | 335.647 | +1.36% |
+| Flash | 64 | 364.724 | 374.774 | -2.68% |
+| Flash | 128 | 485.640 | 449.130 | +8.13% |
+| Flash | 256 | 515.830 | 491.971 | +4.85% |
+| Flash | 512 | 935.094 | 901.984 | +3.67% |
+| Flash | 1024 | 1487.000 | 1526.123 | -2.56% |
+| Flash | 2048 | 2734.000 | 2712.108 | +0.81% |
+| Flash | 4096 | 5162.000 | 5057.000 | +2.08% |
+| Flash | 8192 | 9934.000 | 9835.000 | +1.01% |
+| Pro | 8 | 756.875 | 710.089 | +6.59% |
+| Pro | 16 | 1024.500 | 1002.966 | +2.15% |
+| Pro | 32 | 1036.500 | 1098.664 | -5.66% |
+| Pro | 64 | 1063.500 | 1150.481 | -7.56% |
+| Pro | 128 | 1215.000 | 1280.017 | -5.08% |
+| Pro | 256 | 1637.000 | 1633.680 | +0.20% |
+| Pro | 512 | 2541.000 | 2439.312 | +4.17% |
+| Pro | 1024 | 3957.000 | 4014.000 | -1.42% |
+| Pro | 2048 | 6948.000 | 7034.000 | -1.22% |
+| Pro | 4096 | 13096.000 | 12908.000 | +1.46% |
+| Pro | 8192 | 25432.000 | 24968.000 | +1.86% |
+
+The all-point geometric gap is now `+0.602%`; the ten small-M points lead
+PR383 by `0.131%`, while the 12 large-M points trail by `1.217%`. Flash is
+`+1.713%` overall (`+1.832%` small, `+1.614%` large). Pro now leads PR383 by
+`0.497%` overall and `2.057%` at small M, while trailing by `0.822%` at large
+M. Flash M32 contracts from R59's `+10.79%` to `+1.36%`, consistent with the
+matched `5.96%/5.67%` A/B/A gain despite the expected cross-epoch movement in
+both implementations. The terminal target is not yet met: the total gap is
+positive, with Flash M128/M16 and Pro M8/M512 the largest residual points.
+Complete paired logs are under `iter138-r61-pr383-full-matrix` on the pod and
+local artifact root.
