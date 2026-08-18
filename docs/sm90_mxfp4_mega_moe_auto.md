@@ -3060,3 +3060,52 @@ E2M1-to-E4M3 conversion itself or expose independent packed-word work without
 adding address generation. Complete evidence is under
 `iter77-r36-pr383-flash-m16` and `iter78-direct-scale-flash-m16` on the pod and
 local artifact root.
+
+## Rejected experiment R46: direct Flash M16 scale-byte loads
+
+### Reason and direction
+
+R46 strengthened R45's scale-load experiment. Instead of directly loading a
+32-bit row word and retaining the four exponent-extraction PRMTs, exact Flash
+M16 issued `LDS.U8` for the active `(row, K32)` scale byte. This was intended
+to remove the stage-prologue word load, two row-mapping shuffles, and four
+exponent PRMTs. The packed-weight decoder, CTA topology, barriers, and numeric
+path were unchanged.
+
+Eight-rank forced-ring-wrap correctness passed at `0.000645`. The official
+benchmark cubin remained `STACK=0, LOCAL=0`, but again rose from 114 to 115
+registers per thread. The 20-observation cold-L2 A/B/A screen rejected it:
+
+| Flash point | first R36 us | R46 us | change | second R36 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| M16 | 435.419 | 451.739 | +3.75% | 431.857 | +4.60% |
+
+Static SASS proves that the desired PRMT and shuffle removal occurred, but
+also exposes the larger address-generation replacement:
+
+| static opcode | R36 | R46 | change |
+| --- | ---: | ---: | ---: |
+| `PRMT` | 761 | 632 | -129 |
+| `SHFL.IDX` | 45 | 10 | -35 |
+| `IMAD` | 365 | 303 | -62 |
+| `LDS.U8` | 0 | 128 | +128 |
+| `IADD3` | 237 | 296 | +59 |
+| `IMAD.IADD` | 34 | 162 | +128 |
+
+Matched isolated NCU accordingly reports more, not less, dynamic work:
+
+| isolated Flash M16 metric | R36 | R46 | change |
+| --- | ---: | ---: | ---: |
+| duration us | 370.912 | 586.592 | +58.15% |
+| executed warp instructions | 73,213,070 | 74,023,025 | +1.11% |
+| executed thread instructions | 2,288,544,046 | 2,312,912,652 | +1.06% |
+| shared-load bank conflicts | 3,052,993 | 3,051,233 | -0.06% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+
+One-rank NSYS measures `357.534 us` for R36 versus `569.597 us` for R46
+(`+59.31%`). R46 was fully reverted. It shows that byte-granular scale loads
+can only be viable if one shared address is formed per decoded row and the
+four unrolled byte loads use immediate offsets; recomputing a generic address
+at every K32 loses more instructions than the PRMT path removes. Complete
+evidence is under `iter79-direct-scale-byte-flash-m16` on the pod and local
+artifact root.
