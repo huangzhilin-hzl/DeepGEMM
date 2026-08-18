@@ -4224,3 +4224,45 @@ Matched 48-expert NSYS measures `684.512 -> 666.431 us` (`-2.64%`). Screen,
 formal, correctness, NCU, and NSYS evidence is under
 `iter128-prmt-bank-pair-selector` through
 `iter132-prmt-selected-profiles` on the pod and local artifact root.
+
+### R59 authoritative DSV4 matrix against PR383
+
+The post-R59 matrix uses the complete eight-H20 cold-L2 contract and a fresh
+same-session PR383 baseline. Candidate times are the fused MXFP4 kernel;
+PR383 times are the sum of its native FP8 L1 and L2 kernels.
+
+| model | M | R59 us | PR383 us | R59 gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 301.980 | 303.619 | -0.54% |
+| Flash | 16 | 346.790 | 315.000 | +10.09% |
+| Flash | 32 | 366.952 | 331.214 | +10.79% |
+| Flash | 64 | 376.518 | 373.333 | +0.85% |
+| Flash | 128 | 502.232 | 433.288 | +15.91% |
+| Flash | 256 | 489.029 | 496.087 | -1.42% |
+| Flash | 512 | 889.985 | 921.492 | -3.42% |
+| Flash | 1024 | 1546.000 | 1516.728 | +1.93% |
+| Flash | 2048 | 2777.000 | 2726.481 | +1.85% |
+| Flash | 4096 | 5159.000 | 5083.000 | +1.50% |
+| Flash | 8192 | 9904.000 | 9824.000 | +0.81% |
+| Pro | 8 | 759.296 | 710.803 | +6.82% |
+| Pro | 16 | 1032.500 | 1002.712 | +2.97% |
+| Pro | 32 | 1039.500 | 1101.702 | -5.65% |
+| Pro | 64 | 1080.500 | 1156.624 | -6.58% |
+| Pro | 128 | 1227.000 | 1280.133 | -4.15% |
+| Pro | 256 | 1622.000 | 1624.145 | -0.13% |
+| Pro | 512 | 2587.000 | 2396.005 | +7.97% |
+| Pro | 1024 | 3947.000 | 4013.000 | -1.64% |
+| Pro | 2048 | 6994.000 | 7032.000 | -0.54% |
+| Pro | 4096 | 13143.000 | 12925.000 | +1.69% |
+| Pro | 8192 | 25420.000 | 25080.000 | +1.36% |
+
+The geometric gaps are `+1.700%` over all 22 points, `+2.799%` over the ten
+small-M points, and `+0.794%` over the 12 large-M points. Flash is `+3.333%`
+overall (`+7.237%` small, `+0.189%` large). Pro is effectively at parity at
+`+0.093%` overall, with small M leading PR383 by `1.456%` and large M behind
+by `1.402%`. Flash M8 now leads PR383 by `0.54%`; the remaining dominant
+cluster is Flash M16/M32/M128, followed by Pro M512 and Pro M8. Relative to
+R58's prior matrix, the all-point geometric gap contracts from `+2.813%` to
+`+1.700%`, consistent with the same-code R59 A/B/A result. Complete paired
+logs are under `iter133-r59-pr383-full-matrix` on the pod and local artifact
+root.
