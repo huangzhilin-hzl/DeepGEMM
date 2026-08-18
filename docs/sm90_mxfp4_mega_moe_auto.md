@@ -4102,3 +4102,44 @@ formal, NCU, SourceCounters, and NSYS artifacts are under
 `iter124-flash-regular-bank-permuted-screen` through
 `iter126-flash-regular-bank-permuted-profiles` on the pod and local artifact
 root.
+
+### R58 authoritative DSV4 matrix against PR383
+
+The post-R58 matrix uses the same complete eight-H20 cold-L2 contract and a
+fresh same-session PR383 baseline:
+
+| model | M | R58 us | PR383 us | R58 gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 323.067 | 288.372 | +12.03% |
+| Flash | 16 | 348.460 | 319.955 | +8.91% |
+| Flash | 32 | 356.480 | 326.608 | +9.15% |
+| Flash | 64 | 388.138 | 362.831 | +6.98% |
+| Flash | 128 | 472.736 | 427.477 | +10.59% |
+| Flash | 256 | 507.785 | 497.910 | +1.98% |
+| Flash | 512 | 884.161 | 914.655 | -3.33% |
+| Flash | 1024 | 1535.000 | 1523.882 | +0.73% |
+| Flash | 2048 | 2773.000 | 2709.603 | +2.34% |
+| Flash | 4096 | 5156.000 | 5083.000 | +1.44% |
+| Flash | 8192 | 9922.000 | 9818.000 | +1.06% |
+| Pro | 8 | 780.301 | 708.382 | +10.15% |
+| Pro | 16 | 1041.000 | 1025.902 | +1.47% |
+| Pro | 32 | 1068.500 | 1101.980 | -3.04% |
+| Pro | 64 | 1133.000 | 1152.183 | -1.66% |
+| Pro | 128 | 1270.500 | 1277.056 | -0.51% |
+| Pro | 256 | 1631.000 | 1631.402 | -0.02% |
+| Pro | 512 | 2527.000 | 2387.071 | +5.86% |
+| Pro | 1024 | 3912.000 | 4015.000 | -2.57% |
+| Pro | 2048 | 6986.000 | 7037.000 | -0.72% |
+| Pro | 4096 | 13091.000 | 12874.000 | +1.69% |
+| Pro | 8192 | 25545.000 | 25137.000 | +1.62% |
+
+Geometric gaps are `+2.813%` over all 22 points, `+5.264%` over the ten
+small-M points, and `+0.813%` over the 12 large-M points. Flash is `+4.607%`
+overall (`+9.517%` small, `+0.684%` large); Pro is `+1.049%` overall
+(`+1.177%` small, `+0.942%` large). Relative to the prior R57 candidate run,
+the full 22-point geometric mean changes by `-0.25%`, while the seven
+R58-affected Flash points are effectively flat at `+0.07%`. This cross-run
+comparison does not reproduce the same-session formal A/B/A gain above and is
+treated as epoch variance, not change attribution. The terminal gap remains
+dominated by Flash M8-M128 and Pro M8. Complete paired logs are under
+`iter127-r58-pr383-full-matrix` on the pod and local artifact root.
