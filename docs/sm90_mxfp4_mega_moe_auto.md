@@ -2745,3 +2745,55 @@ points but does not close the remaining PR383 gap. The next iteration should
 retain the exact M8/M64 selector and shorten the HFMA2 temporary live ranges
 or pair it with an epilogue layout that removes the newly measured local
 traffic before expanding to another shape.
+
+## Rejected experiment R37: packed BF16 Flash M64 swap epilogue
+
+### Reason and direction
+
+R36 introduced 16 bytes of compiler stack and measurable local traffic while
+the final swap-AB epilogue still unpacked and repacked adjacent BF16 values.
+R37 enabled the existing packed-BF16 swap epilogue for the exact Flash M64
+specialization, with the hypothesis that a shorter packed output path would
+reduce register pressure enough to remove the spill.
+
+Eight-rank Flash M64 correctness passed at `0.000660`. The isolated NCU target
+did not move: local load/store sectors remained `180,224/73,024`, the cubin
+remained at `REG=128, STACK=16`, and executed instructions regressed by about
+`1.2%`. A 20-observation screen measured
+`488.911/462.501/476.673 us`, apparently winning both controls, but the formal
+50-observation R36/R37/R36 run measured
+`459.662/459.667/463.465 us`: `+0.001%` versus the first control and `-0.82%`
+versus the second. It therefore failed the strict double-control criterion and
+was fully reverted. Evidence is under
+`iter66-flash-m64-packed-epilogue` and
+`iter67-flash-m64-packed-epilogue-formal`.
+
+## Rejected experiment R38: shorten HFMA2 scale live ranges
+
+### Reason and direction
+
+R38 moved the compile-time HFMA2 branch outside the weight-half loop and
+constructed the packed scale directly from the two scale expressions. This
+removed the named FP32 combined-scale temporaries from the HFMA2 source path
+and duplicated only compile-time-eliminated loop bodies. The intended result
+was to lower peak register pressure without changing arithmetic.
+
+Eight-rank Flash M64 ring-wrap correctness passed at `0.000660`, but both
+static and dynamic profiler evidence rejected the mechanism:
+
+| isolated Flash M64 metric | R36 | R38 | change |
+| --- | ---: | ---: | ---: |
+| registers/thread | 128 | 128 | unchanged |
+| stack bytes | 16 | 16 | unchanged |
+| SASS `LDL` / `STL` instructions | 6 / 5 | 6 / 5 | unchanged |
+| local load sectors | 180,224 | 180,224 | unchanged |
+| local store sectors | 73,024 | 73,024 | unchanged |
+| executed warp instructions | 87,158,677 | 87,143,231 | -0.018% |
+| executed thread instructions | 2,733,535,692 | 2,733,161,967 | -0.014% |
+| global-load sectors | 960,389 | 959,792 | -0.062% |
+
+Because the resource target failed and the instruction difference was
+negligible, R38 was rejected before a noisy distributed A/B/A run and fully
+reverted. Evidence is under `iter68-flash-hfma2-live-range`. The next spill
+experiment must be driven by the actual spilled values in SASS rather than by
+CUDA source-level variable names.
