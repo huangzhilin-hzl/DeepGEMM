@@ -3473,3 +3473,46 @@ confirms that the old four-round scale publication was a common Flash
 swap-AB bottleneck rather than an M16-only compiler accident. Complete screen
 and formal logs are under `iter93-vector-sfb-adjacent-screen` and
 `iter94-vector-sfb-adjacent-formal` on the pod and local artifact root.
+
+## R52 same-node full matrix against PR383
+
+The post-commit matrix reruns both native drivers on the same H20 node under
+the authoritative contract. M8 through M128 use 50 observations; M256 through
+M8192 use three. Every observation contains 20 launches, reports the
+maximum-rank median, and starts from cold L2. PR383 time is its measured FP8
+L1 plus L2 duration.
+
+| model | M | R52 MXFP4 us | PR383 FP8 us | gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 319.272 | 308.524 | +3.48% |
+| Flash | 16 | 352.478 | 313.487 | +12.44% |
+| Flash | 32 | 357.011 | 333.222 | +7.14% |
+| Flash | 64 | 390.460 | 369.663 | +5.63% |
+| Flash | 128 | 484.034 | 427.491 | +13.23% |
+| Flash | 256 | 501.068 | 525.578 | -4.66% |
+| Flash | 512 | 889.924 | 919.206 | -3.19% |
+| Flash | 1024 | 1511.000 | 1508.489 | +0.17% |
+| Flash | 2048 | 2824.000 | 2728.568 | +3.50% |
+| Flash | 4096 | 5209.000 | 5055.000 | +3.05% |
+| Flash | 8192 | 10025.000 | 9830.000 | +1.98% |
+| Pro | 8 | 819.119 | 705.827 | +16.05% |
+| Pro | 16 | 1071.500 | 1004.129 | +6.71% |
+| Pro | 32 | 1133.000 | 1097.008 | +3.28% |
+| Pro | 64 | 1184.500 | 1153.941 | +2.65% |
+| Pro | 128 | 1313.500 | 1284.029 | +2.30% |
+| Pro | 256 | 1624.000 | 1624.990 | -0.06% |
+| Pro | 512 | 2545.000 | 2420.777 | +5.13% |
+| Pro | 1024 | 3933.000 | 4020.000 | -2.16% |
+| Pro | 2048 | 6968.000 | 7055.000 | -1.23% |
+| Pro | 4096 | 13089.000 | 12906.000 | +1.42% |
+| Pro | 8192 | 25337.000 | 25064.000 | +1.09% |
+
+Geometric gaps are `+3.420%` over all 22 points, `+7.190%` over the ten
+small-M points, and `+0.381%` over the 12 large-M points. Flash is `+3.750%`
+overall (`+8.315%` small, `+0.093%` large); Pro is `+3.092%` overall
+(`+6.076%` small, `+0.670%` large). Relative to R48, R52 cuts the all-point
+gap from `+6.963%` to `+3.420%` and the Flash small-M gap from `+25.220%` to
+`+8.315%`. The next scale-layout experiment therefore targets Pro M8-M128,
+where natural row-major scale storage still prevents the successful vector
+publication path. Complete logs are under `iter95-r52-pr383-full-matrix` on
+the pod and local artifact root.
