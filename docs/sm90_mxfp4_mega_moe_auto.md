@@ -4397,3 +4397,22 @@ the first control and improved only `0.09%` against the second. The result is
 both order-dependent and noise-sized, so the selector extension was fully
 reverted before commit and did not enter formal profiling. Evidence is under
 `iter139-sparse-flash-m128-screen` on the pod and local artifact root.
+
+## Rejected R63: single-block scheduler lookup for Flash M128
+
+R63 exposed the R29 scheduler owner-lookup fast path through an explicit JIT
+template selector and enabled it only at Flash M128. When every local expert
+owns at most one M64 block, the path selects the owner from the nonempty-lane
+mask instead of rebuilding a warp prefix sum; skewed experts still take the
+unchanged multi-block fallback. The candidate extension was rebuilt so its
+host generator and new template ABI matched, and the production M128
+forced-ring-wrap scenario passed.
+
+The 20-observation cold-L2 A/B/A screen measured
+`512.465/512.149/509.619 us` for R61/R63/R61. The candidate improved only
+`0.06%` against the first control and regressed `0.50%` against the second.
+The result rejects scheduler owner lookup as the source of M128's remaining
+gap. All selector plumbing was reverted and the original R61 extension ABI
+restored. Evidence, including the initial stale-extension compile failure and
+the successful matched rerun, is under
+`iter140-single-block-flash-m128-screen` on the pod and local artifact root.
