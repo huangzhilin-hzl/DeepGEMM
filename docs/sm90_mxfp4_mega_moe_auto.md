@@ -5152,3 +5152,46 @@ measures `261.632 -> 257.056 us` (`-1.75%`). Correctness, screen, formal,
 NCU, and NSYS evidence is under `iter190` through `iter195` on the pod and
 local artifact root. R82 requires a fresh complete PR383 matrix before its
 aggregate headroom is claimed.
+
+### Fresh PR383 full-matrix comparison
+
+R82 and PR383 were rebuilt and measured back-to-back on the same eight-H20
+pod with the fixed production seed and shapes. Small M uses 50 observations;
+large M uses three. Each observation contains 20 launches after one warmup,
+flushes L2 before every launch, and reports the median of the maximum rank.
+Positive gap means R82 is slower than PR383.
+
+| mode | M | R82 us | PR383 us | gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 321.0955 | 291.2895 | +10.232% |
+| Flash | 16 | 325.6950 | 308.2110 | +5.673% |
+| Flash | 32 | 344.2885 | 331.5035 | +3.857% |
+| Flash | 64 | 368.4330 | 368.1080 | +0.088% |
+| Flash | 128 | 429.0355 | 432.0645 | -0.701% |
+| Flash | 256 | 512.0040 | 518.9610 | -1.341% |
+| Flash | 512 | 890.1730 | 943.1800 | -5.620% |
+| Flash | 1024 | 1487.0000 | 1552.6480 | -4.228% |
+| Flash | 2048 | 2740.0000 | 2726.3620 | +0.500% |
+| Flash | 4096 | 5120.0000 | 5075.0000 | +0.887% |
+| Flash | 8192 | 9869.0000 | 9818.0000 | +0.519% |
+| Pro | 8 | 745.2310 | 713.5445 | +4.441% |
+| Pro | 16 | 997.2045 | 1000.0420 | -0.284% |
+| Pro | 32 | 1029.5000 | 1099.8795 | -6.399% |
+| Pro | 64 | 1062.5000 | 1155.8095 | -8.073% |
+| Pro | 128 | 1213.0000 | 1275.5990 | -4.907% |
+| Pro | 256 | 1624.0000 | 1639.6270 | -0.953% |
+| Pro | 512 | 2513.0000 | 2432.9410 | +3.291% |
+| Pro | 1024 | 3940.0000 | 4062.0000 | -3.003% |
+| Pro | 2048 | 6893.0000 | 6990.0000 | -1.388% |
+| Pro | 4096 | 12984.0000 | 12924.0000 | +0.464% |
+| Pro | 8192 | 25289.0000 | 25104.0000 | +0.737% |
+
+The 22-point geometric mean is `-0.367%`: R82 is faster overall. Flash is
+still `+0.810%` slower while Pro is `-1.531%` faster. Small M is `+0.243%`
+slower and large M is `-0.873%` faster; split further, Flash small M is the
+remaining dominant deficit at `+3.754%`, while Flash large, Pro small, and
+Pro large are `-1.580%`, `-3.150%`, and `-0.161%`. This fresh matrix widens
+R78's `-0.088%` aggregate lead, validates keeping R82, and identifies Flash
+M8/M16/M32 plus Pro M8/M512 as the next optimization targets. Raw evidence is
+archived under `iter196-r82-pr383-full-matrix` on the pod and local artifact
+root.
