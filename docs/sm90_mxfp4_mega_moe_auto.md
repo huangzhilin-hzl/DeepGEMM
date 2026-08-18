@@ -5499,3 +5499,31 @@ The required 50-observation A/B/A reversed the result:
 The additional ballots, popcount, second-round branch, and frequent fallback
 do not amortize at M32. R87 was reverted in full and not committed. Evidence
 is archived under `iter216` through `iter218`.
+
+## Rejected R88: two-layer direct source lookup for Flash M16
+
+R88 narrowed R87's two-layer idea to exact Flash M16, where the probability
+that every source-rank/expert count is at most two is roughly 95%. M8 retained
+R84's single-slot selector and M32 retained R85. The second layer avoided the
+general round-robin loop when one source contributed exactly two routes.
+
+Forced-wrap correctness passed at `diff=0.000654`; resources remained 118
+registers, zero stack/local storage, and 1024 bytes static shared memory. The
+20-observation screen straddled the two controls:
+
+| point | first R85 us | R88 us | change | second R85 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M16 max rank | 341.2815 | 334.0850 | -2.11% | 331.2810 | +0.85% |
+| Flash M16 rank 0 | 322.7765 | 315.7180 | -2.19% | 313.4745 | +0.72% |
+
+The 50-observation A/B/A was double-negative:
+
+| point | first R85 us | R88 us | change | second R85 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M16 max rank | 336.0085 | 346.9630 | +3.26% | 336.5130 | +3.11% |
+| Flash M16 rank 0 | 319.5940 | 329.9055 | +3.23% | 309.8935 | +6.46% |
+
+Even at high count-at-most-two coverage, the extra popcount and per-token
+round branch cost more than retaining the R85 fallback for duplicate routes.
+R88 was reverted in full and not committed. Evidence is archived under
+`iter219` through `iter221`.
