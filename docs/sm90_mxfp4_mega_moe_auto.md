@@ -2916,3 +2916,47 @@ PTXAS already scheduled both source forms to effectively identical dynamic
 work, and the candidate failed the reverse-order distributed control. R42 was
 fully reverted without a formal 50-observation run. Evidence is under
 `iter74-flash-m16-decode-ilp` on the pod and local artifact root.
+
+## Rejected experiment R43: one-CTA N256 Flash M16
+
+### Reason and direction
+
+R16 had already shown that replacing the two resident M64N128 CTAs with one
+CTA and two N64 math warpgroups loses throughput. R43 tested the stronger
+variant suggested by the retained older SM90 NVFP4 work: one 384-thread CTA
+per physical H20 SM, an M64N256 task, and two math warpgroups that each own a
+complete N128 tile. This preserves the accepted kernel's aggregate N256 work
+per physical SM while sharing the A tile, scheduler mailbox, and producer
+front end. The selector was exact for routed DSV4 Flash M16; all other
+authoritative points retained R36.
+
+The implementation partitioned packed/expanded B, weight SF, L1/L2 C/D
+scratch, per-WG barriers, activation SF stores, TMA stores, and NVLink scatter
+addresses between the two warpgroups. The host selected 78 workers, a BN256
+TMA box, 384 threads, and one-block residency. Eight-rank forced-ring-wrap
+correctness passed with the unchanged `0.000645` error. The resulting cubin
+used 105 registers/thread with no compiler stack or local allocation, versus
+114 registers/thread and no stack for the R36 M16 cubin.
+
+### Performance and profiler result
+
+The 20-observation, ten-warmup, 20-launch cold-L2 screen measured
+`451.069 us` for the first R36 control and `1004.500 us` for R43, a
+`+122.69%` regression. This is far outside run-to-run noise, so the second
+control was stopped before observations and the experiment was reverted.
+
+Profiler evidence isolates a concurrency failure rather than extra dynamic
+work. On the same isolated one-rank, 32-expert Flash M16 case, source-counter
+NCU reported 73,604,735 executed warp instructions for R43 versus 73,216,037
+for the preceding exact R36 control (`+0.53%`), while profiled duration grew
+from `355.232 us` to `1056.320 us` (`+197.36%`). A fresh matched NSYS pair
+measured `358.398 us` for R36 and `1054.971 us` for R43 (`+194.36%`). Thus two
+math warpgroups inside one CTA do not reproduce the tensor-core/front-end
+overlap of two independently resident CTAs on H20, even when total WGMMA work
+and N coverage are held constant.
+
+The result rules out further one-CTA/two-math-WG widening for this kernel.
+Future small-M work should preserve two independent resident CTAs and reduce
+per-CTA fixed work, or move work onto currently underused producer/dispatch
+warps without reducing the number of resident WGMMA owners. Complete evidence
+is under `iter75-wide-flash-m16` on the pod and local artifact root.
