@@ -3010,3 +3010,53 @@ materialize. R44 was fully reverted. Future producer assistance must split a
 small, independently useful fraction of decode without serializing the full
 tile or delaying producer advance. Complete evidence is under
 `iter76-producer-decode-flash-m16` on the pod and local artifact root.
+
+## Rejected experiment R45: direct mapped Flash M16 scale loads
+
+### Reason and direction
+
+The R36 full-section NCU baseline for isolated Flash M16 is spill-free but
+reports `61.09%` scheduler cycles with no eligible warp. R45 targeted one
+dependency at the head of each paired packed-B decode. R36 loads one SFB word
+per lane and then uses two dependent `SHFL` instructions to map the 32 source
+rows onto the two row groups. The exact Flash M16 specialization instead had
+both lanes for a decoded row load that row's SFB word directly, relying on
+shared-memory multicast. No CTA, pipeline, barrier, packed-weight, or numeric
+contract changed.
+
+Eight-rank forced-ring-wrap correctness passed at `0.000645`. The official
+benchmark cubin remained spill-free, but grew from 114 to 115 registers per
+thread (`STACK=0, LOCAL=0` in both cases).
+
+### Performance and profiler result
+
+The 20-observation, ten-warmup, 20-launch cold-L2 A/B/A screen rejected the
+change in both launch orders:
+
+| Flash point | first R36 us | R45 us | change | second R36 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| M16 | 444.694 | 459.855 | +3.41% | 426.161 | +7.91% |
+
+Matched isolated source-counter NCU shows that the source-level instruction
+trade did not survive code generation as intended:
+
+| isolated Flash M16 metric | R36 | R45 | change |
+| --- | ---: | ---: | ---: |
+| duration us | 370.912 | 590.176 | +59.12% |
+| executed warp instructions | 73,213,070 | 73,932,187 | +0.98% |
+| executed thread instructions | 2,288,544,046 | 2,310,386,924 | +0.95% |
+| shared-load bank conflicts | 3,052,993 | 3,050,758 | -0.07% |
+| global-load sectors | 844,360 | 865,705 | +2.53% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+
+Matched one-rank NSYS measures `357.534 us` for R36 and `573.949 us` for R45
+(`+60.53%`). The isolated topology magnifies the latency cost and is not the
+acceptance score, but NCU and NSYS agree that multicast did not shorten the
+critical chain. Direct row addressing added instructions and one register,
+while the shared-bank-conflict count was already effectively unchanged.
+
+R45 was fully reverted. Further decoder work must remove final SASS from the
+E2M1-to-E4M3 conversion itself or expose independent packed-word work without
+adding address generation. Complete evidence is under
+`iter77-r36-pr383-flash-m16` and `iter78-direct-scale-flash-m16` on the pod and
+local artifact root.
