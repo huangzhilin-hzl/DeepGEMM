@@ -2885,3 +2885,34 @@ cliff: source-level dead-bucket pruning is unsafe here unless a future version
 also proves zero stack in the final M8192-capacity cubin before benchmarking.
 Evidence is under `iter73-compile-time-swap-buckets` on the pod and local
 artifact root.
+
+## Rejected experiment R42: interleave paired Flash decode chains
+
+### Reason and direction
+
+R21's paired Flash decoder shares one E4M3 lookup between two packed words but
+serially reuses the same five PTX temporaries. R42 exposed both independent
+PRMT/LOP3 chains together, following an instruction-level-parallelism pattern
+that had been retained in an older SM90 NVFP4 tuning branch. The selector was
+limited to Flash M16, the largest remaining PR383 gap.
+
+Eight-rank correctness passed at `0.000645`. Both production and isolated
+cubins stayed at `REG=114, STACK=0, LOCAL=0`. The 20-observation cold-L2
+screen was mixed: R36/R42/R36 measured
+`458.362/448.270/442.593 us`, or `-2.20%/+1.28%`.
+
+Isolated one-rank, 32-expert NCU showed why the first apparent win was not
+credible:
+
+| metric | R36-equivalent | R42 | change |
+| --- | ---: | ---: | ---: |
+| kernel duration us | 355.232 | 366.430 | +3.15% |
+| executed warp instructions | 73,216,037 | 73,206,099 | -0.014% |
+| executed thread instructions | 2,288,537,091 | 2,288,373,109 | -0.007% |
+| global-load sectors | 844,012 | 844,664 | +0.08% |
+| local load/store sectors | 0/0 | 0/0 | unchanged |
+
+PTXAS already scheduled both source forms to effectively identical dynamic
+work, and the candidate failed the reverse-order distributed control. R42 was
+fully reverted without a formal 50-observation run. Evidence is under
+`iter74-flash-m16-decode-ilp` on the pod and local artifact root.
