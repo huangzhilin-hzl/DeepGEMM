@@ -5447,3 +5447,26 @@ large-M points moved by several percent in both directions, so the difference
 cannot be attributed to the M16-only change. The reliable next target is the
 50-observation Pro M8 deficit at `+6.158%`; raw evidence is archived in
 `iter213-r85-pr383-full-matrix`.
+
+## Rejected R86: direct source-rank lookup for Pro M8
+
+R86 tested R84's single-slot source-rank selection on exact routed Pro M8,
+which was the largest 50-observation deficit in the R85 full matrix at
+`+6.158%`. Pro M8 has even fewer routes per source-rank/expert pair than Flash
+M8, so the runtime uniqueness condition is commonly true. The experiment kept
+the duplicate-route fallback unchanged and did not affect Pro M16+ or any
+Flash specialization.
+
+Exact eight-rank correctness passed at `diff=0.000716`. The cubin used 107
+registers, zero stack/local storage, and 1024 bytes static shared memory. The
+20-observation cold-L2 A/B/A screen was nevertheless double-negative:
+
+| point | first R85 us | R86 us | change | second R85 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pro M8 max rank | 767.5590 | 775.2045 | +1.00% | 766.1460 | +1.18% |
+| Pro M8 rank 0 | 761.2575 | 771.7005 | +1.37% | 764.8755 | +0.89% |
+
+The common-case ballot and branch cost more than the eliminated round-robin
+work on this longer Pro kernel. R86 was reverted in full and not committed.
+Gate and screening evidence is archived under `iter214` and `iter215` on the
+pod and local artifact root.
