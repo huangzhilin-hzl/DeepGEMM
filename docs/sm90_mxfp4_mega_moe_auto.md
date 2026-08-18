@@ -3682,3 +3682,44 @@ bytes static shared memory. Complete correctness, screen, NCU, NSYS, and
 resource evidence is under `iter101-vector-all-coalesced-sf-correctness`
 through `iter103-vector-all-coalesced-sf-profiles` on the pod and local
 artifact root.
+
+### R54 authoritative DSV4 matrix versus PR383
+
+The fresh same-node comparison again uses the required 8-rank DSV4 Flash and
+Pro matrix, one warmup, 50 small-M observations, three large-M observations,
+20 launches per observation, cold L2, and the maximum-rank median. PR383 uses
+its native two-phase FP8 driver and reports L1 plus L2.
+
+| model | M | R54 MXFP4 us | PR383 FP8 us | gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 320.868 | 293.978 | +9.15% |
+| Flash | 16 | 359.835 | 309.514 | +16.26% |
+| Flash | 32 | 356.036 | 330.895 | +7.60% |
+| Flash | 64 | 383.529 | 376.334 | +1.91% |
+| Flash | 128 | 475.163 | 440.190 | +7.95% |
+| Flash | 256 | 496.234 | 510.924 | -2.88% |
+| Flash | 512 | 891.643 | 916.068 | -2.67% |
+| Flash | 1024 | 1499.000 | 1545.368 | -3.00% |
+| Flash | 2048 | 2783.000 | 2753.866 | +1.06% |
+| Flash | 4096 | 5218.000 | 5064.000 | +3.04% |
+| Flash | 8192 | 9988.000 | 9868.000 | +1.22% |
+| Pro | 8 | 782.680 | 727.351 | +7.61% |
+| Pro | 16 | 1022.000 | 1025.875 | -0.38% |
+| Pro | 32 | 1081.500 | 1111.045 | -2.66% |
+| Pro | 64 | 1133.500 | 1159.103 | -2.21% |
+| Pro | 128 | 1290.000 | 1284.775 | +0.41% |
+| Pro | 256 | 1603.000 | 1630.087 | -1.66% |
+| Pro | 512 | 2526.000 | 2394.240 | +5.50% |
+| Pro | 1024 | 3916.000 | 4011.000 | -2.37% |
+| Pro | 2048 | 6937.000 | 7035.000 | -1.39% |
+| Pro | 4096 | 13102.000 | 12894.000 | +1.61% |
+| Pro | 8192 | 25583.000 | 25096.000 | +1.94% |
+
+Geometric gaps are `+1.979%` over all 22 points, `+4.405%` over the ten
+small-M points, and `-0.00045%` over the 12 large-M points. Flash is `+3.446%`
+overall (`+8.476%` small, `-0.567%` large); Pro is `+0.532%` overall
+(`+0.487%` small, `+0.569%` large). Relative to R53, R54 cuts the all-point
+gap from `+3.317%` to `+1.979%` and brings the aggregate large-M comparison to
+parity. The remaining dominant cluster is Flash M8-M128, especially M16 and
+M128. Complete logs are under `iter104-r54-pr383-full-matrix` on the pod and
+local artifact root.
