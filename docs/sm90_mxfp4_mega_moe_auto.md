@@ -4633,3 +4633,67 @@ Flash M16 (`+12.97%`), Flash M128 (`+9.25%`), Pro M8 (`+5.86%`), and Pro M512
 Flash M16/M128 critical paths without modifying the already-leading Pro
 small-M or Flash M256-M1024 buckets. Complete logs are under
 `iter153-r66-pr383-full-matrix` on the pod and local artifact root.
+
+## R67: move mature Flash M128 below the swap-AB crossover
+
+### Reason and implementation
+
+R66's fresh matrix leaves Flash M128 `9.25%` behind PR383. The regular
+orientation computes a full M64 tensor-core tile for every expert block even
+when the final block owns far fewer routed tokens. R25 previously tested
+swap-AB at M128 and rejected it by `2.07-4.05%`, but that experiment predates
+the accepted vectorized weight-scale staging, packed HFMA2 promotion, PRMT
+decoder, and bank-permuted packed loads. R67 therefore retests the structural
+crossover on the mature path instead of treating the old microarchitecture as
+permanent evidence.
+
+The only source change extends routed Flash's compile-time `small_m_swap_ab`
+selector from M<=64 to M<=128. The existing runtime N8/N16/N32/N64 buckets
+still split expert ownership into M64 tasks, retain the same processed MXFP4
+weights and blockwise activation scales, and preserve every other Flash and
+Pro specialization. The exact eight-rank forced-ring-wrap M128 case passes at
+the unchanged `diff=0.000658`; all 13 production scenarios subsequently pass,
+including every Flash/Pro ring-wrap case.
+
+### Screening and formal performance
+
+The 20-observation cold-L2 R66/R67/R66 screen measured
+`539.814/444.519/495.906 us`. The first control was visibly slow, but R67 also
+beats the faster reverse control by `10.36%`. The authoritative one-warmup,
+50-observation, 20-launch, cold-L2 A/B/A result is:
+
+| point | first R66 us | R67 us | change | second R66 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M128 | 503.079 | 439.360 | -12.67% | 501.610 | -12.41% |
+
+Rank-0 medians move from `484.712/476.882 us` to `434.562 us`, so the gain is
+not created by a single slow peer. Relative to the immediately preceding
+same-session PR383 M128 result (`435.668 us`), R67 is now only `0.85%` behind,
+although a fresh complete matrix remains the aggregate authority.
+
+### NCU and NSYS mechanism check
+
+A matched one-rank/32-expert profile preserves one production Flash expert
+shard while avoiding collective replay. It confirms that the structural
+selector reduces elapsed time despite executing more scalar control and
+remapping instructions:
+
+| metric | R66 regular | R67 swap-AB | change |
+| --- | ---: | ---: | ---: |
+| NCU duration us | 460.736 | 399.744 | -13.24% |
+| executed warp instructions | 90,815,495 | 102,993,473 | +13.41% |
+| executed thread instructions | 2,843,365,775 | 3,239,074,047 | +13.92% |
+| shared-load bank conflicts | 14,715 | 15,135 | +2.85% |
+| shared-store bank conflicts | 1,430,057 | 913,437 | -36.13% |
+| global-load sectors | 1,060,109 | 1,053,287 | -0.64% |
+| local load/store sectors | 0 / 0 | 16,384 / 2,496 | new |
+| registers/thread | 126 | 128 | +2 |
+| dynamic shared memory KiB | 110.816 | 110.816 | unchanged |
+
+The extra generic instructions and small local frame are outweighed by
+bucketed tensor-core work that no longer evaluates padded token rows. NSYS
+independently measures `419.392 -> 364.672 us` (`-13.05%`). Correctness,
+screening, formal timing, NCU, and NSYS artifacts are under `iter154` through
+`iter157` on the pod and local artifact root. The terminal aggregate target is
+still not assumed complete; R67 requires a fresh 22-point PR383 matrix before
+the next residual is selected.

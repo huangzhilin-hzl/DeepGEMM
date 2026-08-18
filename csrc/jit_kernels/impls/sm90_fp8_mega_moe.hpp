@@ -98,9 +98,11 @@ public:
         const bool use_incremental_mxfp4_descriptor =
             args.hidden == 4096 and
             args.num_tokens > kSM90MoeMaxLatencyOverlapTokens;
+        // The mature swap path's vector scale staging, packed promotion, and
+        // bank-permuted decoder move Flash M128 below the regular crossover.
         const bool small_m_swap_ab =
             args.num_shared_experts == 0 and
-            ((args.hidden == 4096 and args.num_tokens <= 64) or
+            ((args.hidden == 4096 and args.num_tokens <= 128) or
              (args.hidden == 7168 and args.num_tokens <= 128));
         const uint32_t max_swap_ab_tokens =
             args.num_tokens <= 8 ? 8 :
