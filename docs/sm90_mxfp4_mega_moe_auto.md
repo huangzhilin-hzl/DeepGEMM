@@ -2849,3 +2849,39 @@ insufficient for sub-percent decisions. Evidence is under
 `iter70-active-swap-chunks-screen`,
 `iter71-pro-active-swap-chunks-screen`, and
 `iter72-pro-m32-active-chunks-formal` on the pod and local artifact root.
+
+## Rejected experiment R41: compile-time swap-bucket pruning
+
+### Reason and direction
+
+`kMaxSwapABTokens` proves that M8/M16/M32 specializations can never reach
+larger swap-AB WGMMA buckets, but the source still instantiated the full
+N8/N16/N32/N64 dispatch chain. R41 used the template bound to omit impossible
+larger buckets and made M8 call N8 directly. All six affected eight-rank
+Flash/Pro M8/M16/M32 production cases passed correctness.
+
+The compiler response invalidated the intended mechanism. Official benchmark
+cubins acquired large local frames despite having fewer bucket bodies:
+
+| point | candidate stack bytes | candidate cubin bytes |
+| --- | ---: | ---: |
+| Flash M8/M16/M32 | 208 / 208 / 224 | 101208 / 128856 / 168792 |
+| Pro M8/M16/M32 | 176 / 176 / 256 | 95064 / 124760 / 164696 |
+
+The 20-observation cold-L2 screen regressed every point:
+
+| point | R36 us | R41 us | change |
+| --- | ---: | ---: | ---: |
+| Flash M8 | 369.108 | 396.396 | +7.39% |
+| Flash M16 | 418.312 | 440.080 | +5.20% |
+| Flash M32 | 427.756 | 461.213 | +7.82% |
+| Pro M8 | 862.452 | 913.188 | +5.88% |
+| Pro M16 | 1072.500 | 1418.500 | +32.26% |
+| Pro M32 | 1142.500 | 1607.000 | +40.66% |
+
+The result is far outside measurement noise, so no second control was needed.
+R41 was fully reverted. It establishes a PTXAS inlining/register-allocation
+cliff: source-level dead-bucket pruning is unsafe here unless a future version
+also proves zero stack in the final M8192-capacity cubin before benchmarking.
+Evidence is under `iter73-compile-time-swap-buckets` on the pod and local
+artifact root.
