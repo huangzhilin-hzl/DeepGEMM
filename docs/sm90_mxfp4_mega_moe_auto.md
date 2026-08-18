@@ -3371,3 +3371,20 @@ transactions and multiplies conflicts. R49 was fully reverted. Future layout
 work must change the lane-to-bank mapping or use a collective matrix store,
 not merely narrow the existing per-lane transaction. Complete evidence is
 under `iter86-split-sts64-flash-m16` on the pod and local artifact root.
+
+## Rejected experiment R50: B32 packed-B TMA swizzle for Flash M16
+
+### Reason and direction
+
+R50 targeted the dominant 3.05-million shared-load conflicts in the matched
+Flash M16 profile. The exact M16 specialization changed only the packed-B TMA
+swizzle from B64 to B32 and changed both packed-byte decoder address mappings
+from `Swizzle<2, 4, 3>` to the corresponding `Swizzle<1, 4, 3>`. Expanded B,
+WGMMA, CTA topology, barriers, and numerical operations were unchanged.
+
+The mandatory eight-rank `production.flash_m16` correctness gate failed on
+its first scenario with `cudaErrorIllegalAddress`. The B32 descriptor/layout
+combination is therefore not legal for this packed tile as currently shaped;
+no profiler or timing result can be accepted. R50 was fully reverted before
+any further experiment. The complete failure log is under
+`iter87-b32-packed-flash-m16` on the pod and local artifact root.
