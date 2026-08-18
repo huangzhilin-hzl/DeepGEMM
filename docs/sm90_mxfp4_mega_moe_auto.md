@@ -3822,3 +3822,53 @@ dynamic shared memory. Complete source-counter, correctness, screening,
 formal, NCU, and NSYS evidence is under
 `iter108-r54-flash-m16-source-counters` through
 `iter112-flash-small-bank-permuted-screen` on the pod and local artifact root.
+
+### R56 authoritative DSV4 matrix against PR383
+
+The post-R56 paired run used the requested `tests/bench_mega_moe_sm90.py`
+standard on the same idle eight-H20 pod: Flash and Pro, M=
+8/16/32/64/128/256/512/1024/2048/4096/8192, one warmup, 50 observations for
+M<=128, three observations for M>=256, 20 launches per observation, cold L2,
+and max-rank median. PR383 is timed as its L1+L2 sum; R56 is the fused MXFP4
+persistent kernel.
+
+| model | M | R56 us | PR383 us | R56 gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 321.680 | 302.466 | +6.35% |
+| Flash | 16 | 349.697 | 311.158 | +12.39% |
+| Flash | 32 | 380.873 | 331.420 | +14.92% |
+| Flash | 64 | 420.351 | 366.732 | +14.62% |
+| Flash | 128 | 480.473 | 432.905 | +10.99% |
+| Flash | 256 | 508.226 | 506.172 | +0.41% |
+| Flash | 512 | 898.071 | 918.616 | -2.24% |
+| Flash | 1024 | 1514.000 | 1518.630 | -0.30% |
+| Flash | 2048 | 2759.000 | 2734.965 | +0.88% |
+| Flash | 4096 | 5214.000 | 5086.000 | +2.52% |
+| Flash | 8192 | 9997.000 | 9828.000 | +1.72% |
+| Pro | 8 | 794.784 | 715.412 | +11.10% |
+| Pro | 16 | 1049.500 | 1005.106 | +4.42% |
+| Pro | 32 | 1093.500 | 1099.223 | -0.52% |
+| Pro | 64 | 1132.000 | 1166.036 | -2.92% |
+| Pro | 128 | 1296.500 | 1273.861 | +1.78% |
+| Pro | 256 | 1612.000 | 1686.930 | -4.44% |
+| Pro | 512 | 2534.000 | 2449.549 | +3.45% |
+| Pro | 1024 | 3926.000 | 4064.000 | -3.40% |
+| Pro | 2048 | 6945.000 | 7017.000 | -1.03% |
+| Pro | 4096 | 13116.000 | 12901.000 | +1.67% |
+| Pro | 8192 | 25530.000 | 25111.000 | +1.67% |
+
+The geometric gaps are `+3.210%` over all 22 points, `+7.137%` over the ten
+small-M points, and `+0.048%` over the 12 large-M points. Flash is `+5.483%`
+overall and Pro is `+0.986%` overall. At the only changed specialization,
+Flash M16, R56 improves the candidate median from R54's `359.835 us` to
+`349.697 us` (`-2.82%`) and narrows the paired PR383 gap from `+16.26%` to
+`+12.39%`. This is consistent with the formal A/B/A and matched NCU/NSYS
+evidence above.
+
+The exact compile-time selector is false for the other 21 points, so their
+movement relative to the R54 matrix is not attributable to R56. In
+particular, the current Flash M32/M64 values are much slower than R54 even
+though those specializations compile the unchanged path; they are treated as
+inter-run variance and require a same-session control before choosing the
+next code direction. Complete paired logs are under
+`iter113-r56-pr383-full-matrix` on the pod and local artifact root.
