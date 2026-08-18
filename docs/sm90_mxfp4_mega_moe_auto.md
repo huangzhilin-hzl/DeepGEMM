@@ -4266,3 +4266,34 @@ R58's prior matrix, the all-point geometric gap contracts from `+2.813%` to
 `+1.700%`, consistent with the same-code R59 A/B/A result. Complete paired
 logs are under `iter133-r59-pr383-full-matrix` on the pod and local artifact
 root.
+
+## Rejected R60: extend incremental WGMMA descriptors below M8192
+
+R59 only enables base-plus-increment shared-memory WGMMA descriptors for
+Flash M8192. R60 temporarily extended that existing path to regular Flash
+M128-M4096. The experiment removes repeated descriptor bit-field construction
+inside each WGMMA group without changing data layout, WGMMA count, pipeline
+order, or numerical operations. All 28 full-suite correctness scenarios
+passed.
+
+The initial cold-L2 A/B/A screen used 20 observations at M128 and five at the
+larger points:
+
+| point | first R59 us | R60 us | change | second R59 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M128 | 519.018 | 496.808 | -4.28% | 506.428 | -1.90% |
+| Flash M256 | 561.842 | 551.578 | -1.83% | 538.625 | +2.40% |
+| Flash M512 | 924.740 | 944.922 | +2.18% | 907.315 | +4.15% |
+| Flash M1024 | 1502.000 | 1525.000 | +1.53% | 1496.000 | +1.94% |
+| Flash M2048 | 2798.000 | 2806.000 | +0.29% | 2779.000 | +0.97% |
+| Flash M4096 | 5137.000 | 5164.000 | +0.53% | 5137.000 | +0.53% |
+
+Only M128 was double-positive, so the selector was narrowed to that point
+plus the pre-existing M8192 path and rerun with the authoritative 50
+observations. The formal result was `498.717 -> 499.386 -> 492.754 us`, a
+`+0.13%/+1.35%` regression against the two controls. The source change was
+fully reverted before commit, and no profiler result is used to overrule the
+formal timing gate. Correctness, screen, and formal logs are under
+`iter134-incremental-desc-regular-flash-screen` and
+`iter135-incremental-desc-flash-m128-formal` on the pod and local artifact
+root.
