@@ -7936,3 +7936,36 @@ that exponent extraction is no longer a material ceiling: a 5.88% reduction
 in integer instructions moves the local kernel only 0.39% and does not yield
 a robust distributed gain. Resources/SASS, NCU, both timing orders, and the
 robustness run are archived under `iter410` through `iter414`.
+
+## R126 matched PR383 NCU/NSYS: Pro M16 residual is distributed
+
+The refreshed matrix left Pro M16 about 8.4% behind PR383 in both comparison
+orders. A matched one-rank profile with the production 48-expert shard shows
+the opposite local relationship. PR383's native L1 and L2 kernels take
+`633.120 + 338.940 = 972.060 us` under NCU, while R126 takes `842.820 us`
+(`-13.30%`). Low-perturbation NSYS independently measures
+`616.927 + 322.111 = 939.038 us` for PR383 and `793.695 us` for R126
+(`-15.48%`).
+
+R126's fused MXFP4 kernel performs more dynamic decode/address work but moves
+far fewer weight bytes:
+
+| metric | PR383 L1+L2 | R126 | change |
+| --- | ---: | ---: | ---: |
+| NCU duration | 972.060 us | 842.820 us | -13.30% |
+| NSYS duration | 939.038 us | 793.695 us | -15.48% |
+| DRAM bytes read | 2.950 GB | 1.510 GB | -48.81% |
+| global-load sectors | 2454141 | 2795827 | +13.92% |
+| warp instructions | 177686668 | 216298780 | +21.73% |
+| thread instructions | 5300597058 | 6744994138 | +27.25% |
+| shared-load conflicts | 85072 | 10445 | -87.72% |
+| shared-store conflicts | 103193 | 4967422 | +4713.72% |
+
+The fused local kernel already has substantial headroom over PR383; the
+eight-rank deficit is therefore cross-rank arrival, persistent scheduling, or
+completion-tail latency rather than MXFP4 arithmetic. Existing adjacent-point
+experiments already reject direct-source lookup and sparse completion at Pro
+M8 and sparse completion at Pro M512, so those mechanisms are not repeated at
+M16 without a new critical-path dependency. Full reports are archived under
+`iter415-r126-pr383-ncu-pro-m16` and
+`iter416-r126-pr383-nsys-pro-m16`.
