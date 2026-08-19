@@ -7148,3 +7148,87 @@ four affected points:
 R125 is accepted. Correctness/resources, NCU, both distributed timing orders,
 the excluded wrong-shard NSYS attempt, and the corrected NSYS evidence are
 archived under `iter357` through `iter362`.
+
+## R126 accepted: share the complete-row decoder across Pro small-M
+
+### Reason and direction
+
+R125's complete-row mapping is independent of the model hidden size: each
+math-warpgroup thread already owns the scale word for one of the 128 packed
+weight rows, and the two adjacent LDS.64 pairs cover the same four packed
+words as the older two-lanes-per-row mapping. R126 therefore removes the
+Flash-only hidden-size guard and selects the mapping for every routed
+small-M specialization. The only newly affected production points are Pro
+M8/M16/M32/M64/M128. Regular-orientation Pro, all shared-expert paths, and
+all accepted Flash paths remain unchanged.
+
+All seven Pro production and guard scenarios pass on eight ranks. The five
+newly selected small-M differences are `0.000716`, `0.000715`, `0.000704`,
+`0.000713`, and `0.000708`; every forced ring-wrap case passes. M8/M16/M32
+use 107/113/127 registers per thread, M64/M128 use 128, and all cubins have
+zero stack and local-memory allocation. The first resource-capture wrapper
+used `DEEP_GEMM_CACHE_DIR` instead of `DG_JIT_CACHE_DIR`; its 7/7 correctness
+result remains valid, but its empty cubin list is retained under `iter363`.
+The isolated `iter364` rerun supplies the accepted resource evidence.
+
+### NCU and NSYS mechanism evidence
+
+Matched one-rank, 48-expert-shard NCU confirms the same decoder instruction
+reduction at every affected point:
+
+| Pro M | NCU duration R125 -> R126 | change | warp instructions | thread instructions | bit instructions | integer instructions | inter-thread instructions |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 663.55 -> 639.36 us | -3.65% | -4.33% | -4.42% | -9.13% | -5.01% | -15.30% |
+| 16 | 865.34 -> 790.11 us | -8.69% | -13.29% | -13.60% | -9.12% | -23.89% | -15.23% |
+| 32 | 968.19 -> 936.22 us | -3.30% | -3.87% | -3.97% | -8.28% | -4.80% | -15.16% |
+| 64 | 1004.224 -> 962.016 us | -4.20% | -4.48% | -4.58% | -13.62% | -3.48% | -16.81% |
+| 128 | 1140.928 -> 1090.752 us | -4.40% | -4.53% | -4.62% | +5.39% | -9.28% | -20.72% |
+
+Pro M16 is the strongest mechanism check. Its older bank-permutation selector
+was intentionally disabled, and R125 executed `10,857,792` shared-load bank
+conflicts. Complete-row ownership reduces that to `10,652` (`-99.90%`) while
+also removing 13.60% of thread instructions. M128 recompiles some decode work
+from the bit category into integer operations, but total warp/thread and
+inter-thread instructions still fall materially and duration improves.
+
+Correct-shard NSYS independently measures M8 at `657.538 -> 630.849 us`
+(`-4.06%`), M16 at `859.809 -> 789.025 us` (`-8.23%`), and M128 at
+`1127.842 -> 1098.209 us` (`-2.63%`).
+
+### Authoritative distributed timing
+
+The requested 50-observation R125/R126/R125 run is double-positive for
+maximum rank and rank 0 at all five points:
+
+| metric | M | first R125 us | R126 us | change | second R125 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| max rank | 8 | 761.9720 | 737.7730 | -3.18% | 766.5635 | -3.76% |
+| max rank | 16 | 992.1905 | 941.1855 | -5.14% | 998.1980 | -5.71% |
+| max rank | 32 | 1034.5000 | 1007.5000 | -2.61% | 1036.0000 | -2.75% |
+| max rank | 64 | 1068.0000 | 1030.0000 | -3.56% | 1058.5000 | -2.69% |
+| max rank | 128 | 1222.0000 | 1190.0000 | -2.62% | 1223.0000 | -2.70% |
+| rank 0 | 8 | 748.8185 | 728.0020 | -2.78% | 759.7900 | -4.18% |
+| rank 0 | 16 | 981.3745 | 933.3465 | -4.89% | 993.5740 | -6.06% |
+| rank 0 | 32 | 1017.5000 | 991.5560 | -2.55% | 1027.0000 | -3.45% |
+| rank 0 | 64 | 1059.5000 | 1014.0000 | -4.29% | 1049.5000 | -3.38% |
+| rank 0 | 128 | 1204.0000 | 1177.5000 | -2.20% | 1206.0000 | -2.36% |
+
+The independent reverse R126/R125/R126 run also passes every point and both
+timing scopes:
+
+| metric | M | first R126 us | R125 us | change | second R126 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| max rank | 8 | 749.3720 | 773.4570 | -3.11% | 732.4540 | -5.30% |
+| max rank | 16 | 922.0295 | 998.2455 | -7.63% | 921.8900 | -7.65% |
+| max rank | 32 | 992.5955 | 1029.5000 | -3.58% | 992.7965 | -3.57% |
+| max rank | 64 | 1025.5000 | 1065.5000 | -3.75% | 1025.5000 | -3.75% |
+| max rank | 128 | 1182.5000 | 1219.0000 | -2.99% | 1199.5000 | -1.60% |
+| rank 0 | 8 | 739.5360 | 761.2905 | -2.86% | 722.6425 | -5.08% |
+| rank 0 | 16 | 909.2390 | 988.2470 | -7.99% | 915.9915 | -7.31% |
+| rank 0 | 32 | 986.3565 | 1019.5000 | -3.25% | 981.3790 | -3.74% |
+| rank 0 | 64 | 1021.0000 | 1051.0000 | -2.85% | 1017.0000 | -3.24% |
+| rank 0 | 128 | 1179.0000 | 1209.5000 | -2.52% | 1188.0000 | -1.78% |
+
+R126 is accepted. The initial gate audit, isolated correctness/resources,
+matched NCU, both authoritative timing orders, and matched NSYS evidence are
+archived under `iter363` through `iter368`.
