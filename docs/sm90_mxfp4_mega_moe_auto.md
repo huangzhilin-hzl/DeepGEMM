@@ -5897,3 +5897,51 @@ R92's matrix), so only the interleaved R92/R93/R92 M32 result is attributed
 causally to R93. The remaining stable optimization priority is Pro M8
 (`+6.63%`), followed by Pro M512 and the near-flat large-M residuals. Complete
 matrix logs are under `iter252-r93-pr383-full-matrix`.
+
+## R94 rejected: packed BF16 epilogue for Pro M8
+
+### Reason and direction
+
+Pro M8 is R93's largest stable residual against PR383 at `+6.63%`. R48 had
+already enabled the packed HFMA2 promotion path for this exact bucket, while
+the direct packed BF16 epilogue remained restricted to Pro M16/M32. R94
+temporarily composed the two existing optimizations by extending only the
+host selector to Pro M8; no generated-kernel code was otherwise changed.
+
+Forced-ring-wrap correctness passes at `diff=0.000716`. The cubin remains at
+107 registers/thread, zero stack/local allocation, 1024 bytes static shared
+memory, and 100.58 KiB dynamic shared memory, identical to R93.
+
+### Performance and rejection decision
+
+The initial 20-observation cold-L2 R93/R94/R93 screen was double-positive:
+
+| point | first R93 us | R94 us | change | second R93 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pro M8 max rank | 797.7555 | 768.6130 | -3.65% | 780.3205 | -1.50% |
+| Pro M8 rank 0 | 779.7565 | 747.1730 | -4.18% | 766.1605 | -2.48% |
+
+The requested 50-observation, 20-launch, one-warmup formal R93/R94/R93 run
+reduced the apparent gain to the noise floor:
+
+| point | first R93 us | R94 us | change | second R93 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pro M8 max rank | 761.9920 | 761.3530 | -0.08% | 767.6480 | -0.82% |
+| Pro M8 rank 0 | 745.8320 | 744.0530 | -0.24% | 745.0300 | -0.13% |
+
+An independent reverse-order R94/R93/R94 formal repeat invalidated the small
+positive direction. The first and second R94 maximum-rank samples were
+`753.9870 us` and `761.8690 us`, versus R93 at `759.6325 us`: respectively
+`-0.74%` and `+0.29%`. Rank 0 was worse for both R94 samples at `742.9725 us`
+and `745.6970 us`, versus R93 at `740.1510 us` (`+0.38%` and `+0.75%`). The
+sign flip means the selector is not retained.
+
+One-rank NCU shows why this composition is weak: duration moves only from
+`658.85 us` to `653.22 us` (`-0.85%`). Shared-load conflicts fall 14.20%, but
+shared-store conflicts rise 6.18%; executed warp and thread instructions rise
+2.90% and 2.95%, global traffic is flat, and local traffic remains zero. A
+low-perturbation NSYS run moves from `1181.121 us` to `1164.064 us`
+(`-1.44%`), but profiler direction cannot override the reproducible formal
+sign reversal. R94 is therefore rejected and the candidate is restored to
+R93. Gate, screen, NCU, formal, NSYS, and reverse-order evidence is archived
+under `iter253` through `iter258`.
