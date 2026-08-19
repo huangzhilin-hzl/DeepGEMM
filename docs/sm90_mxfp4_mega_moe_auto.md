@@ -8360,3 +8360,77 @@ R145 is rejected at the resource/SASS/timing gate, fully reverted, and not
 advanced to NCU or NSYS.  The result rules out predicating WGMMA wait as a
 cheap scheduling dependency on SM90.  Evidence is archived under
 `iter442-r145-nonnegative-wait-gate`.
+
+## R146/R146a rejected: B64-swizzled Flash M8192 L1 output
+
+### Reason and implementation
+
+R141 SourceCounters attributes 7,863,788 excessive shared wavefronts to the
+exact Flash M8192 kernel.  The dominant source is not the expanded-MXFP4 B
+decoder: its vector `STS.128` instructions have four ideal wavefronts and no
+excess replay.  Instead, sixteen scalar `STS.U16` instructions in the regular
+L1 SwiGLU/FP8 epilogue each contribute roughly 294-296K excessive
+wavefronts.  They write a plain 64-byte row and feed an unswizzled TMA store.
+
+R146 isolated the experiment to the existing
+`kUseIncrementalMXFP4Descriptor` specialization, which only selects Flash
+M8192 in the authoritative matrix.  It changed the routed L1-output TMA store
+descriptor from no swizzle to B64 and applied the matching
+`cute::Swizzle<2, 4, 3>` mapping to each FP8x2 shared-store address.  The TMA
+store still produces the identical row-major global L2-activation buffer.
+R146a then hoisted the two row-dependent XOR masks outside the eight-pair
+store loop to reduce address-generation overhead.
+
+Both exact cubins remain at 125 registers/thread with zero stack, spill, and
+local memory.  Exact eight-rank Flash M8192 correctness passes for both forms
+at `diff=0.000661`.  The host `_C.so` was rebuilt for the candidate, while the
+R141 control was given an independent extension compiled from its unswizzled
+descriptor source; this prevents host-descriptor contamination between A and
+B.
+
+### NCU mechanism result
+
+The first R146 form reduces shared-store conflicts but adds about 0.63% warp
+instructions and is 0.6-0.8% slower in matched NCU.  Hoisting the row masks in
+R146a lowers the instruction penalty, so the final R141/R146a/R141 profile is
+effectively neutral in duration while preserving the intended replay
+reduction:
+
+| metric | R141 mean | R146a | change |
+| --- | ---: | ---: | ---: |
+| duration | 10618.480 us | 10619.520 us | +0.01% |
+| DRAM bytes read | 1.143151 GB | 1.141807 GB | -0.12% |
+| global-load sectors | 37824980.5 | 37844576 | +0.05% |
+| warp instructions | 2314908109.5 | 2323977217 | +0.39% |
+| thread instructions | 72708029317 | 72997939815 | +0.40% |
+| integer instructions | 31503278723 | 31866837355 | +1.15% |
+| shared-load conflicts | 1358719 | 1383904 | +1.85% |
+| shared-store conflicts | 27620244.5 | 23037299 | -16.59% |
+| shared-store wavefronts | 249888174 | 244899467 | -2.00% |
+| local-load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+| long-scoreboard stall ratio | 4.003 | 3.987 | -0.016 |
+| wait stall ratio | 1.199 | 1.194 | -0.005 |
+| tensor active | 22.614% | 22.612% | -0.002 pp |
+
+The source diagnosis and swizzle mechanism are valid: the candidate removes
+4.58M shared-store conflicts.  However, every logical FP8 pair still needs a
+dynamic column XOR, so mask hoisting cannot remove the remaining 1.15%
+integer-instruction increase.  The conflict reduction is not valuable enough
+to repay that dependency-critical address work.
+
+### Distributed rejection
+
+The authoritative three-observation, 20-launch, cold-L2
+R141/R146a/R141 sandwich is double-negative for maximum-rank median:
+
+| metric | first R141 us | R146a us | change | second R141 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| max rank | 9934 | 9986 | +0.52% | 9944 | +0.42% |
+| rank 0 | 9911 | 9972 | +0.62% | 9907 | +0.66% |
+
+R146/R146a are rejected, fully reverted to R141, and not advanced to NSYS.
+Future work on this hotspot must reduce scalar stores without adding a
+per-output address permutation, for example by deriving a correct vector or
+STSM layout; merely reducing the aggregate shared-conflict counter is not an
+end-to-end optimization.  Resource/JIT, correctness, matched NCU, and
+distributed timing evidence are archived under `iter443` through `iter449`.
