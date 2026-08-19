@@ -6329,3 +6329,44 @@ R104 is fully reverted without profiler work; changing task order but not
 work count is already rejected by the authoritative distributed timing.
 Correctness/resource and both timing orders are archived under `iter286`
 through `iter288`.
+
+## R105-R106 rejected: publish derived expert totals with the count cache
+
+### Reason and direction
+
+R98/R99 publish completed expert counts once per CTA, but all three scheduler
+consumers still reconstruct `num_total_m_blocks`, and the writer dispatch warp
+reloads its own shared snapshot. R105 kept the writer's register snapshot,
+published the derived total in aligned dispatch scratch, and let the other two
+consumers skip their warp prefix/reduce. A static bound protected the metadata
+word. M8 and M512 correctness passed at `0.000716/0.000709`; M8 stayed at 107
+registers while M512 unexpectedly fell from 128 to 125, with zero spills.
+
+The first R99/R105/R99 run separated the two buckets:
+
+| point | first R99 us | R105 us | change | second R99 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pro M8 max rank | 793.4555 | 768.1840 | -3.18% | 785.3335 | -2.18% |
+| Pro M512 max rank | 2530 | 2537 | +0.28% | 2539 | -0.08% |
+
+M512 changed sign, so R106 restored its original R99 cache APIs and retained
+the derived-total path only for exact M8. Correctness passed at
+`0.000716/0.000713`; M512 returned to 128 registers and M8 remained at 107,
+both without stack/local allocation.
+
+The 50-observation M8 plus three-observation M512 R99/R106/R99 run was
+double-positive:
+
+| point | first R99 us | R106 us | change | second R99 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pro M8 max rank | 773.7680 | 771.4345 | -0.30% | 775.8805 | -0.57% |
+| Pro M512 max rank | 2547 | 2518 | -1.14% | 2526 | -0.32% |
+
+An independent reverse R106/R99/R106 run invalidated both directions. M8 was
+`780.5625/776.0400/757.8575 us`, so the two candidates were `+0.58%/-2.34%`.
+M512 was `2546/2526/2516 us`, likewise `+0.79%/-0.40%`. The instruction-saving
+mechanism is smaller than the distributed max-rank variance and is fully
+reverted without treating the initial double-positive sample as causal.
+
+Correctness/resources and both timing orders are archived under `iter289`
+through `iter293`. R99 remains the accepted control.
