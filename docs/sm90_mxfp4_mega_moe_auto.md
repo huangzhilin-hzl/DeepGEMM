@@ -7434,3 +7434,49 @@ decoder's instantaneous live set by loading and decoding one packed word at a
 time. Correctness, exact resources, and NCU evidence are archived under
 `iter376-r128-pro-m512-zero-stack-gate` and
 `iter377-r128-r126-ncu-pro-m512`.
+
+## R129-R129a rejected: one-word regular Pro M512 row decode
+
+### Reason and variants
+
+R128 showed that giving up expanded-B overlap is not viable. R129 restored
+the R126 pipeline and instead shortened the complete-row decoder's intended
+live set: each lane still reused one exponent lookup across all four packed
+words in a K32 group, but loaded one 32-bit packed word, decoded one `uint2`,
+and immediately stored eight FP8 values before advancing. Pair order retained
+the accepted B64 bank permutation; expanded-B addresses and WGMMA inputs were
+unchanged.
+
+The fully unrolled R129 passes all seven eight-rank Pro scenarios, including
+the required ring wraps, with M512 `diff=0.000979`. However, PTXAS retains
+multiple unrolled addresses/results and grows the exact M512 signature from
+R127b's 16-byte frame to `REG:128, STACK:64`. R129a therefore applies
+`#pragma unroll 1` only to the two two-iteration inner loops. It also passes
+all seven scenarios, with M512 `diff=0.000835`, and reaches
+`REG:125, STACK:0, LOCAL:0` while retaining the expanded-B pipeline.
+
+### NCU rejection
+
+The runtime loop-control and scalar shared-access cost overwhelms the removed
+shuffle/decode duplication:
+
+| metric | R126 | R129a | change |
+| --- | ---: | ---: | ---: |
+| duration | 2420.640 us | 3037.472 us | +25.48% |
+| warp instructions | 512868412 | 725419731 | +41.44% |
+| thread instructions | 16188679136 | 22988666179 | +42.00% |
+| bit instructions | 1282068782 | 1426595630 | +11.27% |
+| integer instructions | 6971250255 | 12324048891 | +76.78% |
+| inter-thread instructions | 230773932 | 158520492 | -31.31% |
+| local-load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+| shared-load conflicts | 123854 | 18212590 | +14604.89% |
+| shared-store conflicts | 8909274 | 45139171 | +406.65% |
+
+R129-R129a are rejected before distributed timing and fully reverted. The
+result distinguishes register lifetime from useful scheduling: preventing
+unrolling can make the cubin spill-free, but it destroys the bank-coalesced
+static instruction schedule. The next variant retains unrolled LDS.64 pair
+loads and emits two immediate STS.64 operations per pair, shortening only the
+simultaneous lifetime of `decoded0` and `decoded1` without adding runtime
+loops. Correctness, resource, and NCU evidence is archived under `iter378`
+through `iter380`.
