@@ -8247,3 +8247,78 @@ result also shows that R141's extra load-sector count is not itself the
 remaining performance limiter; aggressively reducing it delays the
 dependency-critical dispatch warp. Launch/resources/SASS, NCU, and timing
 evidence are archived under `iter433` through `iter435`.
+
+## R143 rejected: precompute Flash M8192 promotion scales
+
+### Reason and implementation
+
+R141 SourceCounters leaves three WGMMA completion waits in the exact Flash
+M8192 cubin.  The hottest wait accounts for 46,944 not-issued samples, and its
+accepted SASS still sinks the two SFA loads, four scale multiplications, and
+BF16 multiplier conversion into the post-wait accumulator schedule.  R143
+restricted a lifetime-reordering experiment to the existing exact-M8192
+incremental-descriptor selector: it computed the two packed BF16 promotion
+multipliers before issuing each WGMMA group and carried them across WGMMA and
+next-stage expanded-B decode.  The scale formula, descriptor sequence,
+expanded-B layout, and accumulator promotion order were unchanged.
+
+The exact cubin grows from 125 to 127 registers/thread but retains zero stack
+and local memory.  SASS confirms that LDS/FMUL/F2FP now precede the WGMMA
+waits, including the former hottest wait.  Exact eight-rank M8192 correctness
+passes at `diff=0.000661`.
+
+### NCU mechanism result
+
+Matched one-rank, 32-expert R141/R143/R141 NCU shows that the intended wait
+overlap works, but the two-register live-range extension perturbs expanded-B
+store scheduling:
+
+| metric | R141 mean | R143 | change |
+| --- | ---: | ---: | ---: |
+| duration | 10620.784 us | 10629.216 us | +0.08% |
+| DRAM bytes read | 1142620800 | 1135275776 | -0.64% |
+| global-load sectors | 37869761 | 37452191 | -1.10% |
+| warp instructions | 2315022207 | 2318909644 | +0.17% |
+| thread instructions | 72711821250 | 72835416394 | +0.17% |
+| integer instructions | 31508691092 | 31548306381 | +0.13% |
+| shared-load conflicts | 1359503 | 1353798 | -0.42% |
+| shared-store conflicts | 27695496 | 36470605 | +31.68% |
+| local-load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+| active warps per issue-active | 9.28 | 9.25 | -0.03 |
+| barrier stall ratio | 1.57 | 1.65 | +0.08 |
+| long-scoreboard stall ratio | 4.01 | 3.94 | -0.07 |
+| short-scoreboard stall ratio | 0.28 | 0.30 | +0.02 |
+| wait stall ratio | 1.20 | 1.07 | -0.13 |
+| issue active | 42.82% | 42.97% | +0.15 pp |
+| tensor active | 22.61% | 22.67% | +0.06 pp |
+
+The lower wait/long-scoreboard ratios and higher issue activity validate the
+overlap mechanism.  They do not offset 3.89M additional warp instructions and
+8.78M additional shared-store conflicts, so the NCU duration is slightly
+negative.
+
+### Distributed rejection
+
+The authoritative three-observation, 20-launch, cold-L2 R141/R143/R141
+sandwich is mixed rather than double-positive:
+
+| metric | first R141 us | R143 us | change | second R141 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| max rank | 10065.0 | 9983.0 | -0.81% | 9965.0 | +0.18% |
+| rank 0 | 10058.0 | 9948.0 | -1.09% | 9924.0 | +0.24% |
+
+R143 is only 0.32% faster than the two max-rank controls' mean.  A reverse
+ten-observation R143/R141/R143 run remains order-sensitive: candidate medians
+are 9926.5/9874.0 us around a 9918.5 us control, or +0.08%/-0.45%
+respectively.  The candidate mean is only 0.18% faster than control, below the
+noise exposed by the two orderings and inconsistent with the slightly slower
+NCU duration.
+
+R143 is therefore rejected and fully reverted without NSYS.  The useful
+constraint is narrower than before: independent scale work can fill the hot
+WGMMA wait, but carrying two extra packed values across the complete regular
+decoder changes the shared-store schedule enough to erase the gain.  A future
+variant must create a dependency-local scheduling window without extending
+the scale registers across the entire next-stage decoder.  Resource/SASS,
+NCU, correctness, three-observation, and robust reverse-order evidence are
+archived under `iter436` through `iter440`.
