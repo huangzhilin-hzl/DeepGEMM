@@ -7708,3 +7708,48 @@ work. The next gate tests partial K32 unrolling before changing the underlying
 mapping. Resource, correctness, and matched NCU reports are archived under
 `iter399-r133-flash-rolled-k32-resource` and
 `iter400-r133-r126-ncu-flash-m8192`.
+
+## R134 rejected: two-way-unrolled K32 Flash row decode
+
+### Reason and resource gate
+
+R134 tested the midpoint between R132 and R133: the complete-row
+LDS.64/decode-16/STS.128 mapping was unchanged, while the four-iteration K32
+loop used `#pragma unroll 2`. The first compile caught a missing closing brace
+in the experimental branch before cubin generation; that log is preserved as
+build diagnostics and excluded from performance results. After the structural
+fix, production Flash M1024 passes on eight ranks with `diff=0.000658`.
+
+The exact 32-expert M8192 shape compiles at 125 registers/thread, zero stack,
+zero local bytes, and 1,024 bytes of static shared memory. The 256-expert shape
+uses 126 registers/thread with the same zero-stack result. Partial unrolling
+therefore improves the resource gate by one register relative to R133 without
+reintroducing R132's spill.
+
+### Matched NCU rejection
+
+R126/R134/R126 on the same GPU shows that partial unrolling still retains
+runtime loop/address overhead instead of R132's straight-line reduction:
+
+| metric | R126 mean | R134 | change |
+| --- | ---: | ---: | ---: |
+| duration | 10666.432 us | 10859.360 us | +1.81% |
+| warp instructions | 2318720476 | 2349636931 | +1.33% |
+| thread instructions | 72829839708 | 73819467571 | +1.36% |
+| bit instructions | 5551254318 | 5647489326 | +1.73% |
+| integer instructions | 31499601158 | 32294665209 | +2.52% |
+| inter-thread instructions | 997317292 | 689429036 | -30.87% |
+| global-load sectors | 35509838 | 35941913 | +1.22% |
+| local-load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+| shared-load conflicts | 1418573 | 1408232 | -0.73% |
+| shared-store conflicts | 26915501 | 28078988 | +4.32% |
+
+R134 is rejected before distributed timing and fully reverted. Compiler loop
+pragmas do not provide a useful midpoint: both rolled variants eliminate the
+shuffle instructions but add more total dynamic work, while full unrolling is
+the only form that substantially reduces total instructions and it spills.
+The next candidate must keep full static specialization but constrain the
+decoder/store live range explicitly, rather than relying on loop unroll policy.
+Resources, correctness, build diagnostics, and NCU reports are archived under
+`iter401-r134-flash-unroll2-k32-resource` and
+`iter402-r134-r126-ncu-flash-m8192`.
