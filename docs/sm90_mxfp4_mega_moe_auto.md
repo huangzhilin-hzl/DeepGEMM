@@ -8322,3 +8322,22 @@ variant must create a dependency-local scheduling window without extending
 the scale registers across the entire next-stage decoder.  Resource/SASS,
 NCU, correctness, three-observation, and robust reverse-order evidence are
 archived under `iter436` through `iter440`.
+
+## R144 rejected: dependency-local predicated WGMMA wait
+
+R143 proved that preparing the two promotion scales before WGMMA reduces
+wait stalls, but carrying them across the whole decoder raises registers and
+shared-store replay.  R144 instead kept the accepted short lifetime and used
+the two packed BF16 scale values to form an identically true inline-PTX
+predicate immediately before the exact Flash M8192 WGMMA wait.  The intended
+effect was a local scale-to-wait scheduling edge with no cross-decoder live
+range; every lane would still execute the wait.
+
+The launch passes at 125 registers/thread with zero stack/local memory, but
+ptxas proves the predicate tautological and removes the XOR, comparison, and
+predication.  Normalized same-template eight-rank disassembly contains 6,432
+instructions for both R141 and R144 and is byte-for-byte identical after
+stripping addresses.  R144 therefore creates no machine-level mechanism and
+is rejected at the SASS gate without NCU, NSYS, or distributed timing.  It is
+fully reverted.  The resource, launch, and disassembly evidence is archived
+under `iter441-r144-dependent-wait-gate`.
