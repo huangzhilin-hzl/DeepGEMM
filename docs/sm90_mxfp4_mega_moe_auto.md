@@ -6641,3 +6641,63 @@ cross-rank and math dependencies, so it does not shorten the production
 maximum-rank tail. R112 is fully reverted without an unnecessary NSYS run.
 Correctness/resources, NCU, and both timing orders are archived under
 `iter312` through `iter315`; R99 remains the accepted control.
+
+## R113-R114 rejected: hierarchical Pro M8 grid barriers
+
+### Reason and direction
+
+Exact routed Pro M8 launches 156 CTAs, while PR383 uses 78 CTAs for each
+separate phase. The fused kernel crosses several grid-wide synchronization
+points, so R113 tested whether pairing the two resident CTAs on each H20 SM
+and letting only 78 leaders perform the global atomic barrier could reduce
+the synchronization tail. The workspace barrier region was temporarily
+expanded by 640 bytes for 78 dispatch pairs and 78 epilogue pairs. All other
+shapes retained the accepted barrier implementation.
+
+R113 used a full pair barrier before and after the leader-only global
+barrier. Eight-rank correctness passed at `diff=0.000716`; the cubin retained
+107 registers/thread, zero spill/local allocation, 1024 bytes static shared
+memory, and 100.58 KiB dynamic shared memory. However, each grid rendezvous
+now performed 390 atomic operations instead of 156. Matched one-rank NCU
+showed duration increasing `660.83 -> 665.66 us` (`+0.73%`), L1 atomic sectors
+increasing `6408 -> 7578` (`+18.26%`), and L2 atomic sectors increasing
+`9356 -> 11068` (`+18.30%`). Barrier stall also rose `2.53 -> 2.59`.
+
+R114 replaced the two full pair barriers with a phase protocol: the follower
+release-stored its next phase into a pair-local counter, the leader
+acquire-polled that counter and joined the 78-leader global barrier, and the
+follower acquire-polled the global phase directly. This reduced each pair to
+one store plus one global atomic operation. Correctness again passed at
+`diff=0.000716`, with the same 107-register, zero-spill resource profile.
+
+### Profiler and production result
+
+The optimized protocol removed atomic traffic but not critical-path time:
+
+| NCU metric | R99 | R114 | change |
+| --- | ---: | ---: | ---: |
+| duration | 661.76 us | 662.66 us | +0.14% |
+| L1 atomic sectors | 6408 | 6018 | -6.09% |
+| L2 atomic sectors | 9359 | 8793 | -6.05% |
+| global-store sectors | 26775 | 27165 | +1.46% |
+| global-load sectors | 2179532 | 2182223 | +0.12% |
+| barrier stall | 2.52 | 2.55 | +1.19% |
+| long-scoreboard stall | 2.27 | 2.28 | +0.44% |
+| warp instructions | 171966423 | 171992401 | +0.015% |
+| thread instructions | 5405114404 | 5405190331 | +0.0014% |
+
+The 20-observation R99/R114/R99 screen remained inconclusive-to-negative:
+
+| metric | first R99 us | R114 us | change | second R99 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| maximum-rank median | 756.7775 | 774.8470 | +2.39% | 784.1160 | -1.18% |
+| rank-0 median | 744.6410 | 769.7930 | +3.38% | 772.8055 | -0.39% |
+
+Both metrics straddle their two controls, while matched NCU is neutral to
+slower despite fewer atomics. The added phase polling and stores merely trade
+one synchronization mechanism for another; they do not reduce the
+cross-rank straggler. R113 and R114 are fully reverted, including the
+temporary workspace ABI expansion. A 50-observation production run and NSYS
+trace were not warranted after the screen and NCU rejection. Build,
+correctness/resources, NCU, and timing evidence is archived under `iter316`
+through `iter321`; R99 remains the accepted control.
