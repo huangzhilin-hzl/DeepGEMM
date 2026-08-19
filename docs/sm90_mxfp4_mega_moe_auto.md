@@ -6809,3 +6809,84 @@ locality. Expert-aware refinement is therefore not justified by this
 mechanism. R117 is fully reverted. Correctness/resources, both timing orders,
 and NCU evidence are archived under `iter327` through `iter330`; R99 remains
 the accepted control.
+
+## R118-R120 rejected: cache or remove Pro M512 dynamic task mapping
+
+### R118: CTA-local pool-block owner table
+
+Every routed L1/L2 N tile reconstructs its pool-block owner from the same 48
+Pro expert counts. R118 used the already-allocated expert-count scratch to
+build one packed `(expert, expert-M-block, valid-M)` record per routed M64
+block in the B-loader warp. Each dynamic task then replaced two warp prefix
+scans and ballots with one shared-memory broadcast. The exact M512 selector
+and a compile-time capacity proof kept every other bucket unchanged.
+
+The first assertion-enabled prototype passed correctness but introduced a
+24-byte stack frame. Removing the redundant device assertions restored 128
+registers/thread, zero stack/local allocation, and correctness at
+`diff=0.000713`.
+
+Matched one-rank NCU confirmed a small real reduction: duration moved
+`2.24 -> 2.23 ms`, warp/thread instructions fell `0.076%/0.076%`, global-load
+sectors fell `0.027%`, atomic traffic was unchanged, and local traffic stayed
+zero. Long-scoreboard stall, however, moved `2.51 -> 2.52` because each task
+now read shared memory.
+
+The first authoritative R99/R118/R99 run straddled its controls:
+
+| metric | first R99 us | R118 us | change | second R99 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| maximum-rank median | 2566 | 2596 | +1.17% | 2678 | -3.06% |
+| rank-0 median | 2553 | 2534 | -0.74% | 2672 | -5.16% |
+
+The independent reverse R118/R99/R118 run remained mixed rather than
+double-positive:
+
+| metric | first R118 us | R99 us | change | second R118 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| maximum-rank median | 2545 | 2557 | -0.47% | 2558 | +0.04% |
+| rank-0 median | 2543 | 2518 | +0.99% | 2518 | +0.00% |
+
+The instruction reduction is below distributed maximum-rank variance and
+does not satisfy the two-sided acceptance contract.
+
+### R119: register-resident expert prefix ends
+
+R119 removed R118's shared table and retained each expert's pool-block prefix
+end in scheduler registers after the existing initialization reductions.
+Correctness passed at `diff=0.000715`; resources stayed at 128 registers and
+zero stack/local allocation. Compared with matched R99, warp/thread
+instructions still fell `0.057%/0.054%`, but less than R118, while duration
+moved `2.23 -> 2.24 ms` and long-scoreboard stall again moved
+`2.51 -> 2.52`. Holding the prefixes across the full kernel did not shorten
+the critical path, so R119 was rejected without production timing.
+
+### R120: static strided L1/L2 task assignment
+
+R120 restored R118's owner table and removed dynamic task claims for normal
+Pro M512 inputs whose routed blocks fit in one ring generation. Every CTA
+received a fixed strided L1 subset followed by a fixed strided L2 subset;
+skewed inputs exceeding ring capacity retained the dynamic fallback.
+Correctness passed at `diff=0.000709`, and removing dynamic scheduler state
+reduced the cubin from 128 to 125 registers with zero spill.
+
+NCU showed that the intended work disappeared but exposed why dynamic
+scheduling is required:
+
+| NCU metric | R99 | R120 | change |
+| --- | ---: | ---: | ---: |
+| duration | 2.23 ms | 2.29 ms | +2.69% |
+| L1 atomic sectors | 10256 | 2664 | -74.02% |
+| L2 atomic sectors | 14985 | 3888 | -74.05% |
+| warp instructions | 512862963 | 511741450 | -0.22% |
+| thread instructions | 16188645613 | 16129504406 | -0.37% |
+| global-load sectors | 4873851 | 4927760 | +1.11% |
+| barrier stall | 4.05 | 4.26 | +5.19% |
+| long-scoreboard stall | 2.51 | 2.56 | +1.99% |
+
+Static ownership removes atomics but loses the dynamic scheduler's balancing
+of expert skew, readiness, and CTA pipeline progress. R120 was rejected before
+formal production timing because both replay duration and critical stalls
+were decisively worse. R118-R120 are fully reverted. Correctness/resources,
+both R118 timing orders, and all NCU reports are archived under `iter331`
+through `iter339`; R99 remains the accepted control.
