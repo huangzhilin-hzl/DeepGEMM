@@ -6249,3 +6249,48 @@ kernel time remains neutral. NSYS similarly moves from `2.225021 ms` to
 `2.226526 ms` (`+0.07%`). R99 is accepted on the four reproducible distributed
 maximum-rank comparisons, not on profiler duration. Correctness, both timing
 orders, NCU, and NSYS evidence is archived under `iter274` through `iter278`.
+
+## R100-R103 rejected: extend expert-count sharing beyond Pro M512
+
+### R100 broad regular-Pro extension
+
+R100 removed R99's M512 upper boundary and cached counts for every regular
+Pro M512+ point. The requested three-observation R99/R100/R99 screen was:
+
+| Pro M | first R99 us | R100 us | change | second R99 us | reverse change |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 | 2559 | 2557 | -0.08% | 2581 | -0.93% |
+| 1024 | 3889 | 3928 | +1.00% | 3933 | -0.13% |
+| 2048 | 6942 | 6953 | +0.16% | 6991 | -0.54% |
+| 4096 | 13108 | 13031 | -0.59% | 13042 | -0.08% |
+| 8192 | 25235 | 25316 | +0.32% | 25307 | +0.04% |
+
+M1024 and M2048 change sign, while M8192 regresses against both controls.
+Only the already accepted M512 and M4096 are double-positive, so the broad
+selector is rejected.
+
+### R101-R103 exact-M4096 isolation attempts
+
+M1024 through M8192 share one generated specialization, so R101 used a
+uniform runtime `num_tokens == 4096` branch. M4096 measured `13082 us` versus
+`13231/13113 us` controls (`-1.13%/-0.24%`), but false-branch M8192 regressed
+to `25257 us` versus `25207/25237 us` (`+0.20%/+0.08%`). The runtime branch
+therefore had a measurable non-target cost.
+
+R102 added an explicit host-generated template boolean to restore a compile-
+time M4096 path. All 13 eight-rank production correctness scenarios passed,
+but the changed specialization compiled differently and performance reversed:
+M4096 was `13135 us` versus `13117/12981 us` controls
+(`+0.14%/+1.19%`). The unselected M1024 and M8192 guards also failed to show
+identity with R99.
+
+R103 restored R99's template signature and selected exact M4096 with a
+generated-source macro. The cubin retained 128 registers/thread and zero
+stack/local allocation. M4096 was `13022 us` versus `13049/12996 us`
+(`-0.21%/+0.20%`), a direct sign reversal. M8192 also changed sign at
+`25284 us` versus `25175/25317 us`. The apparent M4096 gain is below the
+distributed three-observation noise floor and does not justify a host selector.
+
+R100 through R103 are fully reverted; R99 remains the control. Broad, runtime,
+template-boolean, macro, resource, and correctness evidence is archived under
+`iter279` through `iter285`.
