@@ -6370,3 +6370,60 @@ reverted without treating the initial double-positive sample as causal.
 
 Correctness/resources and both timing orders are archived under `iter289`
 through `iter293`. R99 remains the accepted control.
+
+## R99 targeted same-session baseline against PR383
+
+The R98 full matrix mixed several large whole-session shifts with the two
+repeatable Pro residuals. A focused PR383/R99/PR383 run therefore repeated
+Flash M8/M16 and Pro M8/M512 in one session under the authoritative contract:
+one warmup, 50 observations for M8/M16, three for M512, 20 launches per
+observation, cold L2, seed zero, and the maximum-rank median. PR383 is still
+the sum of its native FP8 L1 and L2 kernels.
+
+| point | first PR383 us | R99 us | gap | second PR383 us | reverse gap |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M8 | 306.2755 | 306.5425 | +0.09% | 302.3385 | +1.39% |
+| Flash M16 | 321.9730 | 323.0520 | +0.34% | 304.2195 | +6.19% |
+| Pro M8 | 725.6185 | 779.5105 | +7.43% | 726.4450 | +7.30% |
+| Pro M512 | 2392.9780 | 2596.0000 | +8.48% | 2407.9420 | +7.81% |
+
+The two Pro controls differ by only `0.11%` at M8 and `0.63%` at M512, so
+their deficits are stable and remain the highest-priority code paths. Flash
+M16's PR383 controls move `5.51%` within the same session; that point cannot
+support causal attribution in this run. Raw logs are archived under
+`iter294-r99-pr383-priority-points`.
+
+## R107 rejected: return after the first scheduler owner match
+
+### Reason and direction
+
+The general `create_task()` search iterates two expert groups for DSV4 Pro.
+Once a warp-uniform owner ballot succeeds, the pool block has exactly one
+owner, but the old loop still reconstructs prefixes for later groups. R107
+returned immediately after filling `TaskInfo`, preserving task numbering,
+owner arithmetic, memory layout, and all fallback paths. All 13 eight-rank
+production correctness scenarios passed, including forced ring wraps; Pro M8
+and M512 diffs were `0.000716` and `0.000774`. Their cubins remained at
+107/128 registers, zero stack/local allocation, 1024 bytes static shared
+memory, and 100.58 KiB dynamic shared memory.
+
+### Formal timing and profiler result
+
+The authoritative R99/R107/R99 comparison changed sign at both targets:
+
+| point | first R99 us | R107 us | change | second R99 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pro M8 max rank | 769.0650 | 781.0730 | +1.56% | 785.3380 | -0.54% |
+| Pro M512 max rank | 2554 | 2573 | +0.74% | 2586 | -0.50% |
+
+Matched one-rank Pro M512 NCU shows why the source-level shortcut is too
+small to retain. Executed warp instructions fall only `0.0196%`, executed
+thread instructions fall `0.0208%`, and global-load sectors fall `0.0149%`.
+Shared-load bank conflicts rise `2.03%`, shared-store conflicts fall `0.63%`,
+and both kernels measure `2.21 ms`; local traffic remains zero. The compiler
+and the rest of the fused kernel make the eliminated final scans negligible,
+while the new early branch has no reproducible distributed benefit.
+
+R107 is fully reverted. Correctness, formal timing, cubin resources, and NCU
+evidence are archived under `iter295` through `iter297`; R99 remains the
+accepted control.
