@@ -8031,13 +8031,16 @@ operations were unchanged; L2 already used the early-release path.
 The exact eight-rank production-shape M8192 launch completed at seed zero with
 cold L2. Its cubin is spill-free. In the matched one-rank signature, R126 and
 R140 both use 125 registers/thread, `STACK:0`, and `LOCAL:0`; their SASS dumps
-also have the same 12569-line size. Thus the source-level lifetime shortening
-does not create occupancy or static-size headroom.
+are byte-identical, with the same SHA-256
+`a9e74128edcfdd6bd0f5f580b99f0fa472fb9513f7b1ea745943a575ab1100b8`.
+Thus the compiler already schedules the barrier identically and the
+source-level lifetime shortening creates no machine-code or occupancy change.
 
 ### NCU rejection
 
-NCU used an R126/R140/R126 sandwich. The two controls agree within 32 ns,
-making the small negative result unambiguous:
+NCU used an R126/R140/R126 sandwich. The two controls agree within 32 ns, but
+the byte-identical SASS means the apparent candidate movement is profiler/run
+variance rather than a causal code regression:
 
 | metric | first R126 | R140 | second R126 | change vs control mean |
 | --- | ---: | ---: | ---: | ---: |
@@ -8053,10 +8056,11 @@ making the small negative result unambiguous:
 | shared-store conflicts | 27073355 | 27003052 | 27017794 | -0.16% |
 | local-load/store sectors | 0 / 0 | 0 / 0 | 0 / 0 | unchanged |
 
-Dynamic work is effectively identical, so moving the source barrier does not
-produce useful producer/promotion overlap in the compiled schedule. The extra
-shared-load replay instead accompanies a stable 0.297% local regression.
-R140 is fully reverted and does not proceed to distributed A/B/A. Exact
+Dynamic work is effectively identical. Moving the source barrier does not
+produce useful producer/promotion overlap because ptxas emits the same
+machine instructions; the 0.297% timing and replay movements are therefore
+noise between identical implementations. R140 is fully reverted and does not
+proceed to distributed A/B/A because it is a compiled no-op. Exact
 launch/resources and the complete sandwiched NCU/SASS evidence are archived
 under `iter419-r140-flash-m8192-early-release-gate` and
 `iter420-r126-r140-ncu-flash-m8192`.
