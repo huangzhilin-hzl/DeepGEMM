@@ -6427,3 +6427,44 @@ while the new early branch has no reproducible distributed benefit.
 R107 is fully reverted. Correctness, formal timing, cubin resources, and NCU
 evidence are archived under `iter295` through `iter297`; R99 remains the
 accepted control.
+
+## R108 rejected: sparse local counts without an extra rendezvous
+
+### Reason and direction
+
+R89 removed zero-count CTA/expert atomics at Pro M8, but paid for a new NVLink
+rendezvous, destination aggregation, and grid synchronization before making
+the totals ready. R108 isolated the useful half of that experiment. Nonzero
+CTAs accumulated only the low count field; the already-existing grid barrier
+proved those updates complete, after which SM0 synthesized the original
+`kNumSMs` completion field and used the unchanged per-source-rank system
+atomic publication. No new grid or cross-rank barrier was introduced, and
+remote readiness, token offsets, and routing order were unchanged.
+
+Exact eight-rank correctness passed at `diff=0.000716`. The cubin retained
+107 registers/thread, zero stack/local allocation, 1024 bytes static shared
+memory, and 100.58 KiB dynamic shared memory.
+
+### Formal timing and profiler result
+
+The authoritative 50-observation R99/R108/R99 run was negative at maximum
+rank despite a rank-0 improvement:
+
+| metric | first R99 us | R108 us | change | second R99 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| maximum-rank median | 774.9495 | 778.3200 | +0.43% | 771.1270 | +0.93% |
+| rank-0 median | 761.6515 | 753.9480 | -1.01% | 755.5865 | -0.22% |
+
+Matched one-rank NCU confirms that the mechanism works but is not critical.
+L1/L2 atomic sectors fall from `6408/9359` to `4548/6628`, both about `29%`.
+Executed warp/thread instructions fall only `0.0066%/0.0022%`, global-load
+sectors fall `0.0113%`, and local traffic stays zero. Isolated duration moves
+from `658.94 us` to `661.18 us` (`+0.34%`). Removing R89's additional
+rendezvous therefore does not rescue sparse count publication: those local
+atomics overlap useful work, while the production maximum-rank tail regresses
+against both controls.
+
+R108 is fully reverted. Future Pro M8 work should not spend another selector
+on local dispatch-count atomics without a separate critical-path change.
+Correctness/resources, formal timing, and NCU reports are archived under
+`iter298` through `iter300`; R99 remains the accepted control.
