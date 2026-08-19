@@ -5945,3 +5945,48 @@ low-perturbation NSYS run moves from `1181.121 us` to `1164.064 us`
 sign reversal. R94 is therefore rejected and the candidate is restored to
 R93. Gate, screen, NCU, formal, NSYS, and reverse-order evidence is archived
 under `iter253` through `iter258`.
+
+## R95 rejected: active-range ring-counter cleanup for Pro M8
+
+### Reason and direction
+
+Production Pro uses a capacity-sized `57344`-token physical ring, or 7168
+minimum-sized counter slots. The tail cleanup made SM0 clear all four ring
+counter arrays on every launch even though Pro M8 touches only the contiguous
+prefix occupied by its current routed pool. R95 temporarily changed exact
+Pro M8 to clear
+`min(scheduler.get_num_total_pool_blocks(), workspace.num_ring_blocks)`.
+If the live set wrapped the ring, the expression still selected the complete
+physical capacity; synchronization and data-buffer reuse were unchanged.
+
+Eight-rank production correctness passes at `diff=0.000716`. The cubin stays
+at 107 registers/thread with zero stack/local allocation, 1024 bytes static
+shared memory, and 100.58 KiB dynamic shared memory.
+
+### Performance and rejection decision
+
+The 20-observation cold-L2 R93/R95/R93 screen changed sign against the second
+control:
+
+| point | first R93 us | R95 us | change | second R93 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pro M8 max rank | 789.1460 | 774.1510 | -1.90% | 767.8765 | +0.82% |
+| Pro M8 rank 0 | 762.9800 | 754.5770 | -1.10% | 747.0820 | +1.00% |
+
+Matched one-rank NCU confirms that the intended stores disappear but are not
+on the latency-critical path:
+
+| metric | R93 | R95 | change |
+| --- | ---: | ---: | ---: |
+| duration us | 659.36 | 662.08 | +0.41% |
+| global-store sectors | 26,775 | 26,283 | -1.84% |
+| global-load sectors | 2,202,759 | 2,204,502 | +0.08% |
+| executed warp instructions | 172,500,308 | 172,496,360 | -0.002% |
+| executed thread instructions | 5,380,222,462 | 5,380,249,334 | +0.0005% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+
+The store reduction is real, but cleanup already overlaps the epilogue's
+combine work and does not shorten the maximum-rank critical path. The screen
+sign reversal and NCU duration regression make a formal run unjustified. R95
+is rejected and fully reverted. Correctness/resource, screen, and NCU evidence
+is archived under `iter259` through `iter261`.
