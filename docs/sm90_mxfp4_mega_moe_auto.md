@@ -7526,3 +7526,78 @@ the decoder instruction reduction. The next iteration leaves M512 decode
 unchanged and profiles the refreshed Pro M256 residual against PR383 before
 choosing a new mechanism. Resource, correctness, and NCU evidence is archived
 under `iter381` through `iter385`.
+
+## R126 matched PR383 NCU: Pro M256 residual is also distributed
+
+The refreshed matrix left Pro M256 `+1.98%/+2.71%` behind PR383. A matched
+one-rank, 48-expert-shard NCU comparison instead measures PR383 L1 plus L2 at
+`1113.056 + 609.920 = 1722.976 us`, while R126 finishes in `1688.224 us`
+(`-2.02%`). R126 reads 1.747 GB from DRAM versus PR383's combined 3.241 GB,
+but executes much more integer/decode work and shared replay. As with Pro M8,
+the fused local kernel is already faster; the eight-rank deficit is a
+cross-rank arrival/scheduling tail rather than a local compute ceiling. The
+complete reports are archived under `iter386-r126-pr383-ncu-pro-m256`.
+
+## R131-R131a rejected: restore mature swap-AB at Pro M256
+
+### Reason and gate correction
+
+Early commit `b27967f` had accepted swap-AB through Pro M256, but
+`7307f64` removed the complete per-tensor path. The later mature blockwise
+swap path was rebuilt incrementally only through Pro M128. R131 extended the
+current Pro selector from 128 to 256 tokens without changing Flash, M512, or
+shared experts.
+
+The first gate under `iter387` accidentally used the stale host extension:
+the generated exact signature still showed `kSmallMSwapAB=false`. Its 7/7
+correctness result is retained only as build diagnostics and excluded from
+the experiment. After explicitly rebuilding `_C.so`, the exact signature
+showed `kSmallMSwapAB=true`; all seven Pro scenarios passed, including every
+forced ring wrap, with M256 `diff=0.000710`. The M256 cubin uses 128
+registers/thread and an 8-byte stack frame, producing 36,864 local-load and
+2,496 local-store sectors in the one-rank profiler.
+
+### Local mechanism evidence
+
+Despite the small frame, matched NCU shows a strong isolated gain:
+
+| metric | R126 | R131 | change |
+| --- | ---: | ---: | ---: |
+| duration | 1686.240 us | 1609.408 us | -4.56% |
+| warp instructions | 355943317 | 461275682 | +29.59% |
+| thread instructions | 11174343676 | 14554821439 | +30.25% |
+| bit instructions | 879217454 | 1012892462 | +15.20% |
+| integer instructions | 4925503861 | 5181066615 | +5.19% |
+| inter-thread instructions | 158251180 | 501528748 | +216.92% |
+| shared-load conflicts | 12449057 | 60004 | -99.52% |
+| shared-store conflicts | 5177550 | 4895261 | -5.45% |
+| local-load/store sectors | 0 / 0 | 36864 / 2496 | new traffic |
+
+The swap mapping trades more dynamic instructions for almost complete removal
+of the regular decoder's shared-load replay, improving local duration.
+
+### Distributed rejection
+
+The authoritative three-observation R126/R131/R126 run is not double-positive:
+
+| metric | first R126 us | R131 us | change | second R126 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| max rank | 1667 | 1669 | +0.12% | 1698 | -1.71% |
+| rank 0 | 1666 | 1663 | -0.18% | 1626 | +2.28% |
+
+The independent reverse R131/R126/R131 run looked strongly favorable at
+`1683/1812/1696 us` for maximum rank, but a ten-observation robustness
+sandwich reversed again:
+
+| metric | first R126 us | R131 us | change | second R126 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| max rank | 1672.0 | 1689.5 | +1.05% | 1691.0 | -0.09% |
+| rank 0 | 1668.5 | 1673.0 | +0.27% | 1686.5 | -0.80% |
+
+R131a additionally enabled the mature Pro bank-permute selector at M256. It
+retained the same 8-byte frame and measures `1611.936 us`, 59,874 shared-load
+conflicts, and identical local sectors, providing no improvement over R131.
+The local gain therefore does not translate into a stable maximum-rank
+distributed gain. R131/R131a are rejected and fully reverted. Build,
+correctness, resources, NCU, both standard timing orders, and the robustness
+run are archived under `iter387` through `iter394`.
