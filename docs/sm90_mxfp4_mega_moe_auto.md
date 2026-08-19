@@ -6553,3 +6553,44 @@ duration signal. Sparse completion merely exchanges local atomics for count
 aggregation at this route density, so R110 is fully reverted without an
 unnecessary reverse run or NSYS trace. Gate, NCU, and formal evidence is
 archived under `iter306` through `iter308`; R99 remains the accepted control.
+
+## R111 rejected: replenish two L1 waves after each Pro M512 L2 claim
+
+### Reason and direction
+
+The accepted scheduler replenishes one L1 wave after each L2 claim. At exact
+Pro M512, an L1 task spans K=7168 while an L2 task spans K=3072, so an L1 task
+contains about 2.33 times as much K work. R111 tested whether the tail would be
+better balanced by replenishing two L1 waves per L2 claim. The change was
+selected only for Pro M512; warmup, task counts, dependency polling, ring
+capacity, and all other shapes remained unchanged.
+
+Eight-rank correctness passed at `diff=0.000719`. The cubin retained 128
+registers/thread, zero stack/local allocation, and 1024 bytes static shared
+memory.
+
+### Profiler and formal result
+
+Matched one-rank NCU showed no material critical-path reduction. Both kernels
+measured `2.24 ms`; executed warp/thread instructions changed by
+`-0.0046%/-0.0016%`, global-load sectors changed by `-0.044%`, and local
+traffic remained zero. Barrier stall increased from `4.06` to `4.09` and wait
+stall increased from `1.00` to `1.01`, while long-scoreboard stall stayed at
+`2.51`.
+
+The authoritative three-observation R99/R111/R99 production comparison was
+negative at maximum rank:
+
+| metric | first R99 us | R111 us | change | second R99 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| maximum-rank median | 2544 | 2564 | +0.79% | 2526 | +1.50% |
+| rank-0 median | 2529 | 2519 | -0.40% | 2501 | +0.72% |
+
+The rank-0 direction is mixed, while the production maximum rank loses to
+both controls. Static work-ratio scheduling does not account for expert
+skew, remote readiness, or which rank becomes the straggler, and the higher
+barrier/wait stalls are consistent with less favorable dependency timing.
+R111 is fully reverted; no NSYS run was warranted after the negative NCU and
+double-negative production result. Correctness/resources, NCU, and formal
+timing evidence is archived under `iter309` through `iter311`; R99 remains the
+accepted control.
