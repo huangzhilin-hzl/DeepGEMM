@@ -6521,3 +6521,35 @@ rank, but the reverse production run proves that it destabilizes cross-rank
 arrival order. R109 is fully reverted. Gate, both timing orders, NCU, and
 NSYS evidence is archived under `iter301` through `iter305`; R99 remains the
 accepted control.
+
+## R110 rejected: sparse dispatch completion for Pro M512
+
+R89, R108, and R109 covered Pro M8 but not the other stable residual at Pro
+M512. R110 enabled the existing fully synchronized sparse completion protocol
+only for exact routed Pro M512. Unlike R109, it retained the post-aggregation
+grid barrier, so the experiment changed count publication work but not CTA
+release ordering. Accepted Flash selectors and every other Pro point were
+unchanged.
+
+Eight-rank correctness passed at `diff=0.000714`, generated source contained
+the sparse macro, and the cubin retained 128 registers/thread, zero
+stack/local allocation, 1024 bytes static shared memory, and 100.58 KiB
+dynamic shared memory.
+
+Matched one-rank NCU shows a smaller atomic reduction than at M8: L1 atomic
+sectors fall `10256 -> 8990` (`-12.34%`) and L2 atomic sectors fall
+`14985 -> 12994` (`-13.29%`). Executed warp/thread instructions change only
+`-0.0010%/-0.0006%`, global loads rise `0.018%`, local traffic remains zero,
+and both durations round to `2.23 ms`.
+
+The requested three-observation R99/R110/R99 production result was:
+
+| first R99 us | R110 us | change | second R99 us | reverse change |
+| ---: | ---: | ---: | ---: | ---: |
+| 2552 | 2554 | +0.08% | 2551 | +0.12% |
+
+The candidate is slightly slower than both controls and the profiler has no
+duration signal. Sparse completion merely exchanges local atomics for count
+aggregation at this route density, so R110 is fully reverted without an
+unnecessary reverse run or NSYS trace. Gate, NCU, and formal evidence is
+archived under `iter306` through `iter308`; R99 remains the accepted control.
