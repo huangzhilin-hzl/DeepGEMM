@@ -7604,7 +7604,7 @@ run are archived under `iter387` through `iter394`.
 
 ## R126 matched PR383 NCU: Flash M16 residual is distributed
 
-The refreshed matrix measured R126 `+2.90%/+1.63%` ahead of PR383 at Flash
+The refreshed matrix measured R126 `+2.90%/+1.63%` behind PR383 at Flash
 M16. A matched one-rank NCU comparison makes the mechanism clearer: PR383's
 separate kernels take `171.488 + 98.272 = 269.760 us`, while R126 takes
 `264.384 us` (`-1.99%`). R126 also reads 429.2 MB from DRAM versus PR383's
@@ -8138,3 +8138,55 @@ and NCU, NSYS, SASS, SourceCounters, and numerical correctness agree with the
 mechanism. R141 is accepted as a small Flash M8192 improvement. Exact launch,
 profiles, timing logs, and correctness evidence are archived under `iter424`
 through `iter431`.
+
+## R141 refreshed full DSV4 matrix against PR383
+
+Commit `a72d164` was compared with PR383 in a fresh
+PR383/R141/PR383 sandwich over both required DSV4 models and all 11 token
+counts. M8-M128 use 50 observations, M256-M8192 use three observations, every
+observation uses 20 launches, and the reported number is the cold-L2
+maximum-rank median after one warmup with seed zero. PR383 is the sum of its
+native FP8 L1 and L2 kernels.
+
+| model | M | first PR383 us | R141 us | gap | second PR383 us | reverse gap |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Flash | 8 | 305.2295 | 306.6410 | +0.46% | 295.1445 | +3.90% |
+| Flash | 16 | 316.7715 | 349.2165 | +10.24% | 307.4885 | +13.57% |
+| Flash | 32 | 335.6710 | 318.2405 | -5.19% | 335.1015 | -5.03% |
+| Flash | 64 | 365.9115 | 352.2785 | -3.73% | 371.7725 | -5.24% |
+| Flash | 128 | 441.6860 | 422.4835 | -4.35% | 438.6240 | -3.68% |
+| Flash | 256 | 544.0310 | 517.5950 | -4.86% | 506.2490 | +2.24% |
+| Flash | 512 | 919.4600 | 923.2320 | +0.41% | 913.1500 | +1.10% |
+| Flash | 1024 | 1540.8120 | 1479.0000 | -4.01% | 1515.9530 | -2.44% |
+| Flash | 2048 | 2711.0000 | 2754.0000 | +1.59% | 2703.2870 | +1.88% |
+| Flash | 4096 | 5116.0000 | 5112.0000 | -0.08% | 5107.0000 | +0.10% |
+| Flash | 8192 | 9801.0000 | 9872.0000 | +0.72% | 9787.0000 | +0.87% |
+| Pro | 8 | 714.7800 | 729.6380 | +2.08% | 708.2165 | +3.02% |
+| Pro | 16 | 1002.5110 | 910.5335 | -9.17% | 1009.6990 | -9.82% |
+| Pro | 32 | 1099.2645 | 989.5450 | -9.98% | 1101.9995 | -10.20% |
+| Pro | 64 | 1162.2850 | 1023.5000 | -11.94% | 1159.3565 | -11.72% |
+| Pro | 128 | 1268.5210 | 1180.0000 | -6.98% | 1276.0140 | -7.52% |
+| Pro | 256 | 1636.5460 | 1655.0000 | +1.13% | 1631.3320 | +1.45% |
+| Pro | 512 | 2424.6160 | 2602.0000 | +7.32% | 2401.6010 | +8.34% |
+| Pro | 1024 | 4018.0000 | 3920.0000 | -2.44% | 4010.0000 | -2.24% |
+| Pro | 2048 | 6977.0000 | 6907.0000 | -1.00% | 7002.0000 | -1.36% |
+| Pro | 4096 | 12908.0000 | 12982.0000 | +0.57% | 12899.0000 | +0.64% |
+| Pro | 8192 | 25093.0000 | 25280.0000 | +0.75% | 25096.0000 | +0.73% |
+
+The per-model geometric-mean gaps are `-0.89%/+0.54%` for Flash and
+`-2.87%/-2.80%` for Pro against the first/second controls. Pro therefore
+retains a decisive aggregate lead. Flash straddles parity because its M16
+candidate session is 10-14% slower even though R141 does not change that
+signature and the matched one-rank profile already measured the fused kernel
+1.99% faster than PR383. That point is a distributed/session tail and is not
+attributed to the exact-M8192 source change.
+
+R141's changed Flash M8192 point remains a double-positive `0.72-0.87%`
+residual, narrower than R126's previous `1.04-1.07%` snapshot and consistent
+with the causal R141 timing, but still behind PR383. Pro M512 is the largest
+full-matrix residual at `7.32-8.34%`; matched local profiles show it already
+faster than PR383, so it remains a distributed persistent-schedule problem.
+The next local mechanism iteration continues at Flash M8192, where R141's
+tighter relaxed spin increased global-load sectors by 6.43%. The complete
+three-session matrix is archived under
+`iter432-r141-pr383-full-matrix-sandwich`.
