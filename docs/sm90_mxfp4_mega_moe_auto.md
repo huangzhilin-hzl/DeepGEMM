@@ -5790,3 +5790,110 @@ It does show that the terminal goal is not yet met: the remaining stable
 priorities are Flash M16/M32 and Pro M8, with Pro M512 as a secondary
 three-observation residual. Complete matrix logs are under
 `iter244-r92-pr383-full-matrix`.
+
+## R93: single-slot source-rank lookup for Flash M32
+
+### Reason and direction
+
+R92 shortened Flash M32's packed promotion and epilogue but still left the
+full-matrix point `+4.26%` behind PR383. R87's two-layer source selector had
+tested counts up to two and lost after adding a second ballot/popcount path.
+The cheaper R84/R85 single-layer selector had never been measured at M32: it
+uses a nonempty-rank mask only when every source-rank/expert count is at most
+one, and otherwise falls back directly to the original round-robin loop. R93
+extends that exact selector from Flash M8/M16 to routed Flash M32 while
+retaining R92's packed HFMA2/epilogue composition. Pro and every other Flash
+bucket are compile-time unchanged.
+
+Eight-rank forced-ring-wrap correctness passes at `diff=0.000666`, and all 13
+production correctness scenarios pass. The cubin remains at 127
+registers/thread, zero stack/local allocation, 1024 bytes static shared
+memory, and 110.82 KiB dynamic shared memory, identical to R92.
+
+### Screening and authoritative performance
+
+The 20-observation cold-L2 R92/R93/R92 screen was strongly double-positive:
+
+| point | first R92 us | R93 us | change | second R92 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M32 max rank | 363.3525 | 342.7040 | -5.68% | 357.4405 | -4.12% |
+| Flash M32 rank 0 | 351.4285 | 323.1990 | -8.03% | 348.6520 | -7.30% |
+
+The requested 50-observation, 20-launch, one-warmup formal run retained the
+maximum-rank gain against both controls:
+
+| point | first R92 us | R93 us | change | second R92 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M32 max rank | 343.7260 | 339.5325 | -1.22% | 347.3190 | -2.24% |
+| Flash M32 rank 0 | 325.9145 | 328.6080 | +0.83% | 343.5265 | -4.34% |
+
+Maximum rank is the acceptance metric and is double-positive. Rank 0 straddles
+the controls, so the retained improvement is again primarily a reduction in
+the slowest peer rather than a uniform local arithmetic speedup.
+
+### NCU and NSYS attribution
+
+The selector depends on the production eight-rank count distribution, so a
+matched one-rank profile would exercise its fallback and cannot attribute the
+change. Eight concurrent application-replay NCU profilers were attempted in
+`iter248`, but replay phase skew made the result invalid: rank-0 R93 expanded
+to `129.48 ms` and 223.58M global-load sectors, versus R92's already-perturbed
+`3.29 ms` and 1.47M sectors. These values record cross-rank polling during
+desynchronized replay, not kernel work.
+
+`iter249` therefore used one hardware pass and one application execution per
+rank for duration and instruction counters. NCU still serializes and perturbs
+the peers heavily: rank durations span `2.85-383.46 ms` for R92 and
+`11.22-334.43 ms` for R93. Under that limitation, the maximum duration falls
+12.79%, while the sums of executed warp and thread instructions fall 17.76%
+and 16.34%. This is qualitative evidence that the selector does not add work
+to the distributed wait path, but it is not used as a speedup estimate.
+
+Low-perturbation eight-rank NSYS traced rank 0 while the other seven ranks ran
+normally. Its single fused-kernel duration moves from `585.471 us` to
+`578.848 us` (`-1.13%`), agreeing with the authoritative A/B/A. Gate, screen,
+formal, both NCU attempts, NSYS, and production-correctness evidence is under
+`iter245` through `iter251`.
+
+### R93 authoritative DSV4 matrix against PR383
+
+R93 and PR383 were rebuilt/measured back-to-back on the same pod with the full
+requested contract. Positive gap means R93 is slower.
+
+| model | M | R93 us | PR383 us | gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 298.706 | 327.4525 | -8.78% |
+| Flash | 16 | 318.7405 | 315.042 | +1.17% |
+| Flash | 32 | 330.778 | 335.1275 | -1.30% |
+| Flash | 64 | 366.0265 | 362.434 | +0.99% |
+| Flash | 128 | 422.860 | 436.070 | -3.03% |
+| Flash | 256 | 503.820 | 499.788 | +0.81% |
+| Flash | 512 | 910.766 | 926.596 | -1.71% |
+| Flash | 1024 | 1476.000 | 1519.726 | -2.88% |
+| Flash | 2048 | 2722.000 | 2729.932 | -0.29% |
+| Flash | 4096 | 5105.000 | 5065.000 | +0.79% |
+| Flash | 8192 | 9890.000 | 9823.000 | +0.68% |
+| Pro | 8 | 759.5385 | 712.3185 | +6.63% |
+| Pro | 16 | 995.926 | 1009.1005 | -1.31% |
+| Pro | 32 | 1034.000 | 1105.7015 | -6.48% |
+| Pro | 64 | 1067.000 | 1152.313 | -7.40% |
+| Pro | 128 | 1222.000 | 1269.3115 | -3.73% |
+| Pro | 256 | 1617.000 | 1630.777 | -0.84% |
+| Pro | 512 | 2515.000 | 2403.002 | +4.66% |
+| Pro | 1024 | 3900.000 | 4011.000 | -2.77% |
+| Pro | 2048 | 6909.000 | 7024.000 | -1.64% |
+| Pro | 4096 | 12986.000 | 12899.000 | +0.67% |
+| Pro | 8192 | 25274.000 | 25096.000 | +0.71% |
+
+R93 leads PR383 by `-1.199250%` across all 22 points. Flash and Pro lead by
+`-1.271938%` and `-1.126509%`; small and large M lead by `-2.421019%` and
+`-0.169431%`. The detailed splits are Flash small `-2.257601%`, Flash large
+`-0.442963%`, Pro small `-2.584164%`, and Pro large `+0.104852%`.
+
+This matrix crosses the terminal comparison target and changes Flash M32 from
+R92's prior `+4.26%` snapshot to `-1.30%`. The unusually large Flash M8 lead
+also reflects current-run PR383 drift (`327.4525 us` versus `299.096 us` in
+R92's matrix), so only the interleaved R92/R93/R92 M32 result is attributed
+causally to R93. The remaining stable optimization priority is Pro M8
+(`+6.63%`), followed by Pro M512 and the near-flat large-M residuals. Complete
+matrix logs are under `iter252-r93-pr383-full-matrix`.

@@ -1120,13 +1120,14 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             uint32_t token_idx_in_rank = 0;
             const uint32_t token_idx_in_expert = token_idx - expert_start_idx;
 
-            // At Flash M8/M16, most experts receive at most one route from each
-            // source rank. Select the source directly from the nonempty mask in
-            // that common case; preserve the general round-robin path for
-            // duplicate routes from any rank.
+            // At small routed Flash M, most experts receive at most one route
+            // from each source rank. Select the source directly from the
+            // nonempty mask in that common case; preserve the general
+            // round-robin path for duplicate routes from any rank.
             bool used_single_slot_rank_selection = false;
             if constexpr (kSmallMSwapAB and kHidden == 4096 and
-                          (kMaxSwapABTokens == 8 or kMaxSwapABTokens == 16) and
+                          (kMaxSwapABTokens == 8 or kMaxSwapABTokens == 16 or
+                           kMaxSwapABTokens == 32) and
                           kNumRanks <= 32) {
                 const uint32_t multi_slot_rank_mask = __ballot_sync(
                     0xffffffff, stored_rank_count[0] > 1);
