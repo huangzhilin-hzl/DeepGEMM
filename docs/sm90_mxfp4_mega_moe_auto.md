@@ -6701,3 +6701,60 @@ temporary workspace ABI expansion. A 50-observation production run and NSYS
 trace were not warranted after the screen and NCU rejection. Build,
 correctness/resources, NCU, and timing evidence is archived under `iter316`
 through `iter321`; R99 remains the accepted control.
+
+## R115-R116 rejected: token-ready Pro M8 combine
+
+### Reason and direction
+
+R99 is locally close to PR383 at Pro M8 but remains slower at the distributed
+maximum-rank tail. Both implementations normally wait for every rank to
+finish every L2 scatter before any token starts combine. R115 tested a finer
+dependency: publish completion for each destination token's L2 output and let
+the CTA assigned to that token start combine as soon as its own six routed
+contributions are visible. The exact Pro M8 selector moved the local grid
+rendezvous after combine and retained a final cross-rank cleanup barrier.
+
+The prototype temporarily added one completion counter per destination token
+to symmetric workspace. Every completed L2 row/N tile issued a system-scope
+release atomic to the destination token, and combine acquire-polled for
+`valid_topk * 56` completions. The final barrier made counter reset safe across
+back-to-back launches. Eight-rank correctness passed at `diff=0.000716`, with
+116 registers/thread and zero stack/local allocation; R99 uses 107 registers.
+
+### R115 rejection
+
+The 20-observation R99/R115/R99 screen was decisively negative:
+
+| metric | first R99 us | R115 us | change | second R99 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| maximum-rank median | 787.9225 | 831.8165 | +5.57% | 780.5040 | +6.57% |
+| rank-0 median | 772.9755 | 824.3580 | +6.65% | 762.9790 | +8.04% |
+
+Pro M8 produces about 48 routed rows per rank and 56 L2 N tiles per row, so
+R115 adds roughly 2688 remote system atomics per rank. Removing one global
+barrier does not repay that traffic or the nine-register increase.
+
+### R116 aggregation and rejection
+
+R116 reduced remote completion traffic by reusing the L2 ring completion
+counter. A nonempty L2 task released its ring slot only after scatter; the
+last of the 56 N tasks for a pool block then published one system-scope
+completion per valid row. This reduced remote completion atomics from about
+2688 to about 48 per rank. Correctness again passed at `diff=0.000716`; the
+cubin used 115 registers/thread with zero spill.
+
+The independent 20-observation R99/R116/R99 screen remained double-negative:
+
+| metric | first R99 us | R116 us | change | second R99 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| maximum-rank median | 761.6055 | 814.1525 | +6.90% | 772.8285 | +5.35% |
+| rank-0 median | 748.0145 | 794.7040 | +6.24% | 753.4130 | +5.48% |
+
+Aggregation recovers `17.664 us` from R115, confirming that system atomic
+traffic was material, but token-ready bookkeeping, the eight-register
+residual, delayed ring-slot release, and the post-combine cleanup ordering
+still exceed the removed rendezvous cost. Both variants are fully reverted,
+including the workspace ABI change. Formal 50-observation, NCU, and NSYS runs
+were not warranted after two clear double-negative screens. Build,
+correctness/resources, and both A/B/A screens are archived under `iter322`
+through `iter326`; R99 remains the accepted control.
