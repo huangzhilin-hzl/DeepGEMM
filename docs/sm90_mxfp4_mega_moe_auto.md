@@ -6294,3 +6294,38 @@ distributed three-observation noise floor and does not justify a host selector.
 R100 through R103 are fully reverted; R99 remains the control. Broad, runtime,
 template-boolean, macro, resource, and correctness evidence is archived under
 `iter279` through `iter285`.
+
+## R104 rejected: one L1 warmup wave for Pro M512
+
+### Reason and direction
+
+Pro has 48 L1 and 56 L2 N tasks per routed M block. Its 156 CTA workers make
+the first L2 wave touch only three M blocks, whose 144 prerequisite L1 tasks
+fit inside one 156-task L1 wave. The generic deadlock-safe formula uses two
+warmup waves. R104 specialized exact Pro M512 to one wave so L2 could begin
+one global wave earlier; total task count, dynamic claims, dependency polling,
+and ring capacity were unchanged.
+
+Eight-rank production correctness passed at `diff=0.001017`. The cubin stayed
+at 128 registers/thread, zero stack/local allocation, 1024 bytes static shared
+memory, and 100.58 KiB dynamic shared memory.
+
+### Timing and rejection
+
+The first three-observation R99/R104/R99 run looked double-positive:
+
+| point | first R99 us | R104 us | change | second R99 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pro M512 max rank | 2619 | 2549 | -2.67% | 2579 | -1.16% |
+| Pro M512 rank 0 | 2520 | 2522 | +0.08% | 2579 | -2.21% |
+
+Both controls contained long maximum-rank outliers, so an independent reverse
+R104/R99/R104 run was required. Its maximum-rank medians were
+`2586/2567/2544 us`: the two candidates are respectively `+0.74%` and
+`-0.90%` against the shared control. The direct sign reversal fails the
+two-sided contract even though the dependency proof and correctness hold.
+
+R104 is fully reverted without profiler work; changing task order but not
+work count is already rejected by the authoritative distributed timing.
+Correctness/resource and both timing orders are archived under `iter286`
+through `iter288`.
