@@ -7665,3 +7665,46 @@ keeping the packed load, decoded values, and store address in a bounded live
 range without serializing the decode pipeline. Resource, correctness, and NCU
 evidence is archived under `iter397-r132-flash-throughput-full-row-resource`
 and `iter398-r132-r126-ncu-flash-m8192`.
+
+## R133 rejected: rolled-K32 complete-row Flash decode
+
+### Reason and resource gate
+
+R133 retained R132's complete-row LDS.64/decode-16/STS.128 mapping but changed
+the four-iteration K32 loop from full unrolling to `#pragma unroll 1`. The two
+adjacent word-pair operations remained unrolled. This bounds each iteration's
+live state to one packed pair, one decoded `uint4`, and one store address while
+preserving direct per-row scale ownership.
+
+The production Flash M1024 eight-rank correctness case passes at
+`diff=0.000658`. Both the exact 32-expert M8192 profiler shape and the full
+256-expert shape compile at 126 registers/thread, zero stack, zero local bytes,
+and 1,024 bytes of static shared memory. The rolling mechanism therefore
+completely fixes R132's spill.
+
+### Matched NCU rejection
+
+The runtime K32 index and branch cost more than the ownership change saves.
+Against the mean of a same-GPU R126/R133/R126 sandwich:
+
+| metric | R126 mean | R133 | change |
+| --- | ---: | ---: | ---: |
+| duration | 10646.496 us | 10900.160 us | +2.38% |
+| warp instructions | 2318787779 | 2352918231 | +1.47% |
+| thread instructions | 72832084685 | 73923611246 | +1.50% |
+| integer instructions | 31500717898 | 33101288336 | +5.08% |
+| inter-thread instructions | 997317292 | 689428972 | -30.87% |
+| global-load sectors | 35493292 | 35902559 | +1.15% |
+| local-load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+| shared-load conflicts | 1417691 | 1397460 | -1.43% |
+| shared-store conflicts | 26969053 | 37668165 | +39.67% |
+
+R133 removes the scale shuffles but loses R132's 14% total-instruction
+reduction and raises shared-store replay. It is rejected before distributed
+timing and fully reverted. R132 and R133 bracket the compiler tradeoff: full
+K32 unrolling exposes the desired straight-line instruction reduction but
+spills, while no K32 unrolling prevents spill but adds too much loop/address
+work. The next gate tests partial K32 unrolling before changing the underlying
+mapping. Resource, correctness, and matched NCU reports are archived under
+`iter399-r133-flash-rolled-k32-resource` and
+`iter400-r133-r126-ncu-flash-m8192`.
