@@ -7344,3 +7344,93 @@ count publication, polling backoff, hierarchical barriers, and token-ready
 combine as isolated fixes. The next priority is selected from a fresh full
 22-point same-session matrix rather than repeating one of those disproven
 Pro M8 mechanisms. Complete NCU reports are archived under `iter374`.
+
+## R126 refreshed full DSV4 matrix against PR383
+
+### Reason and protocol
+
+After isolating the Pro M8 residual, a fresh PR383/R126/PR383 sandwich reran
+all 22 authoritative DSV4 Flash and Pro points. Each small-M point uses 50
+observations, each large-M point uses three observations, every observation
+uses 20 launches, and the reported value is the cold-L2 maximum-rank median
+after one warmup with seed zero. PR383 is the sum of its native FP8 L1 and L2
+kernels. The interrupted first attempt at the final PR383 control is retained
+as `pr383-second-incomplete.log` but excluded; the table uses the complete
+fresh replacement with 22 summaries.
+
+| model | M | first PR383 us | R126 us | gap | second PR383 us | reverse gap |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Flash | 8 | 297.6050 | 287.1640 | -3.51% | 304.6935 | -5.75% |
+| Flash | 16 | 306.9760 | 315.8745 | +2.90% | 310.8195 | +1.63% |
+| Flash | 32 | 325.6680 | 320.8815 | -1.47% | 327.2190 | -1.94% |
+| Flash | 64 | 363.0740 | 355.3450 | -2.13% | 363.4450 | -2.23% |
+| Flash | 128 | 427.5395 | 414.4325 | -3.07% | 439.4060 | -5.68% |
+| Flash | 256 | 487.5920 | 486.7200 | -0.18% | 504.0090 | -3.43% |
+| Flash | 512 | 914.4070 | 891.6930 | -2.48% | 925.5910 | -3.66% |
+| Flash | 1024 | 1527.3090 | 1481.0000 | -3.03% | 1550.1100 | -4.46% |
+| Flash | 2048 | 2737.0000 | 2729.0000 | -0.29% | 2748.0000 | -0.69% |
+| Flash | 4096 | 5053.0000 | 5139.0000 | +1.70% | 5095.0000 | +0.86% |
+| Flash | 8192 | 9828.0000 | 9933.0000 | +1.07% | 9831.0000 | +1.04% |
+| Pro | 8 | 708.4965 | 732.4530 | +3.38% | 714.2830 | +2.54% |
+| Pro | 16 | 1002.1525 | 917.4115 | -8.46% | 1001.3300 | -8.38% |
+| Pro | 32 | 1106.2900 | 990.9820 | -10.42% | 1103.6275 | -10.21% |
+| Pro | 64 | 1158.6245 | 1031.5000 | -10.97% | 1164.9940 | -11.46% |
+| Pro | 128 | 1268.1425 | 1182.5000 | -6.75% | 1277.7200 | -7.45% |
+| Pro | 256 | 1633.6480 | 1666.0000 | +1.98% | 1622.0050 | +2.71% |
+| Pro | 512 | 2428.3680 | 2517.0000 | +3.65% | 2435.6200 | +3.34% |
+| Pro | 1024 | 4037.0000 | 3917.0000 | -2.97% | 4015.0000 | -2.44% |
+| Pro | 2048 | 7021.0000 | 6900.0000 | -1.72% | 7054.0000 | -2.18% |
+| Pro | 4096 | 12907.0000 | 12965.0000 | +0.45% | 12893.0000 | +0.56% |
+| Pro | 8192 | 24981.0000 | 25159.0000 | +0.71% | 24983.0000 | +0.70% |
+
+The per-model geometric-mean gaps are `-0.98%/-2.24%` for Flash and
+`-2.97%/-3.08%` for Pro against the first/second controls. R126 therefore
+already leads PR383 in aggregate, but the double-positive residuals identify
+Flash M16/M8192 and Pro M8/M256/M512/M4096/M8192 as the honest next targets.
+Pro M512 is the largest structural residual that still has a demonstrated
+local instruction-reduction opportunity. Raw logs are archived under
+`iter375-r126-pr383-full-matrix-sandwich`.
+
+## R128 rejected: serialize Pro M512 complete-row decode
+
+### Reason and direction
+
+R127b proved that complete-row ownership removes about one sixth of regular
+Pro M512's decoder instructions, but decoding the next expanded-B stage while
+the current 64-value WGMMA fragment remained live created a 16-byte stack
+frame. R128 kept the direct one-pair-at-a-time row decoder and disabled the
+expanded-B overlap only for the exact routed Pro M512 selector. This was
+intended to let the accumulator die before the decoder and recover zero-spill
+two-CTA residency while retaining the instruction saving.
+
+All seven eight-rank Pro production and guard scenarios pass. M512 returns to
+the normal `diff=0.000708`, and every required physical ring wrap passes. The
+exact authoritative one-rank signature (`capacity=8192`, 48 experts) compiles
+at 128 registers/thread with `STACK:0`, `LOCAL:0`, proving that the lifetime
+split removes R127b's frame.
+
+### NCU rejection
+
+Matched one-rank NCU shows that removing overlap costs much more than the
+zero-spill decoder saves:
+
+| metric | R126 | R128 | change |
+| --- | ---: | ---: | ---: |
+| duration | 2420.736 us | 2677.152 us | +10.59% |
+| warp instructions | 512886002 | 396576230 | -22.68% |
+| thread instructions | 16188773327 | 12465030237 | -23.00% |
+| bit instructions | 1282068782 | 1390468910 | +8.46% |
+| integer instructions | 6971278503 | 4251148329 | -39.02% |
+| inter-thread instructions | 230773932 | 122393772 | -46.96% |
+| local-load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+| shared-load conflicts | 128162 | 93575 | -26.99% |
+| shared-store conflicts | 8777768 | 30200701 | +244.06% |
+
+The resource objective succeeds, but serializing every expanded stage exposes
+decode latency and greatly increases shared-store replay. R128 is rejected
+before distributed timing and fully reverted. The next decoder variant must
+retain the accepted expanded-B overlap; it will instead shorten the full-row
+decoder's instantaneous live set by loading and decoding one packed word at a
+time. Correctness, exact resources, and NCU evidence are archived under
+`iter376-r128-pro-m512-zero-stack-gate` and
+`iter377-r128-r126-ncu-pro-m512`.
