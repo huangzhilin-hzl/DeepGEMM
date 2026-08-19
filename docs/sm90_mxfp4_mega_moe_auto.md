@@ -8014,3 +8014,49 @@ reverted, the candidate extension is rebuilt to R126, and no eight-rank A/B/A
 is run after the negative local gate. Launch/resource evidence and complete
 NCU/SASS reports are archived under `iter417-r139-flash-m4096-gate` and
 `iter418-r126-r139-ncu-flash-m4096`.
+
+## R140 rejected: early L1 stage release at Flash M8192
+
+### Reason and direction
+
+For regular Flash, WGMMA completion ends every shared-memory read from the
+current A/SFA pipeline stage, but the long L1 phase normally publishes its
+empty-stage barrier only after 32 register-only HFMA2 promotion operations.
+R140 used the M8192-only incremental-descriptor template selector to publish
+that barrier immediately after `warpgroup_wait<0>`. This was intended to let
+the TMA producer refill the released stage while the math warpgroup promoted
+its accumulator. Decode, descriptors, WGMMA order, data layout, and numerical
+operations were unchanged; L2 already used the early-release path.
+
+The exact eight-rank production-shape M8192 launch completed at seed zero with
+cold L2. Its cubin is spill-free. In the matched one-rank signature, R126 and
+R140 both use 125 registers/thread, `STACK:0`, and `LOCAL:0`; their SASS dumps
+also have the same 12569-line size. Thus the source-level lifetime shortening
+does not create occupancy or static-size headroom.
+
+### NCU rejection
+
+NCU used an R126/R140/R126 sandwich. The two controls agree within 32 ns,
+making the small negative result unambiguous:
+
+| metric | first R126 | R140 | second R126 | change vs control mean |
+| --- | ---: | ---: | ---: | ---: |
+| duration | 10629.600 us | 10661.152 us | 10629.632 us | +0.297% |
+| DRAM bytes read | 1144927232 | 1146654208 | 1145751808 | +0.115% |
+| global-load sectors | 35544776 | 35519665 | 35522254 | -0.039% |
+| warp instructions | 2318891721 | 2318922320 | 2318882876 | +0.002% |
+| thread instructions | 72835538711 | 72836692766 | 72835255318 | +0.002% |
+| bit instructions | 5551254318 | 5551254318 | 5551254318 | unchanged |
+| integer instructions | 31510763235 | 31511952877 | 31513867641 | -0.001% |
+| inter-thread instructions | 997317292 | 997317292 | 997317292 | unchanged |
+| shared-load conflicts | 1407615 | 1420404 | 1399951 | +1.18% |
+| shared-store conflicts | 27073355 | 27003052 | 27017794 | -0.16% |
+| local-load/store sectors | 0 / 0 | 0 / 0 | 0 / 0 | unchanged |
+
+Dynamic work is effectively identical, so moving the source barrier does not
+produce useful producer/promotion overlap in the compiled schedule. The extra
+shared-load replay instead accompanies a stable 0.297% local regression.
+R140 is fully reverted and does not proceed to distributed A/B/A. Exact
+launch/resources and the complete sandwiched NCU/SASS evidence are archived
+under `iter419-r140-flash-m8192-early-release-gate` and
+`iter420-r126-r140-ncu-flash-m8192`.
