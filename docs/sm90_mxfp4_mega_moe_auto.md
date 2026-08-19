@@ -7257,3 +7257,49 @@ remains a stable `1.79-2.83%` maximum-rank deficit even though the matched
 single-rank decoder improved, isolating the next M8 work to cross-rank
 scheduling/synchronization tail latency rather than packed decode arithmetic.
 The complete direct evidence is archived under `iter369`.
+
+## R127-R127b rejected: complete-row decode for regular Pro M512
+
+### Reason and variants
+
+Pro M512 remains one of the largest stable PR383 residuals. Its overlap-
+enabled paired decoder already has the bank-permutation selector, while Pro
+M256 does not and M1024+ enables the L2 C/D swizzle. R127 used that existing
+compile-time combination to select complete-row ownership only for exact
+routed Pro M512, explicitly excluding shared experts. The address set,
+expanded-B layout, and WGMMA input were unchanged.
+
+Eight-rank correctness passed at `diff=0.001094`, and all six Pro guards also
+passed. However, keeping two current plus two lookahead `uint2` pairs live
+beside regular orientation's 64-value accumulator produced a 32-byte stack
+frame at 128 registers/thread. R127a disabled packed LDS lookahead only for
+regular M512 and loaded a pair immediately before decode. This restored the
+usual `diff=0.000708` and reduced the frame to 16 bytes. R127b removed an
+aggregate-return lambda from that direct-load path, but the frame remained
+16 bytes, proving the remainder was real register pressure rather than a
+lambda ABI artifact. SASS contains four STL and six LDL instructions.
+
+### NCU rejection
+
+Matched one-rank NCU shows that the instruction-saving mechanism works but
+the spill and altered shared-memory waves dominate:
+
+| metric | R126 | R127b | change |
+| --- | ---: | ---: | ---: |
+| duration | 2231.360 us | 2284.160 us | +2.37% |
+| warp instructions | 512877708 | 429533046 | -16.25% |
+| thread instructions | 16188733525 | 13520856342 | -16.48% |
+| integer instructions | 6971997851 | 4246546373 | -39.09% |
+| inter-thread instructions | 230773932 | 158520492 | -31.31% |
+| local-load sectors | 0 | 4632320 | new traffic |
+| local-store sectors | 0 | 9984 | new traffic |
+| shared-load conflicts | 123635 | 384044 | +210.63% |
+| shared-store conflicts | 9167992 | 13565885 | +47.97% |
+
+Saving roughly one sixth of executed instructions cannot repay 4.63 million
+local-load sectors and the higher shared replay. R127-R127b are rejected
+before distributed production timing and fully reverted. Future regular-
+orientation decoder work must reduce accumulator lifetime or otherwise make
+register headroom before adopting complete-row ownership. Correctness,
+resource evolution, SASS, and NCU evidence are archived under `iter370`
+through `iter373`; R126 remains the accepted control.
