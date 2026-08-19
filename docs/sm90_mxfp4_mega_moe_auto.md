@@ -7969,3 +7969,48 @@ M8 and sparse completion at Pro M512, so those mechanisms are not repeated at
 M16 without a new critical-path dependency. Full reports are archived under
 `iter415-r126-pr383-ncu-pro-m16` and
 `iter416-r126-pr383-nsys-pro-m16`.
+
+## R139 rejected: PRMT exponent extraction at Flash M4096
+
+### Reason and direction
+
+The refreshed matrix left Flash M4096 `+1.70%/+0.86%` behind PR383. R138
+showed that replacing shift-and-mask exponent extraction with the existing
+byte-select `PRMT` implementation removes about 5.9% of integer instructions
+at M8192, but its distributed gain was not robust. R139 tested whether the
+same mechanism crosses the local threshold at the distinct M4096 workload.
+The host selector enabled it only for routed `hidden=4096, M=4096`; all other
+signatures remained on R126.
+
+An exact eight-rank M4096 production-shape launch completed with seed zero and
+cold L2. The generated signature confirms that the PRMT template boolean is
+enabled. The production cubin uses 126 registers/thread with `STACK:0` and
+`LOCAL:0`. In the matched one-rank, 32-expert profiler signature, R126 uses
+125 registers and R139 uses 126; both remain spill-free.
+
+### NCU rejection
+
+Matched one-rank NCU rejects the candidate before distributed timing:
+
+| metric | R126 | R139 | change |
+| --- | ---: | ---: | ---: |
+| duration | 5456.192 us | 5504.224 us | +0.88% |
+| DRAM bytes read | 821099520 | 820809216 | -0.04% |
+| global-load sectors | 18092118 | 18067375 | -0.14% |
+| warp instructions | 1201868318 | 1192039752 | -0.82% |
+| thread instructions | 37752931717 | 37438741045 | -0.83% |
+| bit instructions | 2850051886 | 3482343214 | +22.19% |
+| integer instructions | 16158601431 | 15208295705 | -5.88% |
+| inter-thread instructions | 512057004 | 512057004 | unchanged |
+| shared-load conflicts | 709673 | 725166 | +2.18% |
+| shared-store conflicts | 13942416 | 13738297 | -1.46% |
+| local-load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+
+The instruction substitution works exactly as intended, but the extra bit
+work, one additional register, and shared-load replay make the kernel 0.88%
+slower. Together with R138, this excludes PRMT-only exponent extraction as a
+regular Flash throughput optimization at both M4096 and M8192. R139 is fully
+reverted, the candidate extension is rebuilt to R126, and no eight-rank A/B/A
+is run after the negative local gate. Launch/resource evidence and complete
+NCU/SASS reports are archived under `iter417-r139-flash-m4096-gate` and
+`iter418-r126-r139-ncu-flash-m4096`.
