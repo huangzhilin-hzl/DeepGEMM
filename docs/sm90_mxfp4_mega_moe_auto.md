@@ -7601,3 +7601,67 @@ The local gain therefore does not translate into a stable maximum-rank
 distributed gain. R131/R131a are rejected and fully reverted. Build,
 correctness, resources, NCU, both standard timing orders, and the robustness
 run are archived under `iter387` through `iter394`.
+
+## R126 matched PR383 NCU: Flash M16 residual is distributed
+
+The refreshed matrix measured R126 `+2.90%/+1.63%` ahead of PR383 at Flash
+M16. A matched one-rank NCU comparison makes the mechanism clearer: PR383's
+separate kernels take `171.488 + 98.272 = 269.760 us`, while R126 takes
+`264.384 us` (`-1.99%`). R126 also reads 429.2 MB from DRAM versus PR383's
+combined 769.6 MB and has no local-memory traffic. Its fused decoder executes
+60.46 million warp instructions versus PR383's combined 41.09 million, but
+that extra work is still cheaper than launching and moving data through two
+kernels locally. The remaining authoritative eight-rank difference is thus
+arrival/scheduling noise rather than a local kernel deficit. Reports are
+archived under `iter395-r126-pr383-ncu-flash-m16`.
+
+## R126 matched PR383 NCU: Flash M8192 is decoder/address bound
+
+Flash M8192 is a genuine local residual. PR383's two kernels take
+`6899.008 + 3675.328 = 10574.336 us`; R126 takes `10666.240 us` (`+0.87%`),
+consistent with the refreshed matrix's `+1.07%/+1.04%` deficit. R126 reads
+1.143 GB from DRAM versus PR383's combined 1.865 GB, but executes 2.319
+billion warp and 72.833 billion thread instructions versus PR383's combined
+1.057 billion and 32.942 billion. R126 also issues 35.527 million global-load
+sectors versus PR383's combined 10.452 million. The next optimization target
+is therefore packed-B decode/address generation and its shared-memory
+schedule, not additional DRAM-byte reduction. Reports are archived under
+`iter396-r126-pr383-ncu-flash-m8192`.
+
+## R132 rejected: complete-row Flash throughput decode
+
+### Reason and implementation
+
+R132 tested whether one lane owning a complete packed-B row could remove the
+two-lane scale shuffles and repeated address work exposed by the M8192 NCU
+comparison. It selected regular routed Flash throughput specializations,
+retained the accepted double-buffered expanded-B/WGMMA overlap, loaded each
+adjacent packed-word pair with LDS.64, decoded 16 values at once, and stored
+the result with STS.128. The production Flash M1024 eight-rank correctness
+gate passed with `diff=0.000658`.
+
+The exact M8192 cubin compiled at 128 registers/thread, a 16-byte stack frame,
+1,024 bytes of static shared memory, and no statically reported local bytes.
+NCU nevertheless confirms that the frame spills heavily at runtime:
+
+| metric | R126 | R132 | change |
+| --- | ---: | ---: | ---: |
+| duration | 10664.160 us | 10872.864 us | +1.96% |
+| warp instructions | 2318531495 | 1985490664 | -14.36% |
+| thread instructions | 72823580084 | 62166101195 | -14.63% |
+| integer instructions | 31506161211 | 20989771949 | -33.38% |
+| inter-thread instructions | 997317292 | 689429164 | -30.87% |
+| local-load/store sectors | 0 / 0 | 20044800 / 9984 | new traffic |
+| shared-load conflicts | 1427557 | 2464015 | +72.60% |
+| shared-store conflicts | 27005852 | 49174074 | +82.09% |
+
+The ownership change is directionally useful because it removes roughly one
+third of integer work and 14% of total dynamic instructions. The fully
+unrolled implementation, however, creates a live-range peak that turns the
+16-byte frame into more than 20 million local-load sectors and raises shared
+replay enough to lose 1.96%. R132 is rejected before distributed timing and
+fully reverted. A viable successor must preserve complete-row ownership while
+keeping the packed load, decoded values, and store address in a bounded live
+range without serializing the decode pipeline. Resource, correctness, and NCU
+evidence is archived under `iter397-r132-flash-throughput-full-row-resource`
+and `iter398-r132-r126-ncu-flash-m8192`.
