@@ -6196,3 +6196,56 @@ The exact interleaved R93/R98/R93 formal run remains R98's causal evidence.
 The largest repeatable code-path residual remains Pro M512, followed by Pro
 M8. Complete matrix logs are archived under
 `iter273-r98-pr383-full-matrix`.
+
+## R99 accepted: extend CTA expert-count sharing to Pro M512
+
+### Reason and direction
+
+R98 proved that publishing one completed-expert snapshot per CTA can reduce
+the three scheduler consumers' duplicate global loads. Pro M512's one-rank
+arithmetic was already faster than PR383, while its stable residual appears
+only in the distributed persistent schedule. R99 therefore extends the same
+cache path to exact Pro M512 and leaves M256 plus M1024 and above unchanged.
+The bucket is identified by Pro hidden size, regular layout, the accepted
+M512+ bank permutation, and absence of the M1024+ L2 C/D swizzle.
+
+Eight-rank production correctness passes at `diff=0.000716`. The cubin stays
+at 128 registers/thread, zero stack/local allocation, 1024 bytes static shared
+memory, and 100.58 KiB dynamic shared memory.
+
+### Production timing
+
+The requested three-observation, 20-launch, one-warmup cold-L2 R98/R99/R98
+screen was positive against both controls:
+
+| point | first R98 us | R99 us | change | second R98 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pro M512 max rank | 2548 | 2544 | -0.16% | 2548 | -0.16% |
+| Pro M512 rank 0 | 2540 | 2525 | -0.59% | 2548 | -0.90% |
+
+Because the signal was small, an independent reverse-order R99/R98/R99 run
+was required. Its maximum-rank medians were `2598/2618/2609 us`; the two R99
+samples improve `0.76%` and `0.34%` against their shared control. Rank-0
+medians were `2598/2591/2601 us`, slightly negative, but the acceptance metric
+is the maximum-rank median. All four maximum-rank comparisons are positive.
+
+### NCU and NSYS evidence
+
+Matched one-rank NCU verifies the intended traffic reduction and its offset:
+
+| metric | R98 | R99 | change |
+| --- | ---: | ---: | ---: |
+| duration ms | 2.42 | 2.42 | flat at report precision |
+| global-load sectors | 4,898,944 | 4,874,507 | -0.50% |
+| global-store sectors | 1,583,274 | 1,583,285 | flat |
+| executed warp instructions | 513,926,085 | 512,867,748 | -0.21% |
+| executed thread instructions | 16,134,447,217 | 16,188,445,714 | +0.33% |
+| shared-load bank conflicts | 123,021 | 122,054 | -0.79% |
+| shared-store bank conflicts | 8,541,210 | 8,980,236 | +5.14% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+
+The shared publication adds thread work and store pressure, so isolated
+kernel time remains neutral. NSYS similarly moves from `2.225021 ms` to
+`2.226526 ms` (`+0.07%`). R99 is accepted on the four reproducible distributed
+maximum-rank comparisons, not on profiler duration. Correctness, both timing
+orders, NCU, and NSYS evidence is archived under `iter274` through `iter278`.

@@ -808,9 +808,11 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         kEpilogueWGBarrierStartIdx + kNumEpilogueWarpgroups;
     constexpr uint32_t kExpertCountCacheBarrierIdx =
         kGemmPhaseBoundaryBarrierIdx + 1;
-    constexpr bool kCacheProM8ExpertCounts =
-        not kHasSharedExperts and kHidden == 7168 and kSmallMSwapAB and
-        kMaxSwapABTokens == 8;
+    constexpr bool kCacheProExpertCounts =
+        not kHasSharedExperts and kHidden == 7168 and
+        ((kSmallMSwapAB and kMaxSwapABTokens == 8) or
+         (not kSmallMSwapAB and kBankPermuteMXFP4PairLoads and
+          not kSwizzleL2CD));
 
     // Cross-rank NVLink barrier tags
     constexpr uint32_t kBeforeDispatchPullBarrierTag    = 1;
@@ -890,7 +892,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         const auto process_task = [&](const task_info_t& task_info) {
             invoke_persistent_task(task_info, func);
         };
-        if constexpr (kCacheProM8ExpertCounts)
+        if constexpr (kCacheProExpertCounts)
             scheduler.template mainloop_with_task<false>(
                 num_tokens, process_task);
         else
@@ -1081,12 +1083,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             false, true);
 #endif
 
-        // Pro M8 has only 48 routed experts, but both dispatch warps and the
-        // B-loader scheduler independently poll and load the same completed
-        // expert totals. Publish one warp's snapshot through the dispatch
-        // scratch after the NVLink rendezvous, then let all three consumers
-        // initialize their private scheduler state from shared memory.
-        if constexpr (kCacheProM8ExpertCounts) {
+        // Selected Pro buckets make both dispatch warps and the B-loader
+        // scheduler independently poll and load the same completed expert
+        // totals. Publish one warp's snapshot through the dispatch scratch
+        // after the NVLink rendezvous, then let all three consumers initialize
+        // their private scheduler state from shared memory.
+        if constexpr (kCacheProExpertCounts) {
             if (warp_idx == 0)
                 scheduler.cache_expert_recv_count(smem_expert_count);
             ptx::sync_unaligned(
@@ -1107,7 +1109,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         const auto pull_buffer = smem_send_buffers.get_rank_buffer(warp_idx).get_data_buffer(0);
         const auto pull_mbarrier = dispatch_barriers[warp_idx];
 
-        if constexpr (not kCacheProM8ExpertCounts)
+        if constexpr (not kCacheProExpertCounts)
             scheduler.fetch_expert_recv_count();
 
         constexpr uint32_t kNumRanksPerLane = math::constexpr_ceil_div(kNumRanks, 32u);
@@ -1435,7 +1437,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         });
 
     } else if (warp_idx == kNumDispatchWarps + 1) {
-        if constexpr (kCacheProM8ExpertCounts) {
+        if constexpr (kCacheProExpertCounts) {
             ptx::sync_unaligned(
                 kNumDispatchThreads + 32, kExpertCountCacheBarrierIdx);
             scheduler.fetch_cached_expert_recv_count(smem_expert_count);
