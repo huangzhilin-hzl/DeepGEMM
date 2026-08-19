@@ -6594,3 +6594,50 @@ R111 is fully reverted; no NSYS run was warranted after the negative NCU and
 double-negative production result. Correctness/resources, NCU, and formal
 timing evidence is archived under `iter309` through `iter311`; R99 remains the
 accepted control.
+
+## R112 rejected: skip idle Pro M8 dispatch-warp expert scans
+
+### Reason and direction
+
+At Pro M8, each rank receives only 48 routed tokens, while the persistent grid
+contains 156 CTAs and two dispatch warps per CTA. The original pull loop lets
+every warp start from its global token index and scan completed counts for up
+to 48 local experts before an out-of-range warp discovers that no token is
+assigned to it. R112 added one warp reduction over the already-cached expert
+counts and used the resulting total as the pull-loop bound, allowing roughly
+264 idle dispatch warps to leave before the expert scan. The selector was
+exact for routed Pro M8; atomics, barriers, scheduling, and all other buckets
+were unchanged.
+
+Eight-rank correctness passed at `diff=0.000716`. The cubin retained 107
+registers/thread, zero stack/local allocation, and 1024 bytes static shared
+memory.
+
+### Profiler and timing result
+
+Matched one-rank NCU confirmed that the source change removed work. Executed
+warp/thread instructions fell `0.148%/0.152%`, global-load sectors fell
+`0.015%`, and duration moved `664.54 -> 662.88 us` (`-0.25%`). Atomic traffic
+was unchanged and local traffic remained zero.
+
+The first authoritative R99/R112/R99 run followed a large session drift:
+
+| metric | first R99 us | R112 us | change | second R99 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| maximum-rank median | 787.6335 | 772.5475 | -1.92% | 763.8320 | +1.14% |
+| rank-0 median | 768.1745 | 753.2860 | -1.94% | 750.5160 | +0.37% |
+
+Because both metrics straddled their controls, an independent reverse
+R112/R99/R112 run was required:
+
+| metric | first R112 us | R99 us | change | second R112 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| maximum-rank median | 775.4545 | 763.0855 | +1.62% | 765.9360 | +0.37% |
+| rank-0 median | 763.9150 | 744.1470 | +2.66% | 750.9460 | +0.91% |
+
+Both candidate samples lose to the shared control. The instruction reduction
+is real but occurs in dispatch warps that already reconverge behind longer
+cross-rank and math dependencies, so it does not shorten the production
+maximum-rank tail. R112 is fully reverted without an unnecessary NSYS run.
+Correctness/resources, NCU, and both timing orders are archived under
+`iter312` through `iter315`; R99 remains the accepted control.
