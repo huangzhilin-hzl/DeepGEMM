@@ -7802,3 +7802,42 @@ SASS diagnosis is archived under
 `iter403-r132-r126-sass-spill-diagnostic`; resources, correctness, and matched
 NCU are under `iter404-r135-flash-fused-asm-row-resource` and
 `iter405-r135-r126-ncu-flash-m8192`.
+
+## R136 rejected: fuse both row pairs per K32 asm block
+
+R136 kept R135's no-output asm boundary and `0/2/2/0` quarter-warp pair
+mapping, but reduced eight isolated pair blocks to four K32 blocks. Each block
+computed the row-flat base and exponent lookup once, then decoded and stored
+both adjacent pairs sequentially. An explicit enumeration of
+`Swizzle<3,4,3>` bank indices confirms that the retained mapping gives each
+8-lane STS.128 transaction 32 distinct bank words; alternating pair ownership
+per lane would introduce 16 duplicate bank accesses per transaction.
+
+The exact M8192 cubin remains at 125 registers/thread, zero stack, zero local
+bytes, and 1,024 bytes of static shared memory. Its SASS contains no `STL` or
+`LDL`, and production Flash M1024 again passes on eight ranks at
+`diff=0.000658`.
+
+The shared lookup reduces some repeated work relative to R135, but matched NCU
+still rejects the fully opaque decoder:
+
+| metric | R126 mean | R136 | change |
+| --- | ---: | ---: | ---: |
+| duration | 10616.000 us | 10758.528 us | +1.34% |
+| warp instructions | 2319021923 | 2263130671 | -2.41% |
+| thread instructions | 72839351286 | 71050740203 | -2.46% |
+| integer instructions | 31507131399 | 30068641687 | -4.57% |
+| inter-thread instructions | 997317260 | 689429164 | -30.87% |
+| global-load sectors | 35547777 | 35826545 | +0.78% |
+| local-load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+| shared-load conflicts | 1409704 | 1436387 | +1.89% |
+| shared-store conflicts | 27051654 | 33074573 | +22.26% |
+
+R136 is rejected before distributed timing and fully reverted. Fusing more of
+the decoder inside asm slightly improves duration but still prevents ptxas
+from recovering R132's 14% total-instruction reduction. The SASS diagnosis
+indicates a narrower boundary: keep LDS and decode visible as fully unrolled
+C++, and hide only the swizzled store-address calculation that ptxas hoisted
+and spilled in R132. Resources, correctness, and NCU are archived under
+`iter406-r136-flash-fused-asm-k32-resource` and
+`iter407-r136-r126-ncu-flash-m8192`.
