@@ -6468,3 +6468,56 @@ R108 is fully reverted. Future Pro M8 work should not spend another selector
 on local dispatch-count atomics without a separate critical-path change.
 Correctness/resources, formal timing, and NCU reports are archived under
 `iter298` through `iter300`; R99 remains the accepted control.
+
+## R109 rejected: poll sparse totals without the final grid barrier
+
+### Reason and direction
+
+R108 showed that sparse local completion atomics alone are not critical. The
+remaining R89 cost is synchronization after SM0 aggregates all source-rank
+counts. Every scheduler consumer already polls each `recv_count_sum` ready
+field, while R98's CTA count-cache barrier keeps the B-loader behind dispatch
+warp 0's complete snapshot. R109 therefore enabled the existing sparse
+completion protocol for exact routed Pro M8 but let CTAs leave the NVLink
+rendezvous independently after SM0 publication, omitting only the final grid
+barrier. Accepted Flash sparse selectors retained their original barrier.
+
+Exact eight-rank correctness passed at `diff=0.000716`, the generated source
+contained the intended sparse macro, and the cubin retained 107 registers,
+zero stack/local allocation, 1024 bytes static shared memory, and 100.58 KiB
+dynamic shared memory.
+
+### Initial positive run and reverse rejection
+
+The first authoritative R99/R109/R99 maximum-rank comparison was positive:
+
+| first R99 us | R109 us | change | second R99 us | reverse change |
+| ---: | ---: | ---: | ---: | ---: |
+| 770.3455 | 762.5745 | -1.01% | 767.5610 | -0.65% |
+
+Rank 0 moved `744.029/751.265/755.040 us`, so its direction was mixed while
+the maximum rank improved. An independent reverse-order run invalidated the
+apparent tail benefit:
+
+| first R109 us | R99 us | change | second R109 us | reverse change |
+| ---: | ---: | ---: | ---: | ---: |
+| 765.1935 | 759.4120 | +0.76% | 794.1445 | +4.57% |
+
+Both candidate samples lose to their shared control, and the second candidate
+has a large tail excursion. Removing the global ordering point changes which
+rank becomes the straggler rather than reproducibly shortening that straggler.
+
+### NCU and NSYS mechanism evidence
+
+Matched one-rank NCU and NSYS do show a real isolated benefit. NCU duration
+falls `664.90 -> 659.87 us` (`-0.76%`) and NSYS falls
+`665.791 -> 660.287 us` (`-0.83%`). L1/L2 atomic sectors fall from
+`6408/9361` to `4380/6395` (about `-31.7%`), executed warp instructions fall
+`0.014%`, and local traffic stays zero. Global-load sectors rise `0.48%` and
+thread instructions rise `0.003%` due to count polling/aggregation.
+
+The profiler result confirms that the omitted barrier shortens an isolated
+rank, but the reverse production run proves that it destabilizes cross-rank
+arrival order. R109 is fully reverted. Gate, both timing orders, NCU, and
+NSYS evidence is archived under `iter301` through `iter305`; R99 remains the
+accepted control.
