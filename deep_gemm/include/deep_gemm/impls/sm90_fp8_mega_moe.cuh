@@ -1701,14 +1701,14 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             constexpr bool kPairPackedWords =
                                 kOverlapMXFP4ScalePath;
                             if constexpr (kPairPackedWords) {
-                                // Exact Flash M16 gives each lane one complete
-                                // packed row. Both adjacent word pairs share
-                                // the row's exponent lookup, and the lane owns
-                                // the scale directly instead of shuffling it
-                                // twice from the two-lane-per-row mapping.
+                                // Routed Flash small-M gives each lane one
+                                // complete packed row. Both adjacent word
+                                // pairs share the row's exponent lookup, and
+                                // the lane owns the scale directly instead of
+                                // shuffling it twice from the two-lane-per-row
+                                // mapping.
                                 constexpr bool kFullRowPairDecode =
-                                    kSmallMSwapAB and kHidden == 4096 and
-                                    kMaxSwapABTokens == 16;
+                                    kSmallMSwapAB and kHidden == 4096;
                                 if constexpr (kFullRowPairDecode) {
                                     const uint32_t decoded_local_n = local_n;
                                     const uint32_t packed_row_base =

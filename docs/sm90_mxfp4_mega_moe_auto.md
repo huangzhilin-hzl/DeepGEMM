@@ -7036,3 +7036,115 @@ R124 is accepted. Matched PR383 decomposition, instruction mix,
 correctness/resources, both timing orders, direct PR383 timing, full
 production regression, NCU, and NSYS evidence is archived under `iter346`
 through `iter354`.
+
+## R124 full-matrix coverage and drift-controlled PR383 priorities
+
+R124 and PR383 were next run sequentially over the complete requested Flash
+and Pro matrix: `M=8,16,32,64,128` used 50 observations, larger M used three,
+and every observation used 20 launches, one warmup, cold L2, seed zero, and
+the maximum-rank median. The point gaps below are `R124 / PR383 - 1`:
+
+| model | M8 | M16 | M32 | M64 | M128 | M256 | M512 | M1024 | M2048 | M4096 | M8192 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Flash | -1.89% | +13.79% | -2.41% | +3.39% | -2.47% | +5.62% | +3.51% | -2.90% | +0.22% | +0.77% | +1.04% |
+| Pro | +3.42% | -1.98% | -6.97% | -7.71% | -4.00% | -2.36% | +4.36% | -3.41% | -1.81% | +0.84% | +1.09% |
+
+The arithmetic point means are `+1.70%` for Flash, `-1.68%` for Pro, and
+`+0.006%` across all 22 points. This is coverage rather than causal evidence:
+the implementations occupied two long sequential phases, and the apparent
+Flash M16 gap directly contradicts the drift-controlled R124/PR383/R124 run
+above.
+
+A focused same-session R124/PR383/R124 repeat likewise disproved the apparent
+Flash M64/M256/M512 deficits:
+
+| Flash M | first R124 us | PR383 us | change | second R124 us | reverse change |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 385.1165 | 393.9650 | -2.25% | 380.4225 | -3.44% |
+| 256 | 502.6480 | 514.4690 | -2.30% | 482.8710 | -6.14% |
+| 512 | 895.6530 | 925.6020 | -3.24% | 900.8560 | -2.67% |
+
+The complete matrix and targeted correction are archived under `iter355` and
+`iter356`. Subsequent decisions continue to require matched controls rather
+than treating the sequential matrix phase shift as a kernel regression.
+
+## R125 accepted: share one decode lookup across every routed Flash small-M row
+
+### Reason and direction
+
+R124 proved that one lane can own a complete packed N row, retain the two
+LDS.64 transactions and B64 bank permutation, and share one scale/exponent
+lookup across its two adjacent word pairs. R125 broadens that compile-time
+mapping from the Flash M16 specialization to all routed Flash small-M
+specializations. It affects M8, M32, M64, and M128 in addition to the already
+identical M16 path; regular-orientation Flash, every Pro specialization, and
+shared-expert paths remain unchanged.
+
+All six affected and guard Flash production scenarios pass, including every
+forced ring wrap. Focused differences for M8/M16/M32/M64/M128 are `0.000671`,
+`0.000654`, `0.000666`, `0.000660`, and `0.000658`. M8 uses 114 registers/thread,
+M16 uses 118, M32/M64/M128 use 128, and the unchanged M1024 guard uses 125;
+all have zero stack and local-memory allocation.
+
+### NCU and NSYS mechanism evidence
+
+Matched one-rank NCU shows that every newly selected bucket removes the
+intended decoder work:
+
+| Flash M | NCU duration R124 -> R125 | change | warp instructions | thread instructions | bit instructions | inter-thread instructions |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 221.54 -> 207.42 us | -6.37% | -4.38% | -4.47% | -9.52% | -15.23% |
+| 32 | 290.94 -> 281.09 us | -3.39% | -3.96% | -4.07% | -9.45% | -15.18% |
+| 64 | 329.31 -> 317.28 us | -3.65% | -4.25% | -4.35% | -11.02% | -18.84% |
+| 128 | 397.66 -> 383.65 us | -3.52% | -3.30% | -3.35% | -10.53% | -16.65% |
+
+Shared-load bank conflicts do not move uniformly, but shared-store conflicts
+fall at M8/M32/M128 and the isolated duration improves at all four points.
+This confirms that the gain comes from fewer duplicate lookup/shuffle/decode
+instructions rather than a fragile conflict-only effect.
+
+Matched correct-shard NSYS independently measures M8 at `203.552 -> 199.936 us`
+(`-1.78%`) and M128 at `368.672 -> 353.344 us` (`-4.16%`). The first
+NSYS command accidentally retained all 256 Flash experts in a one-rank
+no-dist run; its template signature exposed the mismatch, the remaining run
+was stopped, and those files are retained under `iter361` but excluded. The
+accepted `iter362` rerun explicitly uses 32 experts, matching one production
+rank's expert shard.
+
+### Authoritative distributed timing
+
+The 50-observation R124/R125/R124 run is double-positive at every newly
+selected point for both maximum rank and rank 0:
+
+| metric | M | first R124 us | R125 us | change | second R124 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| max rank | 8 | 310.9050 | 286.1635 | -7.96% | 293.9925 | -2.66% |
+| max rank | 32 | 336.8845 | 319.7410 | -5.09% | 322.7995 | -0.95% |
+| max rank | 64 | 369.8245 | 351.7550 | -4.89% | 359.7470 | -2.22% |
+| max rank | 128 | 431.7945 | 415.4425 | -3.79% | 423.1545 | -1.82% |
+| rank 0 | 8 | 298.3440 | 272.0600 | -8.81% | 291.5300 | -6.68% |
+| rank 0 | 32 | 317.9570 | 297.8340 | -6.33% | 318.1230 | -6.38% |
+| rank 0 | 64 | 355.1875 | 338.6085 | -4.67% | 351.6160 | -3.70% |
+| rank 0 | 128 | 422.0280 | 392.8625 | -6.91% | 419.0675 | -6.25% |
+
+M16 is intentionally not attributed to R125 because both versions compile
+the same R124 full-row path. Its maximum-rank medians were
+`318.0730/311.5610/317.4755 us`, serving only as a session-drift sentinel.
+
+The independent reverse R125/R124/R125 run is also double-positive at all
+four affected points:
+
+| metric | M | first R125 us | R124 us | change | second R125 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| max rank | 8 | 285.9770 | 317.7730 | -10.01% | 298.3905 | -6.10% |
+| max rank | 32 | 325.2720 | 340.9765 | -4.61% | 319.1235 | -6.41% |
+| max rank | 64 | 359.0125 | 388.8325 | -7.67% | 349.2450 | -10.18% |
+| max rank | 128 | 412.9255 | 437.8420 | -5.69% | 409.7740 | -6.41% |
+| rank 0 | 8 | 271.6610 | 297.3420 | -8.64% | 291.5585 | -1.95% |
+| rank 0 | 32 | 318.0300 | 338.6955 | -6.10% | 313.9040 | -7.32% |
+| rank 0 | 64 | 341.2175 | 380.6510 | -10.36% | 345.6445 | -9.20% |
+| rank 0 | 128 | 405.4655 | 431.1325 | -5.95% | 397.0160 | -7.91% |
+
+R125 is accepted. Correctness/resources, NCU, both distributed timing orders,
+the excluded wrong-shard NSYS attempt, and the corrected NSYS evidence are
+archived under `iter357` through `iter362`.
