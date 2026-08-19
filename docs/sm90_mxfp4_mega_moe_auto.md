@@ -6152,3 +6152,47 @@ cross-rank dependency.
 
 R98 is accepted. Gate, screen, formal, NCU, and NSYS evidence is archived
 under `iter268` through `iter272`.
+
+### R98 authoritative DSV4 matrix against PR383
+
+R98 and PR383 were measured back-to-back on the same eight-H20 pod with the
+full requested contract. Positive gap means R98 is slower.
+
+| model | M | R98 us | PR383 us | gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 323.5095 | 300.2340 | +7.75% |
+| Flash | 16 | 328.8660 | 304.8945 | +7.86% |
+| Flash | 32 | 331.9085 | 331.8395 | +0.02% |
+| Flash | 64 | 368.1605 | 364.8300 | +0.91% |
+| Flash | 128 | 435.6905 | 435.3910 | +0.07% |
+| Flash | 256 | 514.8480 | 487.0910 | +5.70% |
+| Flash | 512 | 890.0580 | 899.4580 | -1.05% |
+| Flash | 1024 | 1512.0000 | 1542.3860 | -1.97% |
+| Flash | 2048 | 2740.0000 | 2716.3120 | +0.87% |
+| Flash | 4096 | 5109.0000 | 5069.0000 | +0.79% |
+| Flash | 8192 | 9902.0000 | 9812.0000 | +0.92% |
+| Pro | 8 | 754.5660 | 712.9715 | +5.83% |
+| Pro | 16 | 991.8705 | 1004.4275 | -1.25% |
+| Pro | 32 | 1033.0000 | 1102.3700 | -6.29% |
+| Pro | 64 | 1069.5000 | 1151.7610 | -7.14% |
+| Pro | 128 | 1224.5000 | 1279.7300 | -4.32% |
+| Pro | 256 | 1616.0000 | 1628.5130 | -0.77% |
+| Pro | 512 | 2525.0000 | 2398.3250 | +5.28% |
+| Pro | 1024 | 3900.0000 | 4007.0000 | -2.67% |
+| Pro | 2048 | 6896.0000 | 7031.0000 | -1.92% |
+| Pro | 4096 | 12972.0000 | 12881.0000 | +0.71% |
+| Pro | 8192 | 25275.0000 | 25106.0000 | +0.67% |
+
+The 22-point geometric gap is `+0.377920%`. Flash is `+1.936931%` and Pro is
+`-1.157248%`; small and large slices are `+0.212648%` and `+0.515855%`.
+Detailed splits are Flash small `+3.258646%`, Flash large `+0.848434%`, Pro
+small `-2.743498%`, and Pro large `+0.184372%`.
+
+Flash M8 is unchanged by R98 yet moved from R93's prior `298.706 us` versus
+`327.4525 us` PR383 comparison to `323.5095 us` versus `300.2340 us`. Flash
+M16 and M256 also move far more than any intervening branch change permits.
+Those points expose whole-matrix session drift and are not attributed to R98.
+The exact interleaved R93/R98/R93 formal run remains R98's causal evidence.
+The largest repeatable code-path residual remains Pro M512, followed by Pro
+M8. Complete matrix logs are archived under
+`iter273-r98-pr383-full-matrix`.
