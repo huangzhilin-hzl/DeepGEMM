@@ -7841,3 +7841,42 @@ C++, and hide only the swizzled store-address calculation that ptxas hoisted
 and spilled in R132. Resources, correctness, and NCU are archived under
 `iter406-r136-flash-fused-asm-k32-resource` and
 `iter407-r136-r126-ncu-flash-m8192`.
+
+## R137 rejected: scope only the full-row shared store
+
+R137 restored R132's fully unrolled C++ LDS.64 and x16 decode, but replaced
+only the B128 swizzle-address calculation and STS.128 with a no-output inline
+asm helper. This is the narrowest boundary suggested by the R132 SASS
+diagnosis: ptxas can still schedule and common decode/load operations, while a
+swizzled store address cannot escape the helper and become long-lived.
+
+The exact M8192 cubin uses 125 registers/thread, zero stack, zero local bytes,
+and 1,024 bytes of static shared memory; its SASS has no `STL` or `LDL`.
+Static SASS length is 9,394 lines, between R132's 9,275 and R126's 9,506.
+Production Flash M1024 passes on eight ranks with `diff=0.000658`.
+
+Matched NCU confirms that the narrow boundary still pays the complete-row
+store schedule's replay cost without recovering R132's full instruction
+reduction:
+
+| metric | R126 mean | R137 | change |
+| --- | ---: | ---: | ---: |
+| duration | 10647.200 us | 10818.784 us | +1.61% |
+| warp instructions | 2318828269 | 2253731090 | -2.81% |
+| thread instructions | 72833336693 | 70750214219 | -2.86% |
+| integer instructions | 31496324457 | 30057779789 | -4.57% |
+| inter-thread instructions | 997317260 | 689429164 | -30.87% |
+| global-load sectors | 35531185 | 35897135 | +1.03% |
+| local-load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+| shared-load conflicts | 1420482 | 1462146 | +2.93% |
+| shared-store conflicts | 26978866 | 33688741 | +24.87% |
+
+R137 is rejected before distributed timing and fully reverted. R132-R137 now
+exclude the regular Flash complete-row family under the current expanded-B
+layout: static C++ spills, rolled forms add dynamic work, and scoped asm forms
+remove spill but consistently add 22-25% shared-store replay and lose
+1.3-1.7% locally. Further work keeps R126's two-lane-per-row store mapping and
+targets its address/exponent work without changing ownership. Resources,
+correctness, SASS, and NCU are archived under
+`iter408-r137-flash-scoped-store-resource` and
+`iter409-r137-r126-ncu-flash-m8192`.
