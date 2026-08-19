@@ -7232,3 +7232,28 @@ timing scopes:
 R126 is accepted. The initial gate audit, isolated correctness/resources,
 matched NCU, both authoritative timing orders, and matched NSYS evidence are
 archived under `iter363` through `iter368`.
+
+### R126 same-session comparison with PR383
+
+The follow-up PR383/R126/PR383 run uses the same 50 observations, 20 launches
+per observation, one warmup, cold L2, seed zero, and maximum-rank median.
+PR383 remains the sum of its native FP8 L1 and L2 kernels:
+
+| metric | M | first PR383 us | R126 us | gap | second PR383 us | reverse gap |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| max rank | 8 | 724.5320 | 737.4850 | +1.79% | 717.2125 | +2.83% |
+| max rank | 16 | 1003.7000 | 920.6235 | -8.28% | 1008.3790 | -8.70% |
+| max rank | 32 | 1102.1410 | 994.9555 | -9.73% | 1106.7405 | -10.10% |
+| max rank | 64 | 1153.9675 | 1031.0000 | -10.66% | 1160.3455 | -11.15% |
+| max rank | 128 | 1275.2540 | 1185.5000 | -7.04% | 1274.2245 | -6.96% |
+| rank 0 | 8 | 714.8845 | 725.8480 | +1.53% | 713.0700 | +1.79% |
+| rank 0 | 16 | 1001.1505 | 905.0630 | -9.60% | 1002.9360 | -9.76% |
+| rank 0 | 32 | 1092.0065 | 980.2650 | -10.23% | 1095.5070 | -10.52% |
+| rank 0 | 64 | 1146.2905 | 1020.5000 | -10.97% | 1157.0030 | -11.80% |
+| rank 0 | 128 | 1266.6715 | 1179.0000 | -6.92% | 1267.2800 | -6.97% |
+
+R126 now leads PR383 decisively at four of five Pro small-M points. Pro M8
+remains a stable `1.79-2.83%` maximum-rank deficit even though the matched
+single-rank decoder improved, isolating the next M8 work to cross-rank
+scheduling/synchronization tail latency rather than packed decode arithmetic.
+The complete direct evidence is archived under `iter369`.
