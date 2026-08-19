@@ -5679,3 +5679,114 @@ latency benefit. The screen was distributed drift, so no third formal run was
 performed. R91 was reverted and the candidate extension rebuilt to R85.
 Correctness, screen, formal, and NCU evidence are under `iter234` through
 `iter237`.
+
+## R92: combine packed HFMA2 promotion and direct epilogue for Flash M32
+
+### Reason and direction
+
+R36's broad Flash experiment found that packed BF16 `HFMA2` promotion at M32
+was mixed, and R91 found that the direct packed-BF16 epilogue was also mixed
+when enabled alone. Flash M16 established an important counterexample in R78
+and R82: shortening the mainloop promotion and keeping its packed result
+through the epilogue changed the compiler schedule enough to pass even though
+the components had not won independently. R92 tests that missing composition
+at exact routed `hidden=4096, M=32`. It enables `HFMA2` promotion only when the
+M32 packed epilogue selector is also true, so the other 21 matrix points retain
+their R85 compile-time paths.
+
+Eight-rank forced-ring-wrap correctness passes at `diff=0.000666`. All 13
+production correctness scenarios pass after selection. The Flash M32 cubin
+uses 127 registers/thread, zero stack/local allocation, 1024 bytes static
+shared memory, and 110.82 KiB dynamic shared memory. R85 uses 125 registers
+with otherwise identical resources; the fixed two-CTA-per-SM launch topology
+is unchanged.
+
+### Screening and authoritative performance
+
+The one-warmup, 20-observation, 20-launch, cold-L2 screen was double-positive:
+
+| point | first R85 us | R92 us | change | second R85 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M32 max rank | 360.3005 | 348.9885 | -3.14% | 358.6925 | -2.71% |
+| Flash M32 rank 0 | 345.2500 | 333.6340 | -3.36% | 349.6485 | -4.58% |
+
+The requested small-M contract then used 50 observations with all other
+settings unchanged. Maximum rank reproduced the gain against both controls:
+
+| point | first R85 us | R92 us | change | second R85 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M32 max rank | 347.2895 | 343.6520 | -1.05% | 351.2080 | -2.15% |
+| Flash M32 rank 0 | 340.4110 | 330.3350 | -2.96% | 329.7520 | +0.18% |
+
+Maximum-rank median is the acceptance metric. Its two-sided result, the
+double-positive screen, and the independent profiler directions justify
+retaining R92. Rank 0 is essentially flat against the second formal control;
+the production benefit is primarily a reduction in the slowest peer.
+
+### NCU and NSYS attribution
+
+Matched one-rank/32-expert NCU isolates the generated M32 kernel:
+
+| metric | R85 | R92 | change |
+| --- | ---: | ---: | ---: |
+| duration us | 277.15 | 272.93 | -1.52% |
+| executed warp instructions | 72,062,450 | 69,312,840 | -3.82% |
+| executed thread instructions | 2,251,253,568 | 2,162,917,053 | -3.92% |
+| shared-load bank conflicts | 7,885 | 6,844 | -13.20% |
+| shared-store bank conflicts | 1,134,246 | 1,478,216 | +30.33% |
+| global-load sectors | 895,948 | 895,857 | -0.01% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+
+The composition wins by shortening the promotion/epilogue instruction and
+dependency path, not by reducing global traffic. It tolerates two additional
+registers and more shared-store conflicts without introducing local memory.
+A low-perturbation eight-rank NSYS run traced rank 0 only while the other seven
+ranks ran normally. Its single fused-kernel duration moves from `587.072 us`
+to `575.904 us` (`-1.90%`). The absolute profiler time is not a benchmark
+score, but its direction agrees with NCU and formal timing. Gate, screen, NCU,
+formal, production-correctness, and NSYS evidence is archived under `iter238`
+through `iter243`.
+
+### R92 authoritative DSV4 matrix against PR383
+
+R92 and PR383 were measured back-to-back on the same eight-H20 pod with the
+full requested contract. PR383 is the sum of its native FP8 L1 and L2 kernels.
+Positive gap means R92 is slower.
+
+| model | M | R92 us | PR383 us | gap |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 297.333 | 299.096 | -0.59% |
+| Flash | 16 | 332.1845 | 307.800 | +7.92% |
+| Flash | 32 | 347.338 | 333.132 | +4.26% |
+| Flash | 64 | 371.122 | 364.1585 | +1.91% |
+| Flash | 128 | 444.733 | 436.578 | +1.87% |
+| Flash | 256 | 514.458 | 505.204 | +1.83% |
+| Flash | 512 | 914.715 | 911.749 | +0.33% |
+| Flash | 1024 | 1522.000 | 1525.493 | -0.23% |
+| Flash | 2048 | 2798.000 | 2702.674 | +3.53% |
+| Flash | 4096 | 5169.000 | 5062.000 | +2.11% |
+| Flash | 8192 | 9895.000 | 9854.000 | +0.42% |
+| Pro | 8 | 754.444 | 707.3405 | +6.66% |
+| Pro | 16 | 999.932 | 1007.8985 | -0.79% |
+| Pro | 32 | 1035.500 | 1106.4865 | -6.42% |
+| Pro | 64 | 1062.000 | 1163.8855 | -8.75% |
+| Pro | 128 | 1216.500 | 1280.468 | -5.00% |
+| Pro | 256 | 1620.000 | 1639.099 | -1.17% |
+| Pro | 512 | 2542.000 | 2407.399 | +5.59% |
+| Pro | 1024 | 3934.000 | 4031.000 | -2.41% |
+| Pro | 2048 | 6912.000 | 7029.000 | -1.66% |
+| Pro | 4096 | 12996.000 | 12907.000 | +0.69% |
+| Pro | 8192 | 25303.000 | 25102.000 | +0.80% |
+
+The 22-point geometric gap is `+0.419673%`. Flash trails by `+2.097853%`,
+while Pro leads by `-1.230924%`. Small M is effectively tied at `-0.030925%`;
+large M trails by `+0.796722%`. The more detailed splits are Flash small
+`+3.035906%`, Flash large `+1.322670%`, Pro small `-3.006472%`, and Pro large
+`+0.273503%`.
+
+The full-matrix snapshot is noisier than the exact causal A/B/A, especially
+at three-observation large M, and does not invalidate R92's isolated M32 win.
+It does show that the terminal goal is not yet met: the remaining stable
+priorities are Flash M16/M32 and Pro M8, with Pro M512 as a secondary
+three-observation residual. Complete matrix logs are under
+`iter244-r92-pr383-full-matrix`.
