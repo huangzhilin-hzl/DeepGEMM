@@ -8064,3 +8064,77 @@ proceed to distributed A/B/A because it is a compiled no-op. Exact
 launch/resources and the complete sandwiched NCU/SASS evidence are archived
 under `iter419-r140-flash-m8192-early-release-gate` and
 `iter420-r126-r140-ncu-flash-m8192`.
+
+## R141 accepted: relaxed L1 ring polling with acquire confirmation
+
+### Reason and direction
+
+SourceCounters on accepted R126 identified the exact Flash M8192 L1
+ring-reuse wait as the largest single long-scoreboard source. Its acquire
+load compiles to `LDG.E.STRONG.GPU; CCTL.IVALL` on every unsuccessful poll;
+the hot `CCTL.IVALL` executes 48,215,888 times and accounts for 60,774
+long-scoreboard not-issued samples, 36.6% of the kernel total. The empty count
+is monotonic, so R141 uses a GPU-scope relaxed load while waiting and performs
+a second acquire load after the observed value reaches the target. The final
+acquire still orders the consumer's writes before dispatch overwrites the
+ring slot. The change is restricted to the existing exact routed Flash M8192
+template selector; all Pro and other Flash signatures retain R126.
+
+The exact eight-rank launch succeeds with 125 registers/thread, zero stack,
+zero local bytes, and 1,024 bytes of static shared memory. SASS contains a
+relaxed `LDG.E.STRONG.GPU` polling loop without a following CCTL and a single
+acquire confirmation with `CCTL.IVALL`. An exact eight-rank numerical test of
+the production Flash M8192 route passes with `diff=0.000661`.
+
+### NCU and SourceCounters
+
+Matched one-rank NCU used the production 32-expert shard and an
+R126/R141/R126 sandwich. Against the control mean:
+
+| metric | R126 mean | R141 | change |
+| --- | ---: | ---: | ---: |
+| duration | 10645.440 us | 10617.600 us | -0.26% |
+| DRAM bytes read | 1143175936 | 1142446336 | -0.06% |
+| global-load sectors | 35501745 | 37785149 | +6.43% |
+| warp instructions | 2318661991 | 2314973287 | -0.16% |
+| thread instructions | 72828054328 | 72710284696 | -0.16% |
+| integer instructions | 31498847996 | 31502838031 | +0.01% |
+| inter-thread instructions | 997317228 | 997317292 | unchanged |
+| shared-load conflicts | 1415916 | 1352718 | -4.46% |
+| shared-store conflicts | 26964504 | 27576365 | +2.27% |
+| local-load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+| active warps per issue-active | 9.28 | 9.28 | unchanged |
+| barrier stall ratio | 1.53 | 1.57 | +0.04 |
+| long-scoreboard stall ratio | 4.12 | 4.01 | -0.11 |
+| issue active | 42.80% | 42.80% | unchanged |
+| tensor active | 22.60% | 22.61% | +0.01 pp |
+
+SourceCounters explains why removing the hot cache-control instruction gives
+only a small end-to-end gain. Long-scoreboard not-issued samples fall from
+166,238 to 161,440 (-2.89%), while barrier samples rise from 74,019 to 75,807
+(+2.42%). The hot CCTL's 60,774 long-scoreboard samples disappear, but most
+of the dependency wait transfers to the comparison consuming the relaxed
+load. Removing CCTL permits a tighter polling rate, reflected in 6.43% more
+global-load sectors, while still removing 0.16% of dynamic instructions.
+
+Low-perturbation NSYS independently measures `9777.326/9769.839/9779.503 us`
+for R126/R141/R126; R141 is 0.09% faster than the control mean.
+
+### Authoritative distributed acceptance
+
+The required three-observation, 20-launch, cold-L2 run is statistically
+neutral at `9956/9957/9974 us` for maximum-rank median: R141 is one microsecond
+slower than the first control and 17 microseconds faster than the second.
+Because both profilers show a consistent but sub-percent local gain, two
+ten-observation order-controlled runs provide the acceptance decision:
+
+| order | first us | middle us | last us | result |
+| --- | ---: | ---: | ---: | --- |
+| R126 / R141 / R126 | 9939.5 | 9881.5 | 9884.5 | R141 -0.58% / -0.03% |
+| R141 / R126 / R141 | 9879.0 | 9883.5 | 9876.5 | R141 -0.05% / -0.07% |
+
+Both orders are double-positive for the authoritative maximum-rank median,
+and NCU, NSYS, SASS, SourceCounters, and numerical correctness agree with the
+mechanism. R141 is accepted as a small Flash M8192 improvement. Exact launch,
+profiles, timing logs, and correctness evidence are archived under `iter424`
+through `iter431`.

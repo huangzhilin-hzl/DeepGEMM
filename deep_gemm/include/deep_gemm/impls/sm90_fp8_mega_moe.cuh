@@ -1225,18 +1225,28 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             if (empty_target > 0) {
                 const auto empty_ptr =
                     workspace.get_l1_empty_count_ptr(ring_block_idx);
-                while (ptx::ld_acq(empty_ptr) < empty_target) {
-                    // For one-block Pro dispatch, avoid hammering the counter
-                    // while the wider GEMM tile retires the previous slot.
-                    if constexpr (kNumRanks > 1 and kHidden > 4096) {
-                        if (num_tokens <= BLOCK_M)
-                            __nanosleep(64);
-                    }
-                    // Flash M128 wraps padded expert blocks onto a second ring
-                    // generation. Briefly back off contending dispatch lanes.
-                    if constexpr (kNumRanks > 1 and kHidden == 4096) {
-                        if (num_tokens == 2 * BLOCK_M)
-                            __nanosleep(16);
+                if constexpr (kHidden == 4096 and
+                              kUseIncrementalMXFP4Descriptor) {
+                    // Poll the monotonic counter without invalidating L1 on
+                    // every miss, then acquire once before reusing the slot.
+                    while (ptx::ld_relaxed_gpu(empty_ptr) < empty_target) {}
+                    while (ptx::ld_acq(empty_ptr) < empty_target) {}
+                } else {
+                    while (ptx::ld_acq(empty_ptr) < empty_target) {
+                        // For one-block Pro dispatch, avoid hammering the
+                        // counter while the wider GEMM tile retires the
+                        // previous slot.
+                        if constexpr (kNumRanks > 1 and kHidden > 4096) {
+                            if (num_tokens <= BLOCK_M)
+                                __nanosleep(64);
+                        }
+                        // Flash M128 wraps padded expert blocks onto a second
+                        // ring generation. Briefly back off contending
+                        // dispatch lanes.
+                        if constexpr (kNumRanks > 1 and kHidden == 4096) {
+                            if (num_tokens == 2 * BLOCK_M)
+                                __nanosleep(16);
+                        }
                     }
                 }
             }
