@@ -6890,3 +6890,73 @@ formal production timing because both replay duration and critical stalls
 were decisively worse. R118-R120 are fully reverted. Correctness/resources,
 both R118 timing orders, and all NCU reports are archived under `iter331`
 through `iter339`; R99 remains the accepted control.
+
+## R121-R123 rejected: direct Flash small-M pool mapping and count sharing
+
+### R121/R122: one-warp pool-token owner mapping
+
+Flash dispatch originally advances each global pool-token ordinal through a
+serial scan of all 32 local expert counts. R121 used the one-expert-per-lane
+layout to form expert prefix ends in one warp inclusive scan and select the
+owner with a ballot. A runtime guard retained the original scan whenever any
+expert exceeded one M64 block. The first candidate selected exact Flash M8
+and M16; R122 narrowed the specialization to exact M8 after the M16 result.
+
+Both forced-ring-wrap gates passed: Flash M8 at `diff=0.000671` and Flash M16
+at `diff=0.000654`. Their cubins used 114 and 118 registers/thread,
+respectively, with zero stack/local allocation. The authoritative
+50-observation R99/R121/R99 comparison separated the two buckets:
+
+| point | first R99 us | R121 us | change | second R99 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M8 maximum rank | 304.8880 | 302.8005 | -0.68% | 306.0655 | -1.07% |
+| Flash M8 rank 0 | 295.5025 | 282.0530 | -4.55% | 291.4815 | -3.23% |
+| Flash M16 maximum rank | 317.3230 | 326.7695 | +2.98% | 323.0615 | +1.15% |
+| Flash M16 rank 0 | 306.3745 | 305.3775 | -0.33% | 316.1710 | -3.41% |
+
+The required reverse R122/R99/R122 M8 run then changed sign. Its first R122,
+R99, and second R122 maximum-rank medians were `291.6545/304.5890/309.4340
+us`; rank-0 medians were `281.6735/290.0390/297.3065 us`. The two candidate
+samples were therefore `-4.25%/+1.59%` at maximum rank and `-2.88%/+2.51%`
+at rank 0.
+
+Matched one-rank NCU and NSYS do show a real but sub-noise local mechanism:
+
+| metric | R99 | R122 | change |
+| --- | ---: | ---: | ---: |
+| NCU duration | 206.18 us | 205.60 us | -0.28% |
+| NSYS duration | 209.632 us | 209.184 us | -0.21% |
+| warp instructions | 47438050 | 47303934 | -0.28% |
+| thread instructions | 1475883841 | 1471503455 | -0.30% |
+| global-load sectors | 644329 | 645683 | +0.21% |
+| barrier stall | 2.99 | 2.97 | -0.67% |
+| long-scoreboard stall | 2.57 | 2.60 | +1.17% |
+
+The instruction saving is only about 0.3%, while extra shuffle/ballot work
+slightly increases memory-scoreboard pressure. It does not survive the
+distributed maximum-rank acceptance contract, so R121/R122 are rejected.
+
+### R123: share completed Flash M8 expert counts per CTA
+
+R123 composed R122 with the expert-count snapshot accepted for Pro M8/M512:
+dispatch warp 0 polled all 32 completed Flash counts once, published them in
+the existing shared scratch, and synchronized both dispatch warps plus the
+B-loader. Correctness remained `diff=0.000671`; resource usage remained 114
+registers/thread with zero stack/local allocation.
+
+The count cache removed the expected traffic but moved synchronization onto
+the critical path:
+
+| NCU metric | R99 | R123 | change |
+| --- | ---: | ---: | ---: |
+| duration | 220.42 us | 222.08 us | +0.75% |
+| global-load sectors | 642640 | 624374 | -2.84% |
+| warp instructions | 47419225 | 47148008 | -0.57% |
+| thread instructions | 1475663456 | 1477895546 | +0.15% |
+| barrier stall | 2.88 | 2.99 | +3.82% |
+| long-scoreboard stall | 2.48 | 2.54 | +2.42% |
+
+The saved polling cannot repay a CTA-wide rendezvous at this very small
+workload. R123 was rejected before formal production timing. R121-R123 are
+fully reverted; gate, both timing orders, NCU, and NSYS evidence is archived
+under `iter340` through `iter345`; R99 remains the accepted control.
