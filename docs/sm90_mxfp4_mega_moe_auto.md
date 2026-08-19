@@ -6039,3 +6039,49 @@ dependency path. Because both maximum-rank controls and rank 0 regress well
 beyond the profiler's `0.21%` signal, a formal run is unjustified. R96 is
 rejected and fully reverted. Correctness/resource, NCU, and screen evidence is
 archived under `iter262` through `iter264`.
+
+## R97 rejected: two-task L2 scheduler claims for Pro M512
+
+### Reason and direction
+
+The existing Pro M512 profile is locally faster than PR383, while its
+production residual appears only in the multi-rank persistent schedule. R97
+therefore reduced scheduler contention rather than changing arithmetic. L1's
+task counter also publishes dependency progress and continued to claim one
+task at a time. Exact Pro M512 made each dependency-free L2 atomic claim
+reserve two consecutive, equal-cost N tiles, cutting claim frequency while
+limiting per-CTA tail ownership to one extra tile. Every other specialization
+retained single-task claims.
+
+Eight-rank correctness passes at `diff=0.000708`. The cubin remains at 128
+registers/thread, zero stack/local allocation, 1024 bytes static shared
+memory, and 100.58 KiB dynamic shared memory.
+
+### NCU gate and production screen
+
+Matched one-rank NCU confirms the intended scheduler effect:
+
+| metric | R93 | R97 | change |
+| --- | ---: | ---: | ---: |
+| duration ms | 2.23 | 2.23 | flat at report precision |
+| L1 global-atomic sectors | 10,256 | 8,296 | -19.11% |
+| L2 atomic sectors | 14,983 | 12,122 | -19.10% |
+| executed warp instructions | 513,921,386 | 514,047,845 | +0.025% |
+| executed thread instructions | 16,134,487,793 | 16,135,849,752 | +0.008% |
+| shared-load bank conflicts | 119,711 | 123,975 | +3.56% |
+| shared-store bank conflicts | 8,951,698 | 8,701,823 | -2.79% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+
+The atomics fall, but isolated duration does not. A five-observation cold-L2
+R93/R97/R93 screen then changed sign on the required maximum-rank metric:
+
+| point | first R93 us | R97 us | change | second R93 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pro M512 max rank | 2574 | 2572 | -0.08% | 2547 | +0.98% |
+| Pro M512 rank 0 | 2547 | 2538 | -0.35% | 2544 | -0.24% |
+
+Rank 0 benefits slightly, but pre-claiming one extra tile increases tail
+ownership variance and loses against the second maximum-rank control. A larger
+claim size would amplify that exact risk. R97 is rejected without a formal
+run and fully reverted. Correctness/resource, NCU, and screen evidence is
+archived under `iter265` through `iter267`.
