@@ -7480,3 +7480,49 @@ loads and emits two immediate STS.64 operations per pair, shortening only the
 simultaneous lifetime of `decoded0` and `decoded1` without adding runtime
 loops. Correctness, resource, and NCU evidence is archived under `iter378`
 through `iter380`.
+
+## R130-R130c rejected: split-store LDS.64 Pro M512 row decode
+
+### Reason and variants
+
+R129a showed that nested scalar loops destroy the static shared-memory
+schedule. R130 restored one bank-permuted LDS.64 per adjacent packed-word pair
+and kept the expanded-B pipeline. It decoded the low word, immediately issued
+STS.64, then decoded and stored the high word, so `decoded0` and `decoded1`
+would not coexist as C++ values. The exact signature still compiled with a
+32-byte stack frame.
+
+R130a moved both decodes and stores into one inline PTX block so decoded
+results never escaped to C++; the frame remained 32 bytes. R130b additionally
+moved LDS.64 and exponent lookup into the same asm block, limiting the caller
+to packed/load/store addresses plus one exponent, but full pair-loop unrolling
+again retained a 32-byte frame. R130c finally disabled only the two-iteration
+pair-loop unroll. This reached `REG:125, STACK:0, LOCAL:0` while retaining
+LDS.64 and expanded-B overlap. All seven eight-rank Pro scenarios passed,
+including every ring-wrap guard, with M512 `diff=0.000710`.
+
+### NCU rejection
+
+The remaining pair loop and per-pair lookup still cost more work and shared
+replay than complete-row ownership saves:
+
+| metric | R126 | R130c | change |
+| --- | ---: | ---: | ---: |
+| duration | 2414.720 us | 2534.976 us | +4.98% |
+| warp instructions | 512864977 | 592124457 | +15.45% |
+| thread instructions | 16188572131 | 18723874942 | +15.66% |
+| bit instructions | 1282068782 | 1426595630 | +11.27% |
+| integer instructions | 6971242681 | 8925661355 | +28.04% |
+| inter-thread instructions | 230773932 | 158520492 | -31.31% |
+| local-load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+| shared-load conflicts | 123598 | 110879 | -10.29% |
+| shared-store conflicts | 8926404 | 47108389 | +427.74% |
+
+R130-R130c are rejected before distributed timing and fully reverted. Across
+R127-R130, every regular Pro M512 complete-row schedule now falls into one of
+two excluded classes: fully static forms spill at 128 registers, while forms
+that suppress live ranges with serialization or runtime loops lose more than
+the decoder instruction reduction. The next iteration leaves M512 decode
+unchanged and profiles the refreshed Pro M256 residual against PR383 before
+choosing a new mechanism. Resource, correctness, and NCU evidence is archived
+under `iter381` through `iter385`.
