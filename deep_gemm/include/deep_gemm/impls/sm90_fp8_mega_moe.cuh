@@ -1701,6 +1701,112 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             constexpr bool kPairPackedWords =
                                 kOverlapMXFP4ScalePath;
                             if constexpr (kPairPackedWords) {
+                                // Exact Flash M16 gives each lane one complete
+                                // packed row. Both adjacent word pairs share
+                                // the row's exponent lookup, and the lane owns
+                                // the scale directly instead of shuffling it
+                                // twice from the two-lane-per-row mapping.
+                                constexpr bool kFullRowPairDecode =
+                                    kSmallMSwapAB and kHidden == 4096 and
+                                    kMaxSwapABTokens == 16;
+                                if constexpr (kFullRowPairDecode) {
+                                    const uint32_t decoded_local_n = local_n;
+                                    const uint32_t packed_row_base =
+                                        decoded_local_n * (BLOCK_K / 2);
+                                    const uint32_t packed_row_xor =
+                                        cute::Swizzle<2, 4, 3>::apply(
+                                            packed_row_base) ^ packed_row_base;
+                                    const uint32_t first_pair_in_k32 =
+                                        __byte_perm(
+                                            0x00020200u, 0u, lane_idx >> 3);
+                                    uint2 packed_current[2];
+                                    #pragma unroll
+                                    for (uint32_t pair_idx = 0;
+                                         pair_idx < 2; ++ pair_idx) {
+                                        const uint32_t pair_in_k32 =
+                                            first_pair_in_k32 ^ (pair_idx * 2u);
+                                        const uint32_t packed_byte_offset =
+                                            packed_row_base +
+                                            ((pair_in_k32 * sizeof(uint32_t)) ^
+                                             packed_row_xor);
+                                        packed_current[pair_idx] =
+                                            ptx::ld_shared(
+                                                reinterpret_cast<const uint2*>(
+                                                    packed +
+                                                    packed_byte_offset));
+                                    }
+                                    #pragma unroll
+                                    for (uint32_t k32_idx = 0;
+                                         k32_idx < kNumMXFP4SFBKGroups;
+                                         ++ k32_idx) {
+                                        uint2 packed_next[2] = {
+                                            make_uint2(0u, 0u),
+                                            make_uint2(0u, 0u)};
+                                        if (k32_idx + 1 <
+                                            kNumMXFP4SFBKGroups) {
+                                            #pragma unroll
+                                            for (uint32_t pair_idx = 0;
+                                                 pair_idx < 2; ++ pair_idx) {
+                                                const uint32_t pair_in_k32 =
+                                                    first_pair_in_k32 ^
+                                                    (pair_idx * 2u);
+                                                const uint32_t next_packed_pair =
+                                                    (k32_idx + 1) *
+                                                        kPackedWordsPerK32 +
+                                                    pair_in_k32;
+                                                const uint32_t
+                                                    next_packed_byte_offset =
+                                                        packed_row_base +
+                                                        ((next_packed_pair *
+                                                          sizeof(uint32_t)) ^
+                                                         packed_row_xor);
+                                                packed_next[pair_idx] =
+                                                    ptx::ld_shared(
+                                                        reinterpret_cast<
+                                                            const uint2*>(
+                                                            packed +
+                                                            next_packed_byte_offset));
+                                            }
+                                        }
+                                        const uint32_t exponent_offset =
+                                            sm90_extract_u8_prmt(
+                                                scale_word, k32_idx);
+                                        const uint2 lookup =
+                                            sm90_mxfp4_e4m3_lookup(
+                                                exponent_offset);
+                                        #pragma unroll
+                                        for (uint32_t pair_idx = 0;
+                                             pair_idx < 2; ++ pair_idx) {
+                                            const uint2 decoded0 =
+                                                sm90_mxfp4_reordered_signs_e2m1x8_to_e4m3x8_bits(
+                                                    packed_current[pair_idx].x,
+                                                    lookup);
+                                            const uint2 decoded1 =
+                                                sm90_mxfp4_reordered_signs_e2m1x8_to_e4m3x8_bits(
+                                                    packed_current[pair_idx].y,
+                                                    lookup);
+                                            const uint32_t pair_in_k32 =
+                                                first_pair_in_k32 ^
+                                                (pair_idx * 2u);
+                                            const uint32_t packed_k_pair =
+                                                k32_idx *
+                                                    kPackedWordsPerK32 +
+                                                pair_in_k32;
+                                            const uint32_t flat =
+                                                decoded_local_n * BLOCK_K +
+                                                packed_k_pair * 8u;
+                                            const uint32_t swizzled =
+                                                cute::Swizzle<3, 4, 3>::apply(
+                                                    flat);
+                                            ptx::st_shared(
+                                                expanded + swizzled,
+                                                decoded0.x, decoded0.y,
+                                                decoded1.x, decoded1.y);
+                                            packed_current[pair_idx] =
+                                                packed_next[pair_idx];
+                                        }
+                                    }
+                                } else {
                                 constexpr uint32_t kPairRowsPerDecodeGroup = 16;
                                 const uint32_t pair_row_in_decode_group =
                                     lane_idx % 16;
@@ -1826,6 +1932,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                             decoded.z, decoded.w);
                                         packed_current = packed_next;
                                     }
+                                }
                                 }
                             } else {
                                 // Each half warp covers the same eight rows and

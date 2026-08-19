@@ -6960,3 +6960,79 @@ The saved polling cannot repay a CTA-wide rendezvous at this very small
 workload. R123 was rejected before formal production timing. R121-R123 are
 fully reverted; gate, both timing orders, NCU, and NSYS evidence is archived
 under `iter340` through `iter345`; R99 remains the accepted control.
+
+## R124 accepted: decode one complete Flash M16 row per lane
+
+### Reason and direction
+
+Fresh matched R99/PR383 NCU narrowed the remaining Flash small-M problem to
+M16. At M8, R99's persistent MXFP4 kernel took `221.15 us` versus `249.19
+us` for PR383's L1+L2 sum, but at M16 R99 took `274.40 us` versus `270.37
+us`. R99 already read 44% fewer DRAM bytes and 32% fewer L2 read sectors at
+M16, while executing about 58% more thread instructions. Instruction-mix
+profiling attributed the excess primarily to MXFP4 expansion: R99 executed
+about 831 million integer and 257 million bit instructions, versus about 283
+million and 16 million for PR383's two kernels combined.
+
+The R99 paired decoder assigns two lanes to each N row. Each lane owns one
+adjacent two-word pair, independently shuffles the same scale word, and
+rebuilds the same E4M3 exponent lookup. R124 specializes exact routed Flash
+M16 so each lane owns all four packed words of one N row. It preserves the
+two LDS.64 transactions, packed B64 swizzle, and bank-permuted pair order,
+but shares one exponent lookup across both pairs and consumes the lane-local
+scale without two cross-lane shuffles. All other Flash and Pro buckets keep
+the R99 mapping.
+
+### Correctness, resources, and mechanism
+
+The focused forced-ring-wrap gate passed at `diff=0.000654`. The cubin stays
+at 118 registers/thread, zero stack/local allocation, and 1024 bytes static
+shared memory. The full production suite subsequently passed all 13 Flash
+and Pro scenarios, including every forced-wrap case.
+
+Matched one-rank NCU confirms the intended mechanism:
+
+| metric | R99 | R124 | change |
+| --- | ---: | ---: | ---: |
+| duration | 274.40 us | 264.45 us | -3.63% |
+| warp instructions | 63121418 | 60464048 | -4.21% |
+| thread instructions | 1966607465 | 1881291342 | -4.34% |
+| bit instructions | 256615022 | 232235630 | -9.50% |
+| integer instructions | 830061785 | 787080842 | -5.18% |
+| inter-thread communication | 81035372 | 68846636 | -15.04% |
+| shared-load bank conflicts | 5541 | 5489 | -0.94% |
+| shared-store bank conflicts | 1424316 | 1316082 | -7.60% |
+| short-scoreboard stall | 0.56 | 0.42 | -25.00% |
+
+The new mapping does not reintroduce R54's former LDS.64 conflicts. NSYS
+independently measures `259.903 -> 249.791 us` (`-3.89%`).
+
+### Authoritative distributed timing
+
+The requested 50-observation, 20-launch, one-warmup R99/R124/R99 run is
+double-positive despite substantial node tail latency:
+
+| metric | first R99 us | R124 us | change | second R99 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| maximum-rank median | 344.2430 | 319.7520 | -7.11% | 336.5420 | -4.99% |
+| rank-0 median | 322.8940 | 304.8415 | -5.59% | 331.2470 | -7.97% |
+
+The independent reverse R124/R99/R124 run also passes both sides:
+
+| metric | first R124 us | R99 us | change | second R124 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| maximum-rank median | 331.8845 | 341.9230 | -2.94% | 327.3750 | -4.25% |
+| rank-0 median | 317.5255 | 329.1490 | -3.53% | 312.2360 | -5.14% |
+
+A same-session PR383/R124/PR383 production comparison measured maximum-rank
+medians `339.0045/330.2475/325.8445 us`: R124 is `2.58%` faster than the
+first PR383 control but `1.35%` slower than the second. Rank-0 medians were
+`335.4195/309.3840/309.8625 us`, making R124 `7.76%/0.15%` faster. Therefore
+R124 clearly removes the R99 regression and locally beats PR383, while a
+stable maximum-rank production lead still requires a fresh full-matrix run;
+the mixed PR383 sides are not claimed as a conclusive overall win.
+
+R124 is accepted. Matched PR383 decomposition, instruction mix,
+correctness/resources, both timing orders, direct PR383 timing, full
+production regression, NCU, and NSYS evidence is archived under `iter346`
+through `iter354`.
