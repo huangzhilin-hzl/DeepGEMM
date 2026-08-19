@@ -8341,3 +8341,22 @@ stripping addresses.  R144 therefore creates no machine-level mechanism and
 is rejected at the SASS gate without NCU, NSYS, or distributed timing.  It is
 fully reverted.  The resource, launch, and disassembly evidence is archived
 under `iter441-r144-dependent-wait-gate`.
+
+## R145 rejected: nonnegative-scale predicated WGMMA wait
+
+R144's tautological predicate was optimized away, so R145 formed the local
+dependency from a real processed-MXFP4 invariant instead: activation and
+secondary scales are nonnegative, hence the sign bits of both duplicated
+BF16x2 promotion multipliers are clear.  The exact Flash M8192 wait was
+predicated on that sign test, which is true for every valid lane but cannot be
+folded from load-time values.
+
+ptxas retains the scale-dependent predicate but expands the predicated wait
+into additional `WARPGROUP.ARRIVE`/`WARPGROUP.DEPBAR` sequences.  The exact
+cubin grows from 125 registers and zero stack to 128 registers and an 8-byte
+stack frame.  A one-observation eight-rank gate regresses from the established
+roughly 9.9 ms range to 11,441 us maximum-rank and 11,408 us rank-0 time.
+R145 is rejected at the resource/SASS/timing gate, fully reverted, and not
+advanced to NCU or NSYS.  The result rules out predicating WGMMA wait as a
+cheap scheduling dependency on SM90.  Evidence is archived under
+`iter442-r145-nonnegative-wait-gate`.
