@@ -7303,3 +7303,44 @@ orientation decoder work must reduce accumulator lifetime or otherwise make
 register headroom before adopting complete-row ownership. Correctness,
 resource evolution, SASS, and NCU evidence are archived under `iter370`
 through `iter373`; R126 remains the accepted control.
+
+## R126 matched PR383 NCU: Pro M8 residual is distributed tail latency
+
+### Reason and direction
+
+The direct eight-rank PR383/R126/PR383 comparison left Pro M8 as the only
+small-M Pro deficit, at `+1.79%/+2.83%` for maximum-rank latency. A fresh
+matched one-rank, 48-expert-shard NCU comparison therefore tested whether
+the residual still came from local arithmetic or memory capacity. PR383 is
+reported as the sum of its native L1 and L2 kernels, while R126 remains one
+fused persistent launch.
+
+### Profiler result
+
+| metric | PR383 L1 + L2 | R126 | R126 change |
+| --- | ---: | ---: | ---: |
+| duration | 444.448 + 238.432 = 682.880 us | 639.680 us | -6.33% |
+| DRAM read bytes | 2,078,123,776 | 1,187,452,416 | -42.86% |
+| L2 read sectors | 138,137,642 | 95,235,186 | -31.06% |
+| global-load sectors | 1,739,537 | 2,179,719 | +25.30% |
+| warp instructions | 125,827,793 | 164,511,345 | +30.74% |
+| thread instructions | 3,753,776,471 | 5,166,455,508 | +37.63% |
+| bit instructions | 96,590,818 | 677,909,854 | +601.84% |
+| integer instructions | 564,394,974 | 2,266,343,527 | +301.55% |
+| inter-thread instructions | 96,199,836 | 188,554,156 | +96.01% |
+
+R126 wins the isolated duration by `43.20 us` despite executing substantially
+more integer/decode work, because the fused MXFP4 path reads much less DRAM
+and L2 data and avoids PR383's phase boundary. This is the opposite of the
+stable eight-rank ordering. The remaining `13-20 us` distributed deficit is
+therefore not a local compute or bandwidth ceiling; it is a cross-rank
+arrival/synchronization tail in the 156-CTA fused protocol.
+
+Directly shrinking the grid is not reopened: R01, R05, R16, and R43 already
+showed that 78 CTAs lose the independent producer/scheduler/WGMMA concurrency
+required by this kernel, even with zero spills, more stages, or a second math
+warpgroup. R89/R90/R108/R109/R113/R114/R115/R116 likewise exclude sparse
+count publication, polling backoff, hierarchical barriers, and token-ready
+combine as isolated fixes. The next priority is selected from a fresh full
+22-point same-session matrix rather than repeating one of those disproven
+Pro M8 mechanisms. Complete NCU reports are archived under `iter374`.
