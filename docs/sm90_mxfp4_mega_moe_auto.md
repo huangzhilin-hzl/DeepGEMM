@@ -5990,3 +5990,52 @@ combine work and does not shorten the maximum-rank critical path. The screen
 sign reversal and NCU duration regression make a formal run unjustified. R95
 is rejected and fully reverted. Correctness/resource, screen, and NCU evidence
 is archived under `iter259` through `iter261`.
+
+## R96 rejected: pipelined packed BF16 epilogue for Pro M8
+
+### Reason and direction
+
+R94's packed BF16 epilogue silently disabled R12's accepted two-fragment
+weight-half pipeline because `kPipelineWeightHalves` excluded every packed
+bucket. That explained R94's roughly 3% increase in executed instructions.
+R96 retested the composition at exact Pro M8 while explicitly preserving the
+two separate WGMMA commit groups and `wait<1>` overlap. Other packed buckets
+and all other authoritative points compiled their original schedule.
+
+Eight-rank correctness passes at `diff=0.000716`. The cubin remains at 107
+registers/thread, zero stack/local allocation, 1024 bytes static shared
+memory, and 100.58 KiB dynamic shared memory.
+
+### Profiler gate
+
+Matched one-rank NCU verifies that R96 repairs R94's scheduling side effect:
+
+| metric | R93 | R96 | change |
+| --- | ---: | ---: | ---: |
+| duration us | 665.38 | 664.00 | -0.21% |
+| shared-load bank conflicts | 8,079 | 7,255 | -10.20% |
+| shared-store bank conflicts | 3,991,725 | 3,997,445 | +0.14% |
+| global-load sectors | 2,202,036 | 2,203,133 | +0.05% |
+| executed warp instructions | 172,496,995 | 172,487,537 | -0.005% |
+| executed thread instructions | 5,380,258,889 | 5,380,006,286 | -0.005% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+
+The instruction counts return to R93 rather than R94's `+2.90%/+2.95%`, and
+the isolated duration direction is slightly positive, so R96 proceeded to a
+distributed screen.
+
+### Eight-rank rejection
+
+The 20-observation cold-L2 R93/R96/R93 screen was negative against both
+controls:
+
+| point | first R93 us | R96 us | change | second R93 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pro M8 max rank | 769.2190 | 791.1800 | +2.85% | 781.6710 | +1.22% |
+| Pro M8 rank 0 | 749.6120 | 782.9295 | +4.45% | 755.4285 | +3.64% |
+
+The local NCU conflict reduction does not survive the production cross-rank
+dependency path. Because both maximum-rank controls and rank 0 regress well
+beyond the profiler's `0.21%` signal, a formal run is unjustified. R96 is
+rejected and fully reverted. Correctness/resource, NCU, and screen evidence is
+archived under `iter262` through `iter264`.
