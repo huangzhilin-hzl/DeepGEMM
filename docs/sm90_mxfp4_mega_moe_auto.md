@@ -6758,3 +6758,54 @@ including the workspace ABI change. Formal 50-observation, NCU, and NSYS runs
 were not warranted after two clear double-negative screens. Build,
 correctness/resources, and both A/B/A screens are archived under `iter322`
 through `iter326`; R99 remains the accepted control.
+
+## R117 rejected: pair adjacent Pro M512 L2 blocks N-major
+
+### Reason and direction
+
+R99 schedules every L2 N tile for one routed M block before moving to the
+next M block. R117 tested whether pairing adjacent routed M blocks and
+visiting the pair N-major (`N0/M0`, `N0/M1`, `N1/M0`, `N1/M1`, ...) could
+reuse an expert's MXFP4 weights across the two tasks. The specialization was
+limited to the routed DSV4 Pro M512 bucket; L1 ordering, task count,
+dependencies, barriers, and all other benchmark cases were unchanged.
+
+Eight-rank correctness passed at `diff=0.000716`. The generated cubin stayed
+at 128 registers/thread, zero stack/local allocation, 1024 bytes static
+shared memory, and 100.58 KiB dynamic shared memory.
+
+### Timing and profiler result
+
+The authoritative R99/R117/R99 run was already inconclusive-to-negative
+because its second control contained large outliers:
+
+| metric | first R99 us | R117 us | change | second R99 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| maximum-rank median | 2566 | 2615 | +1.91% | 2776 | -5.80% |
+| rank-0 median | 2560 | 2601 | +1.60% | 2769 | -6.07% |
+
+The independent reverse R117/R99/R117 run rejected the candidate against a
+stable shared control:
+
+| metric | first R117 us | R99 us | change | second R117 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| maximum-rank median | 2552 | 2528 | +0.95% | 2600 | +2.85% |
+| rank-0 median | 2526 | 2524 | +0.08% | 2590 | +2.61% |
+
+Matched one-rank NCU also falsified the intended locality mechanism:
+
+| NCU metric | R99 | R117 | change |
+| --- | ---: | ---: | ---: |
+| duration | 2.23 ms | 2.24 ms | +0.45% |
+| L2 read sectors | 198749333 | 202804783 | +2.04% |
+| L2 read hit rate | 69.12% | 68.28% | -0.84 pp |
+| L1 global-load sectors | 4873435 | 4877879 | +0.09% |
+| warp instructions | 512858470 | 512937729 | +0.015% |
+| thread instructions | 16188667868 | 16189648303 | +0.006% |
+
+Adjacent pool blocks are not reliably adjacent blocks of the same expert,
+and N-major pairing disrupts the original M-major cache and pipeline
+locality. Expert-aware refinement is therefore not justified by this
+mechanism. R117 is fully reverted. Correctness/resources, both timing orders,
+and NCU evidence are archived under `iter327` through `iter330`; R99 remains
+the accepted control.
