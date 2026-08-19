@@ -8190,3 +8190,60 @@ The next local mechanism iteration continues at Flash M8192, where R141's
 tighter relaxed spin increased global-load sectors by 6.43%. The complete
 three-session matrix is archived under
 `iter432-r141-pr383-full-matrix-sandwich`.
+
+## R142 rejected: short backoff after relaxed Flash M8192 polls
+
+### Reason and implementation
+
+R141 removed per-miss cache invalidation from the exact Flash M8192 L1-ring
+poll and improved the local kernel, but its tighter loop increased global-load
+sectors by 6.43%. R142 added the already validated minimum
+`__nanosleep(16)` delay after each unsuccessful relaxed load, retaining the
+same final acquire confirmation. The intent was to preserve R141's memory
+ordering and single-CCTL property while reducing redundant polling pressure.
+
+The exact eight-rank launch succeeds. Its cubin remains at 125
+registers/thread, zero stack/local bytes, and 1,024 bytes of static shared
+memory. SASS contains `NANOSLEEP 0x10` only on the relaxed miss branch.
+
+### NCU mechanism result
+
+Matched R141/R142/R141 one-rank NCU confirms that the backoff performs the
+intended traffic reduction but does not improve execution time:
+
+| metric | R141 mean | R142 | change |
+| --- | ---: | ---: | ---: |
+| duration | 10617.856 us | 10615.200 us | -0.03% |
+| DRAM bytes read | 1141547392 | 1142702848 | +0.10% |
+| global-load sectors | 37805402 | 35449475 | -6.23% |
+| warp instructions | 2314873584 | 2305519991 | -0.40% |
+| thread instructions | 72706692487 | 72407629981 | -0.41% |
+| integer instructions | 31502940253 | 31501840245 | unchanged |
+| shared-load conflicts | 1359490 | 1367629 | +0.60% |
+| shared-store conflicts | 27651662 | 27291504 | -1.30% |
+| local-load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+| active warps per issue-active | 9.28 | 9.33 | +0.05 |
+| barrier stall ratio | 1.57 | 1.58 | +0.01 |
+| long-scoreboard stall ratio | 4.01 | 4.10 | +0.09 |
+| wait stall ratio | 1.20 | 1.19 | -0.01 |
+| issue active | 42.81% | 42.60% | -0.21 pp |
+| tensor active | 22.62% | 22.62% | unchanged |
+
+The saved polling instructions are offset by lower issue activity and more
+long-scoreboard pressure, leaving the profiled duration effectively neutral.
+
+### Distributed rejection
+
+The authoritative three-observation, 20-launch, cold-L2 R141/R142/R141
+sandwich is double-negative for maximum-rank median:
+
+| metric | first R141 us | R142 us | change | second R141 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| max rank | 9964 | 9976 | +0.12% | 9975 | +0.01% |
+| rank 0 | 9953 | 9967 | +0.14% | 9968 | -0.01% |
+
+R142 is rejected without NSYS or a larger timing run and fully reverted. The
+result also shows that R141's extra load-sector count is not itself the
+remaining performance limiter; aggressively reducing it delays the
+dependency-critical dispatch warp. Launch/resources/SASS, NCU, and timing
+evidence are archived under `iter433` through `iter435`.
