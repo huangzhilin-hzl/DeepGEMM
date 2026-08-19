@@ -7880,3 +7880,59 @@ targets its address/exponent work without changing ownership. Resources,
 correctness, SASS, and NCU are archived under
 `iter408-r137-flash-scoped-store-resource` and
 `iter409-r137-r126-ncu-flash-m8192`.
+
+## R138 rejected: PRMT exponent extraction at Flash M8192
+
+### Reason and local evidence
+
+The accepted host selector uses PRMT exponent extraction only for Flash below
+M1024. Commit `cc395f6` changed M1024 from PRMT to shifts but did not evaluate
+M8192, whose fully unrolled regular decoder still expresses the four scale
+bytes as shift/mask pairs. R138 enabled the already validated PRMT extractor
+only for exact routed Flash M8192; every load/store mapping, descriptor,
+pipeline, and epilogue remained R126.
+
+The generated signature confirms the PRMT bit is enabled. Its exact 32-expert
+M8192 cubin uses 126 registers/thread, zero stack, zero local bytes, and 1,024
+bytes of static shared memory. SASS has no `STL`/`LDL` and shrinks from 9,506
+to 9,490 static lines. Against the mean of a matched R126/R138/R126 NCU run:
+
+| metric | R126 mean | R138 | change |
+| --- | ---: | ---: | ---: |
+| duration | 10647.520 us | 10606.304 us | -0.39% |
+| warp instructions | 2318943017 | 2299439375 | -0.84% |
+| thread instructions | 72836904794 | 72213003462 | -0.86% |
+| bit instructions | 5551254318 | 6782806830 | +22.19% |
+| integer instructions | 31502199098 | 29650163527 | -5.88% |
+| global-load sectors | 35521296 | 35481275 | -0.11% |
+| local-load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+| shared-load conflicts | 1415258 | 1421315 | +0.43% |
+| shared-store conflicts | 26965882 | 27607465 | +2.38% |
+
+PRMT therefore gives a real isolated local gain with no resource failure.
+
+### Distributed rejection
+
+The authoritative three-observation R126/R138/R126 sandwich is initially
+double-positive for maximum-rank median:
+
+| metric | first R126 us | R138 us | change | second R126 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| max rank | 9999 | 9934 | -0.65% | 9946 | -0.12% |
+| rank 0 | 9964 | 9914 | -0.50% | 9912 | +0.02% |
+
+The reverse R138/R126/R138 order is also favorable at `9933/9966/9939 us`
+for max rank (`-0.33%/-0.27%`). Because these margins are sub-percent, the
+ten-observation robustness sandwich is decisive:
+
+| metric | first R126 us | R138 us | change | second R126 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| max rank | 9887.5 | 9889.5 | +0.02% | 9931.0 | -0.42% |
+| rank 0 | 9865.0 | 9839.5 | -0.26% | 9897.0 | -0.58% |
+
+The required maximum-rank median is not double-positive at the larger sample
+count, so R138 is rejected and fully reverted. It remains useful evidence
+that exponent extraction is no longer a material ceiling: a 5.88% reduction
+in integer instructions moves the local kernel only 0.39% and does not yield
+a robust distributed gain. Resources/SASS, NCU, both timing orders, and the
+robustness run are archived under `iter410` through `iter414`.
