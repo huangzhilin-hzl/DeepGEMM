@@ -7753,3 +7753,52 @@ decoder/store live range explicitly, rather than relying on loop unroll policy.
 Resources, correctness, build diagnostics, and NCU reports are archived under
 `iter401-r134-flash-unroll2-k32-resource` and
 `iter402-r134-r126-ncu-flash-m8192`.
+
+## R135 rejected: fused-asm complete-row Flash decode
+
+### SASS diagnosis and implementation
+
+An R126/R132 `nvdisasm` comparison identifies R132's spill precisely. The
+fully unrolled C++ swizzle calculations are hoisted near the math-warpgroup
+entry. Four store-address values are written with `STL [R1+0x0/0x4/0x8/0xc]`
+and repeatedly recovered with `LDL` inside the persistent pipeline. They are
+not decoded FP8 payloads; they are long-lived expanded-B shared-store
+addresses. This explains why a nominal 16-byte frame caused 20.045 million
+local-load sectors.
+
+R135 retained the fully static complete-row mapping but fused packed address
+calculation, LDS.64, x16 decode, B128 swizzle, and STS.128 into a volatile
+inline-PTX helper with no output operands. Four K32 bases and two lane-selected
+pairs were instantiated explicitly, preventing intermediate addresses and
+decoded values from escaping an asm block. The exact 32-expert M8192 cubin
+uses 125 registers/thread, zero stack, zero local bytes, and 1,024 bytes of
+static shared memory. Its complete SASS contains no `STL` or `LDL` instruction.
+Production Flash M1024 passes on eight ranks with `diff=0.000658`.
+
+### Matched NCU rejection
+
+R135 preserves some of R132's instruction reduction without its local-memory
+traffic, but the new full-warp STS.128 schedule replays too heavily:
+
+| metric | R126 mean | R135 | change |
+| --- | ---: | ---: | ---: |
+| duration | 10643.216 us | 10823.200 us | +1.69% |
+| warp instructions | 2318817723 | 2254034929 | -2.79% |
+| thread instructions | 72832991272 | 70759118803 | -2.85% |
+| bit instructions | 5551254318 | 5551274286 | +0.00% |
+| integer instructions | 31498897273 | 29742800393 | -5.58% |
+| inter-thread instructions | 997317292 | 689429036 | -30.87% |
+| global-load sectors | 35529313 | 35984079 | +1.28% |
+| local-load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+| shared-load conflicts | 1410309 | 1437284 | +1.91% |
+| shared-store conflicts | 26981763 | 33085447 | +22.62% |
+
+The explicit asm boundary solves the compiler failure mode and is reusable,
+but this pair-to-lane store mapping is still 1.69% slower locally. R135 is
+rejected before distributed timing and fully reverted. A successor may reuse
+the bounded asm mechanism only if it redistributes each STS.128 wave across
+shared-memory banks; further instruction reduction alone is insufficient.
+SASS diagnosis is archived under
+`iter403-r132-r126-sass-spill-diagnostic`; resources, correctness, and matched
+NCU are under `iter404-r135-flash-fused-asm-row-resource` and
+`iter405-r135-r126-ncu-flash-m8192`.
