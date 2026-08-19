@@ -806,6 +806,11 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr uint32_t kEpilogueWGBarrierStartIdx       = 3;
     constexpr uint32_t kGemmPhaseBoundaryBarrierIdx =
         kEpilogueWGBarrierStartIdx + kNumEpilogueWarpgroups;
+    constexpr uint32_t kExpertCountCacheBarrierIdx =
+        kGemmPhaseBoundaryBarrierIdx + 1;
+    constexpr bool kCacheProM8ExpertCounts =
+        not kHasSharedExperts and kHidden == 7168 and kSmallMSwapAB and
+        kMaxSwapABTokens == 8;
 
     // Cross-rank NVLink barrier tags
     constexpr uint32_t kBeforeDispatchPullBarrierTag    = 1;
@@ -882,10 +887,14 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     };
 
     const auto produce_selected_blocks = [&](auto&& func) {
-        scheduler.mainloop_with_task(
-            num_tokens, [&](const task_info_t& task_info) {
-                invoke_persistent_task(task_info, func);
-            });
+        const auto process_task = [&](const task_info_t& task_info) {
+            invoke_persistent_task(task_info, func);
+        };
+        if constexpr (kCacheProM8ExpertCounts)
+            scheduler.template mainloop_with_task<false>(
+                num_tokens, process_task);
+        else
+            scheduler.mainloop_with_task(num_tokens, process_task);
     };
 
     const auto cleanup_workspace = [&]() {
@@ -1072,6 +1081,19 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             false, true);
 #endif
 
+        // Pro M8 has only 48 routed experts, but both dispatch warps and the
+        // B-loader scheduler independently poll and load the same completed
+        // expert totals. Publish one warp's snapshot through the dispatch
+        // scratch after the NVLink rendezvous, then let all three consumers
+        // initialize their private scheduler state from shared memory.
+        if constexpr (kCacheProM8ExpertCounts) {
+            if (warp_idx == 0)
+                scheduler.cache_expert_recv_count(smem_expert_count);
+            ptx::sync_unaligned(
+                kNumDispatchThreads + 32, kExpertCountCacheBarrierIdx);
+            scheduler.fetch_cached_expert_recv_count(smem_expert_count);
+        }
+
         // Shared L1 does not depend on routed dispatch. Let dispatch pull
         // routed tokens while the math warpgroup computes shared L1 instead
         // of serializing both paths at the frontend barrier.
@@ -1085,7 +1107,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         const auto pull_buffer = smem_send_buffers.get_rank_buffer(warp_idx).get_data_buffer(0);
         const auto pull_mbarrier = dispatch_barriers[warp_idx];
 
-        scheduler.fetch_expert_recv_count();
+        if constexpr (not kCacheProM8ExpertCounts)
+            scheduler.fetch_expert_recv_count();
 
         constexpr uint32_t kNumRanksPerLane = math::constexpr_ceil_div(kNumRanks, 32u);
         int      current_expert_idx = -1;
@@ -1412,6 +1435,11 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         });
 
     } else if (warp_idx == kNumDispatchWarps + 1) {
+        if constexpr (kCacheProM8ExpertCounts) {
+            ptx::sync_unaligned(
+                kNumDispatchThreads + 32, kExpertCountCacheBarrierIdx);
+            scheduler.fetch_cached_expert_recv_count(smem_expert_count);
+        }
         const auto load_b_task = [&](const auto& block_phase,
                                      const uint32_t& local_expert_idx,
                                      const uint32_t& num_k_blocks,

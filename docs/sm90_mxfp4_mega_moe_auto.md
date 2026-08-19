@@ -6085,3 +6085,70 @@ ownership variance and loses against the second maximum-rank control. A larger
 claim size would amplify that exact risk. R97 is rejected without a formal
 run and fully reverted. Correctness/resource, NCU, and screen evidence is
 archived under `iter265` through `iter267`.
+
+## R98 accepted: share completed expert counts inside each Pro M8 CTA
+
+### Reason and direction
+
+Source-counter analysis showed that the dispatch schedulers and the B-loader
+scheduler independently polled and then reread the same 48 completed expert
+totals from symmetric global memory. In the distributed Pro M8 schedule those
+reads sit ahead of the short routed-token pull path, so repeating them across
+three scheduler consumers is more visible than at larger M.
+
+R98 specializes exact routed Pro M8. Dispatch warp 0 polls and loads the 48
+totals once into shared memory. Both dispatch warps and the B-loader warp join
+a 96-thread named barrier, then consume the shared copy. The scheduler exposes
+separate global-fetch and cached-fetch paths; all other shapes retain their
+original global path. Task ownership, arithmetic, communication buffers, and
+ring layout are unchanged.
+
+Eight-rank production correctness passes at `diff=0.000716`. The cubin stays
+at 107 registers/thread with zero stack/local allocation, 1024 bytes static
+shared memory, and 100.58 KiB dynamic shared memory.
+
+### Screen and formal production performance
+
+The 20-observation cold-L2 R93/R98/R93 screen was positive against both
+controls:
+
+| point | first R93 us | R98 us | change | second R93 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pro M8 max rank | 783.1205 | 763.1985 | -2.54% | 767.5765 | -0.57% |
+| Pro M8 rank 0 | 766.4310 | 739.0865 | -3.57% | 741.8240 | -0.37% |
+
+The authoritative 50-observation, 20-launch, one-warmup formal run preserved
+the double-positive maximum-rank result:
+
+| point | first R93 us | R98 us | change | second R93 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Pro M8 max rank | 787.0675 | 765.8580 | -2.69% | 773.7380 | -1.02% |
+| Pro M8 rank 0 | 781.2780 | 742.2170 | -5.00% | 743.9510 | -0.23% |
+
+### NCU and NSYS evidence
+
+Matched one-rank full-section NCU confirms the intended traffic reduction
+without a resource penalty:
+
+| metric | R93 | R98 | change |
+| --- | ---: | ---: | ---: |
+| NCU duration us | 716.70 | 718.14 | +0.20% |
+| global-load sectors | 2,203,060 | 2,179,933 | -1.05% |
+| global-store sectors | 26,780 | 26,821 | +0.15% |
+| L2 read sectors | 75,739,543 | 75,622,246 | -0.15% |
+| executed warp instructions | 172,471,607 | 171,965,202 | -0.29% |
+| executed thread instructions | 5,732,716,687 | 5,763,005,743 | +0.53% |
+| excessive shared wavefronts | 3,845 | 3,845 | unchanged |
+| local spilling requests | 0 | 0 | unchanged |
+
+The added shared publication and barrier increase thread-level work, while
+removing duplicate scheduler loads reduces global traffic and warp-level
+instructions. The isolated NCU duration is therefore neutral rather than the
+acceptance signal. A matched NSYS trace reports one target-kernel launch at
+`663.679 us` for R93 and `662.975 us` for R98 (`-0.11%`), also effectively
+neutral on one rank. The reproducible eight-rank maximum-rank improvement is
+the deciding evidence because that is where completed expert counts are a
+cross-rank dependency.
+
+R98 is accepted. Gate, screen, formal, NCU, and NSYS evidence is archived
+under `iter268` through `iter272`.

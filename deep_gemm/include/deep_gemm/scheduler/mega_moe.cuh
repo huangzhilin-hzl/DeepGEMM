@@ -257,19 +257,7 @@ struct MegaMoEScheduler {
         return get_pool_block_offset(kNumExpertsPerRank);
     }
 
-    CUTLASS_DEVICE void fetch_expert_recv_count() {
-        // NOTES: each lane caches experts at indices (i * 32 + lane_idx)
-        #pragma unroll
-        for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
-            const auto expert_idx = i * 32 + ptx::get_lane_idx();
-            uint64_t value = 0;
-            if (expert_idx < kNumExpertsPerRank) {
-                do {
-                    value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
-                } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
-            }
-            stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
-        }
+    CUTLASS_DEVICE void finalize_expert_recv_count() {
         __syncwarp();
 
         num_total_m_blocks = get_num_total_pool_blocks();
@@ -279,6 +267,51 @@ struct MegaMoEScheduler {
         const uint32_t min_l1_warmup_waves = get_num_l1_warmup_waves(
             num_total_m_blocks, num_task_groups, kNumL1Clusters, kNumL2Clusters);
         num_sched_l1_waves = cute::min(min_l1_warmup_waves, num_total_l1_waves);
+    }
+
+    CUTLASS_DEVICE void cache_expert_recv_count(uint32_t* smem_counts) const {
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+            const auto expert_idx = i * 32 + ptx::get_lane_idx();
+            uint64_t value = 0;
+            if (expert_idx < kNumExpertsPerRank) {
+                do {
+                    value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
+                } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+                ptx::st_shared(smem_counts + expert_idx,
+                               static_cast<uint32_t>(value));
+            }
+        }
+    }
+
+    CUTLASS_DEVICE void fetch_expert_recv_count() {
+        // NOTES: each lane caches experts at indices (i * 32 + lane_idx)
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+            const auto expert_idx = i * 32 + ptx::get_lane_idx();
+            uint64_t value = 0;
+            if (expert_idx < kNumExpertsPerRank) {
+                do {
+                    value = ptx::ld_volatile(
+                        workspace.get_expert_recv_count_sum_ptr(expert_idx));
+                } while (static_cast<uint32_t>(value >> 32) !=
+                         kNumSMs * kNumRanks);
+            }
+            stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
+        }
+        finalize_expert_recv_count();
+    }
+
+    CUTLASS_DEVICE void fetch_cached_expert_recv_count(
+            const uint32_t* smem_counts) {
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+            const auto expert_idx = i * 32 + ptx::get_lane_idx();
+            stored_num_tokens_per_expert[i] =
+                expert_idx < kNumExpertsPerRank ?
+                    ptx::ld_shared(smem_counts + expert_idx) : 0u;
+        }
+        finalize_expert_recv_count();
     }
 
     CUTLASS_DEVICE task_info_t create_task(const BlockPhase& block_phase,
@@ -494,7 +527,7 @@ struct MegaMoEScheduler {
         }
     }
 
-    template <typename Func>
+    template <bool kFetchExpertRecvCount = true, typename Func>
     CUTLASS_DEVICE void mainloop_with_task(
             const uint32_t& num_tokens, Func&& process_task) {
         const auto lane_idx = ptx::get_lane_idx();
@@ -508,7 +541,8 @@ struct MegaMoEScheduler {
                     workspace.get_shared_l1_task_count_ptr(), process_task);
         }
 
-        fetch_expert_recv_count();
+        if constexpr (kFetchExpertRecvCount)
+            fetch_expert_recv_count();
         task_info_t task_info;
         do {
             task_info_empty_barriers[sched_stage_idx].wait(sched_phase ^ 1);
