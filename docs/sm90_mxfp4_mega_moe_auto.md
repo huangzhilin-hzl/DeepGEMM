@@ -8947,3 +8947,32 @@ All rejected resource variants, both formal timing orders, final selector
 machine-code proof, NCU, both NSYS orders, full correctness, and the fresh
 PR383 comparison are archived under `iter498-r152-predicated-swiglu-resource`
 through `iter507-pr383-r152-pr383-flash16-formal`.
+
+## R153 rejected: predicate inactive Flash M16 amax reductions
+
+R152 skips inactive chunks' clamp, exp, and multiply work but still executes
+two `abs/max` reductions and six shuffle steps before discarding the result.
+R153 kept the same exact Flash M16 compile-time selector and guarded only that
+reduction plus its scratch store.  The production and cross-rank-hotspot gates
+passed at `diff=0.000654/0.000663`; the cubin remained 128 registers/thread
+with zero stack/local allocation.
+
+The first 50-observation R152/R153/R152 sandwich looked double-positive but
+one side was below the established tail variance:
+
+| first R152 us | R153 us | change | second R152 us | reverse change |
+| ---: | ---: | ---: | ---: | ---: |
+| 338.309 | 337.245 | -0.31% | 357.634 | -5.70% |
+
+The independent reverse R153/R152/R153 run failed the two-sided requirement:
+
+| first R153 us | R152 us | change | second R153 us | reverse change |
+| ---: | ---: | ---: | ---: | ---: |
+| 338.009 | 342.650 | -1.35% | 343.791 | +0.33% |
+
+The saved inactive shuffle work is real but smaller than distributed
+maximum-rank variance and does not produce a reproducible improvement.  NCU
+and NSYS were not warranted after the reverse formal failure.  R153 is fully
+reverted; R152 remains the accepted kernel.  Resource/correctness and both
+timing orders are archived under `iter508-r153-active-reduction-resource`
+through `iter510-r153-r152-r153-flash16-reverse-formal`.
