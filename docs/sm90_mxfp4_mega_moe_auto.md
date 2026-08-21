@@ -9444,3 +9444,21 @@ maximum rank loses.  One-chunk specialization therefore does not solve the
 route-quantized tail and is fully reverted to R152.  Source, PTXAS,
 correctness, NCU reports, the excluded screen, both R152 orders, and the
 PR383 sandwich are archived under `iter530` through `iter535`.
+
+## R163 rejected: vector-load a complete Flash M16 packed row
+
+R124's accepted complete-row decoder owns all four packed words for one K32
+row but loads them as two `LDS.64` pairs.  R163 tested one aligned `LDS.128`
+for exact Flash M16, removing the pair permutation and one shared-load/address
+sequence while preserving the 16-byte address set, shared exponent lookup,
+four x8 conversions, two expanded-B `STS.128` stores, and all WGMMA work.
+
+Production Flash M16 and the all-ranks-to-rank-zero PR411 hotspot both remain
+correct at `diff=0.000654/0.000663`, confirming that each swizzled K32 row is
+a valid aligned 16-byte segment.  The wider load nevertheless extends all
+four packed words across the decoder at once.  PTXAS reports 128 registers,
+an 8-byte stack frame, 16 bytes of spill stores, and 20 bytes of spill loads,
+versus R152's zero stack/spill.  It therefore fails the predeclared two-CTA
+resource gate before NCU, NSYS, or distributed timing and is fully reverted.
+The exact candidate source, correctness logs, and repeated PTXAS resource
+reports are archived under `iter536-r163-flash-m16-lds128-gates`.
