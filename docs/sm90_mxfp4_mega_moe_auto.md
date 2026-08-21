@@ -8859,3 +8859,91 @@ Both variants are fully reverted; the branch kernel is byte-for-byte R150.
 Correctness and resource reports are archived under
 `iter496-r151-live-chunk-resource-correctness` and
 `iter497-r151a-predicated-live-chunk-resource`.
+
+## R152 accepted: predicate only inactive Flash M16 SwiGLU arithmetic
+
+### Reason, implementation, and scope
+
+R151 showed that runtime control flow around the eight-chunk array producer
+destroys scalarization.  It did not require inactive chunks to execute their
+expensive arithmetic.  R152 therefore leaves the unrolled loop, every array
+index, the amax reduction, inverse-scale load, and store loop unchanged.  It
+adds a warp-uniform branch only around each half's clamp, `__expf`, and
+multiply sequence; inactive chunks write two explicit zero scalars and keep
+the surrounding compile-time structure.
+
+The initial form selected every swap-AB signature.  Flash M16 improved, but
+Pro M8 regressed, so the final compile-time selector is exactly routed
+`hidden=4096, kLocalSwapABTokens=16`.  Flash M8/M32/M64, every Pro signature,
+shared experts, and regular orientation compile their original expression.
+The final Pro M8 `nvdisasm -c` SHA-256 is identical to R147/R150 at
+`c237e793139bc8c49e812d31f5ec2ed13b220dc6c054f5536797d5d117abf628`.
+
+### Resource and correctness gates
+
+The selected Flash M16 cubin uses 128 registers/thread with zero stack and
+local allocation.  Production Flash M16, its all-ranks-to-rank-zero hotspot,
+Pro M8, and Flash M64 pass at differences `0.000654`, `0.000663`, `0.000716`,
+and `0.000660`.  The final full suite passes 41/41 scenarios, including all
+production Flash/Pro cases, both cross-rank bound gates, mixed protocols,
+ring wrap, shared experts, masked routes, and eight random stress cases.
+
+### Formal distributed timing and scope reduction
+
+R147 is machine-code equivalent to R150 for Flash M16 and Pro M8, so it is the
+frozen control.  The authoritative 50-observation, 20-launch, cold-L2
+R147/R152/R147 run gives:
+
+| point | first R147 us | broad R152 us | change | second R147 us | reverse change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash M16 max rank | 345.964 | 337.587 | -2.42% | 355.454 | -5.03% |
+| Flash M16 rank 0 | 330.974 | 328.364 | -0.79% | 341.436 | -3.83% |
+| Pro M8 max rank | 743.391 | 758.646 | +2.05% | 747.974 | +1.43% |
+| Pro M8 rank 0 | 733.216 | 735.853 | +0.36% | 735.784 | +0.01% |
+
+The Pro result caused the final selector to exclude all Pro cubins.  An
+independent reverse final-selector R152/R147/R152 Flash M16 run is also
+double-positive:
+
+| metric | first R152 us | R147 us | second R152 us |
+| --- | ---: | ---: | ---: |
+| maximum rank | 344.229 | 366.867 | 351.186 |
+| rank 0 | 334.773 | 348.245 | 329.350 |
+
+The two candidates improve maximum-rank time by 6.17% and 4.28% against the
+shared control, confirming the gain in both execution orders.
+
+### NCU and NSYS attribution
+
+A one-pass distributed rank-zero NCU comparison directly confirms that the
+uniform branch removes inactive special-function work:
+
+| NCU metric | R147 | R152 | change |
+| --- | ---: | ---: | ---: |
+| duration | 678.21 us | 671.39 us | -1.01% |
+| warp instructions | 68,155,868 | 66,562,498 | -2.34% |
+| thread instructions | 2,061,542,057 | 2,012,174,334 | -2.39% |
+| XU/SFU-pipe instructions | 250,144 | 35,104 | -85.97% |
+| branch instructions | 2,820,456 | 2,851,745 | +1.11% |
+
+The branch cost is small relative to the removed `exp` work.  Rank-zero NSYS
+is not stable enough for acceptance: the first R147/R152 pair is
+`659.872/670.495 us`, while the reverse R152/R147/R152 run is
+`669.472/644.704/634.495 us`.  Its two candidate sides straddle the control,
+matching R149's finding that profiling one rank perturbs this distributed
+rendezvous.  The two formal production sandwiches and NCU mechanism evidence
+are the acceptance basis; NSYS is retained as an honest inconclusive result.
+
+### Fresh PR383 residual
+
+The final-standard PR383/R152/PR383 Flash M16 run measures maximum-rank
+medians `337.222/340.391/320.177 us`.  R152 is 0.94% and 6.31% slower than the
+two controls, or 3.56% slower than their arithmetic mean.  R152 therefore
+substantially narrows but does not close the R149 Flash M16 residual; the next
+iteration must recover the remaining distributed tail without reintroducing
+dynamic chunk indexing.
+
+All rejected resource variants, both formal timing orders, final selector
+machine-code proof, NCU, both NSYS orders, full correctness, and the fresh
+PR383 comparison are archived under `iter498-r152-predicated-swiglu-resource`
+through `iter507-pr383-r152-pr383-flash16-formal`.

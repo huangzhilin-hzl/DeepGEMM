@@ -3017,14 +3017,35 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                     up_0 = final_accum[accum_offset + 2];
                                     up_1 = final_accum[accum_offset + 3];
                                 }
-                                clamp_gate(gate_0);
-                                clamp_gate(gate_1);
-                                clamp_up(up_0);
-                                clamp_up(up_1);
-                                swap_swiglu[half][chunk][0] =
-                                    silu(gate_0) * up_0 * weight_0;
-                                swap_swiglu[half][chunk][1] =
-                                    silu(gate_1) * up_1 * weight_1;
+                                // Keep compile-time chunk indices so the M64
+                                // safety bound remains spill-free, but skip
+                                // inactive M16 chunks' special-function work.
+                                if constexpr (
+                                        kHidden == 4096 and
+                                        kLocalSwapABTokens == 16) {
+                                    if (active_chunk) {
+                                        clamp_gate(gate_0);
+                                        clamp_gate(gate_1);
+                                        clamp_up(up_0);
+                                        clamp_up(up_1);
+                                        swap_swiglu[half][chunk][0] =
+                                            silu(gate_0) * up_0 * weight_0;
+                                        swap_swiglu[half][chunk][1] =
+                                            silu(gate_1) * up_1 * weight_1;
+                                    } else {
+                                        swap_swiglu[half][chunk][0] = 0.0f;
+                                        swap_swiglu[half][chunk][1] = 0.0f;
+                                    }
+                                } else {
+                                    clamp_gate(gate_0);
+                                    clamp_gate(gate_1);
+                                    clamp_up(up_0);
+                                    clamp_up(up_1);
+                                    swap_swiglu[half][chunk][0] =
+                                        silu(gate_0) * up_0 * weight_0;
+                                    swap_swiglu[half][chunk][1] =
+                                        silu(gate_1) * up_1 * weight_1;
+                                }
                             }
 
                             float partial_0 = cute::max(
