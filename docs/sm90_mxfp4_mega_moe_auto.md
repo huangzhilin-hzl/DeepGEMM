@@ -9371,3 +9371,76 @@ launch-arrival bottleneck.  The next production experiment must reduce the
 fixed cost of the common tiny expert block; changing combine or polling
 cannot close this residual.  Six raw JSON logs and exact instrumented source
 snapshots are archived under `iter529-r161-flash-m16-phase-trace`.
+
+## R162 rejected: one-chunk hot epilogue for Flash M16
+
+### Reason and implementation
+
+R161 found that seed-zero Flash M16 has 242 routed expert blocks, only one of
+which receives more than eight tokens.  The maximum-work rank 4 owns 32
+blocks and every one fits in eight tokens.  R162 therefore tested a narrower
+form than the rejected R148 M16 selector: `valid_m <= 8` instantiated a
+one-chunk L1 SwiGLU/quantization epilogue, while every larger destination used
+the unchanged complete M64 template.  R148 had selected two chunks for the
+whole local M16 bucket; it never tested the common one-chunk distribution
+identified by R161.  The complete fallback retained the R147/PR411
+cross-rank safety bound.
+
+Production Flash M16 and the all-ranks-to-rank-zero hotspot pass at
+`diff=0.000654/0.000663`.  The selected cubin remains at 128 registers,
+zero stack, zero spills, and zero local-memory allocation.
+
+### NCU mechanism gate
+
+Matched one-rank/32-expert NCU confirms a small amount of real work removal,
+but no local-duration improvement:
+
+| metric | R152 | R162 | change |
+| --- | ---: | ---: | ---: |
+| duration | 262.94 us | 263.10 us | +0.06% |
+| warp instructions | 60,239,279 | 59,894,753 | -0.57% |
+| thread instructions | 1,874,346,022 | 1,863,156,686 | -0.60% |
+| FP32 instructions | 44,919,712 | 41,872,288 | -6.78% |
+| integer instructions | 787,079,422 | 784,745,829 | -0.30% |
+| inter-thread instructions | 68,845,996 | 68,083,692 | -1.11% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+
+The branch deletes inactive-chunk arithmetic as intended, but the hot-path
+runtime branch plus duplicated complete fallback consumes the saved critical
+path.  NSYS was not advanced after the authoritative comparison below failed
+both PR383 controls; its profiler rendezvous cannot override that acceptance
+failure.
+
+### Distributed rejection
+
+An initial screen accidentally inverted the two benchmark counts and ran 20
+observations with 10 launches each.  It is archived under `iter532` but
+explicitly excluded from acceptance.  Both subsequent comparisons use the
+required 50 observations, 20 launches per observation, one warmup, cold L2,
+seed zero, and maximum-rank median.
+
+The first R152/R162/R152 order is strongly positive:
+
+| first R152 us | R162 us | change | second R152 us | reverse change |
+| ---: | ---: | ---: | ---: | ---: |
+| 339.867 | 323.7005 | -4.76% | 352.364 | -8.13% |
+
+The independent reverse order does not reproduce both sides:
+
+| first R162 us | R152 us | change | second R162 us | reverse change |
+| ---: | ---: | ---: | ---: | ---: |
+| 336.725 | 340.563 | -1.13% | 340.8535 | +0.085% |
+
+Most decisively, the goal-level PR383/R162/PR383 comparison is double
+negative:
+
+| first PR383 us | R162 us | change | second PR383 us | reverse change |
+| ---: | ---: | ---: | ---: | ---: |
+| 339.018 | 346.6005 | +2.24% | 324.120 | +6.94% |
+
+R162 rank zero is 295.4315 us in that comparison versus PR383 controls of
+332.399/312.441 us, so the fused kernel remains locally favorable while its
+maximum rank loses.  One-chunk specialization therefore does not solve the
+route-quantized tail and is fully reverted to R152.  Source, PTXAS,
+correctness, NCU reports, the excluded screen, both R152 orders, and the
+PR383 sandwich are archived under `iter530` through `iter535`.
