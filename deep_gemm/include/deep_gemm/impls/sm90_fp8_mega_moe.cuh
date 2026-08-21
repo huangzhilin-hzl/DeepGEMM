@@ -259,6 +259,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     bool kFastMath, \
     bool kSmallMSwapAB, \
     uint32_t kMaxSwapABTokens, \
+    uint32_t kLocalSwapABTokens, \
     bool kPackedBF16SwapEpilogue, \
     bool kSwizzleL2CD, \
     bool kOverlapMXFP4ScalePath, \
@@ -336,7 +337,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     kNumMaxTokensPerRank, kHidden, kIntermediateHidden, kNumExperts, kNumTopk, \
     kNumSMs, kNumRanks, \
     kActivationClamp, kFastMath, kSmallMSwapAB, \
-    kMaxSwapABTokens, \
+    kMaxSwapABTokens, kLocalSwapABTokens, \
     kPackedBF16SwapEpilogue, kSwizzleL2CD, \
     kOverlapMXFP4ScalePath, \
     kUsePRMTMXFP4Exponent, \
@@ -383,6 +384,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         kMaxSwapABTokens == 8 or kMaxSwapABTokens == 16 or
             kMaxSwapABTokens == 32 or kMaxSwapABTokens == 64,
         "Swap-AB token bound must select a supported WGMMA bucket");
+    DG_STATIC_ASSERT(
+        kLocalSwapABTokens == 8 or kLocalSwapABTokens == 16 or
+            kLocalSwapABTokens == 32 or kLocalSwapABTokens == 64,
+        "Local swap-AB token bucket must be supported");
+    DG_STATIC_ASSERT(kMaxSwapABTokens >= kLocalSwapABTokens,
+                     "Swap-AB storage must cover the local policy bucket");
 
     // =====================================================================
     // Template checks
@@ -781,7 +788,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         kNumExpertsPerRank, kNumSMs, kNumRanks,
         kNumRingBlocks, kNumSharedExperts, 1,
         kSmallMSwapAB and
-            (kMaxSwapABTokens == 8 or kMaxSwapABTokens == 64)>;
+            (kLocalSwapABTokens == 8 or kLocalSwapABTokens == 64)>;
     auto scheduler = scheduler_t(
         workspace, task_info_full_barriers,
         task_info_empty_barriers, task_infos);
@@ -810,7 +817,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         kGemmPhaseBoundaryBarrierIdx + 1;
     constexpr bool kCacheProExpertCounts =
         not kHasSharedExperts and kHidden == 7168 and
-        ((kSmallMSwapAB and kMaxSwapABTokens == 8) or
+        ((kSmallMSwapAB and kLocalSwapABTokens == 8) or
          (not kSmallMSwapAB and kBankPermuteMXFP4PairLoads and
           not kSwizzleL2CD));
 
@@ -1040,48 +1047,20 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 *sym_buffer.map(
                     workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
                     dst_rank_idx) = expert_status & 0xffffffff;
-#if not defined(DG_SM90_SPARSE_DISPATCH_COMPLETION)
+                // Keep the cross-rank completion protocol identical even when
+                // ranks select different local sparse-count specializations.
                 ptx::atomic_add_sys(
                     sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
                     expert_status);
-#endif
             }
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
-#if defined(DG_SM90_SPARSE_DISPATCH_COMPLETION)
-        sm90_nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
-                            kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
-            workspace, sym_buffer, sm_idx, thread_idx,
-            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            false, false);
-
-        if (sm_idx == 0) {
-            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
-            for (uint32_t local_expert_idx = thread_idx;
-                 local_expert_idx < kNumExpertsPerRank;
-                 local_expert_idx += kNumDispatchThreads) {
-                uint32_t num_recv_tokens = 0;
-                #pragma unroll
-                for (uint32_t rank_idx = 0; rank_idx < kNumRanks; ++ rank_idx)
-                    num_recv_tokens += static_cast<uint32_t>(
-                        *workspace.get_expert_recv_count_ptr(
-                            rank_idx, local_expert_idx));
-                *workspace.get_expert_recv_count_sum_ptr(local_expert_idx) =
-                    (static_cast<uint64_t>(kNumSMs * kNumRanks) << 32) |
-                    num_recv_tokens;
-            }
-        }
-        sm90_grid_sync<kNumSMs, kDispatchGridSyncIndex>(
-            workspace, sm_idx, thread_idx,
-            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); });
-#else
         sm90_nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
                             kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
             workspace, sym_buffer, sm_idx, thread_idx,
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
             false, true);
-#endif
 
         // Selected Pro buckets make both dispatch warps and the B-loader
         // scheduler independently poll and load the same completed expert
@@ -1151,8 +1130,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             // round-robin path for duplicate routes from any rank.
             bool used_single_slot_rank_selection = false;
             if constexpr (kSmallMSwapAB and kHidden == 4096 and
-                          (kMaxSwapABTokens == 8 or kMaxSwapABTokens == 16 or
-                           kMaxSwapABTokens == 32) and
+                          (kLocalSwapABTokens == 8 or
+                           kLocalSwapABTokens == 16 or
+                           kLocalSwapABTokens == 32) and
                           kNumRanks <= 32) {
                 const uint32_t multi_slot_rank_mask = __ballot_sync(
                     0xffffffff, stored_rank_count[0] > 1);
@@ -1833,14 +1813,14 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 constexpr bool kPrmtPairLoads =
                                     kSmallMSwapAB and
                                     ((kHidden == 4096 and
-                                      (kMaxSwapABTokens == 8 or
-                                       kMaxSwapABTokens == 16 or
-                                       kMaxSwapABTokens == 32 or
-                                       kMaxSwapABTokens == 64)) or
+                                      (kLocalSwapABTokens == 8 or
+                                       kLocalSwapABTokens == 16 or
+                                       kLocalSwapABTokens == 32 or
+                                       kLocalSwapABTokens == 64)) or
                                      (kHidden == 7168 and
-                                      (kMaxSwapABTokens == 8 or
-                                       kMaxSwapABTokens == 32 or
-                                       kMaxSwapABTokens == 64)));
+                                      (kLocalSwapABTokens == 8 or
+                                       kLocalSwapABTokens == 32 or
+                                       kLocalSwapABTokens == 64)));
                                 const uint32_t packed_k_pair_in_k32 =
                                     kBankPermutedPairLoads ?
                                         (kPrmtPairLoads ?
@@ -2437,12 +2417,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                                 (kHidden == 4096 or
                                                  kHidden == 7168) and
                                                 kSmallMSwapAB and
-                                                (kMaxSwapABTokens == 8 or
-                                                 kMaxSwapABTokens == 16 or
+                                                (kLocalSwapABTokens == 8 or
+                                                 kLocalSwapABTokens == 16 or
                                                  (kHidden == 4096 and
-                                                  kMaxSwapABTokens == 32 and
+                                                  kLocalSwapABTokens == 32 and
                                                   kPackedBF16SwapEpilogue) or
-                                                 kMaxSwapABTokens == 64)) {
+                                                 kLocalSwapABTokens == 64)) {
                                             const nv_bfloat162 scale_pair =
                                                 __floats2bfloat162_rn(
                                                     combined_scale_0,

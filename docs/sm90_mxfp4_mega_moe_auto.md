@@ -8434,3 +8434,147 @@ per-output address permutation, for example by deriving a correct vector or
 STSM layout; merely reducing the aggregate shared-conflict counter is not an
 end-to-end optimization.  Resource/JIT, correctness, matched NCU, and
 distributed timing evidence are archived under `iter443` through `iter449`.
+
+## R147: fix PR411 cross-rank swap and completion protocols
+
+### Critical-review diagnosis
+
+PR411's two swap-bound critical comments
+([short report](https://github.com/deepseek-ai/DeepGEMM/pull/411#discussion_r3822451803),
+[detailed report](https://github.com/deepseek-ai/DeepGEMM/pull/411#discussion_r3822451818))
+identify the same real correctness bug in R26's compile-time epilogue bound.
+The host selected `kMaxSwapABTokens` from rank-local `args.num_tokens`, so an
+M8 rank instantiated only one token chunk.  Dispatch is cross-rank: one local
+expert can receive routes from every source rank and its task `valid_m` can
+reach the complete M64 block.  The math path then correctly selects
+`run_swap_ab<64>()`, but the L1/L2 epilogue arrays and loops only cover the
+compiled M8 chunk.  Rows 8-63 consequently retain stale activation/scale data
+and can produce a wrong result or NaN.
+
+The pre-fix eight-rank reproduction routes every M8 top-k entry to the first
+experts on rank zero.  It fails with `diff nan exceeded tolerance 0.01`.
+Existing forced-ring-wrap tests did not cover this distribution: they proved
+physical ring reuse while spreading routes across experts, and the randomized
+hidden-512 cases did not select the DSV4 swap-AB path.  This matches the
+[review's test-gap warning](https://github.com/deepseek-ai/DeepGEMM/pull/411#discussion_r3822451883).
+
+The separate
+[mixed-protocol critical](https://github.com/deepseek-ai/DeepGEMM/pull/411#discussion_r3822451810)
+comes from rank-local JIT specialization.  Flash M32 and M1024 define
+`DG_SM90_SPARSE_DISPATCH_COMPLETION`, while other token counts use the normal
+path.  The sparse source skipped the remote system-scope add into
+`expert_recv_count_sum` and reconstructed its own totals after a different
+barrier.  With uneven per-rank token counts, a normal receiver waits for the
+high completion contribution from every rank, but a sparse sender never
+publishes its contribution.  The receiver cannot reach its target and the
+kernel deadlocks.
+
+### Fix and policy separation
+
+R147 makes two protocol changes:
+
+1. Every rank publishes the same `expert_status` through
+   `atomic_add_sys(expert_recv_count_sum)`, and every specialization uses the
+   same NVLink rendezvous with receiver-side completion waiting.  The sparse
+   path retains its useful zero-local-count atomic elision and its equivalent
+   all-CTA high completion count, but no longer changes the wire protocol.
+2. Multi-rank swap-AB storage always covers M64.  A second compile-time
+   `kLocalSwapABTokens` retains the original M8/M16/M32/M64 policy bucket for
+   the scheduler fast path, Pro expert-count cache, PRMT pair decoder,
+   packed-promotion selection, and source-rank selector.  This separation is
+   necessary: storage safety is a cross-rank property, while those policies
+   were tuned for the rank-local input size.
+
+The validation suite now accepts uneven `num_tokens_by_rank` and a
+`hot_route_rank`, and adds three permanent eight-rank cases:
+
+- M8 Flash with every route targeting rank zero, exercising `valid_m=64`
+  under a local M8 policy;
+- Flash M32 on one rank and M64 on the other seven;
+- Flash M1024 on one rank and M64 on the other seven.
+
+### Rejected intermediate forms
+
+The first safe-bound implementation overloaded the old policy key with M64.
+It passed correctness but unintentionally enabled or disabled several unrelated
+small-M policies.  Its 50-observation sandwich against R141 measured:
+
+| model | M | R141 mean us | overloaded-bound us | change |
+| --- | ---: | ---: | ---: | ---: |
+| Flash | 8 | 302.717 | 305.290 | +0.85% |
+| Flash | 16 | 315.628 | 344.122 | +9.03% |
+| Flash | 32 | 315.078 | 340.100 | +7.94% |
+| Pro | 8 | 722.732 | 738.725 | +2.21% |
+| Pro | 16 | 919.642 | 943.580 | +2.60% |
+| Pro | 32 | 989.411 | 975.092 | -1.45% |
+
+An attempt to predicate the M64 epilogue body on active runtime chunks also
+passed the hotspot test, but ptxas introduced a 128-byte stack frame in all
+six small-M cubins and the screen slowed down.  It was fully reverted.
+
+Finally, extending Flash's single-slot source-rank selector to every M64-bound
+signature regressed M64 by 2.78% and M128 by 0.26% against the two controls'
+means.  The local-policy bucket restores the accepted M8-M32 selector while
+leaving M64/M128 on their previous general path.  These rejected gates are
+archived under `iter467`, `iter469`, and `iter471`.
+
+### Final correctness and resources
+
+The exact critical cases pass with timeout protection:
+
+| case | result |
+| --- | ---: |
+| hotspot Flash M8 | 0.000641 |
+| mixed Flash M32/M64 | 0.000647 |
+| mixed Flash M1024/M64 | 0.000659 |
+
+The complete final suite passes 32/32 scenarios, including every production
+Flash/Pro point in the suite.  All final Flash/Pro M8/M16/M32 cubins use 128
+registers/thread, 1,024 bytes static shared memory, and zero stack/local
+memory.  The pre-fix reproduction, final critical gates, resources, and full
+suite are archived under `iter461`, `iter472b`, `iter474`, and `iter475`.
+
+### Authoritative small-M performance
+
+The final R141/R147/R141 run uses the requested 50 observations, 20 launches
+per observation, one warmup, cold L2, seed zero, and maximum-rank medians.
+The change column compares R147 with the two controls' arithmetic mean;
+individual control comparisons are retained to expose session drift.
+
+| model | M | first R141 us | R147 us | second R141 us | mean change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash | 8 | 313.822 | 302.064 | 298.081 | -1.27% |
+| Flash | 16 | 315.390 | 317.077 | 319.803 | -0.16% |
+| Flash | 32 | 329.743 | 331.464 | 317.266 | +2.46% |
+| Pro | 8 | 727.888 | 730.900 | 724.328 | +0.66% |
+| Pro | 16 | 917.875 | 932.483 | 919.685 | +1.49% |
+| Pro | 32 | 985.473 | 1005.500 | 985.365 | +2.04% |
+
+The mixed-protocol change is not an inherent regression.  At Flash M1024,
+R147 measures 1494 us against R141 controls of 1527/1579 us, or -3.80% versus
+their mean.  The remaining small-M cost is instead the instruction footprint
+of compiling the epilogue for the safe M64 fallback.
+
+### NCU and NSYS attribution
+
+Low-perturbation eight-rank NSYS traces rank zero while the other seven ranks
+run normally.  At Flash M16, R141 takes 668.321 us and R147 takes 664.161 us
+(-0.62%).  This independently shows that the unified completion protocol does
+not lengthen the actual distributed launch.
+
+A one-pass rank-zero NCU capture avoids distributed application replay and
+collects duration plus instruction counters:
+
+| metric | R141 | R147 | change |
+| --- | ---: | ---: | ---: |
+| duration | 638.05 us | 640.10 us | +0.32% |
+| warp instructions | 62,810,169 | 67,995,833 | +8.26% |
+| thread instructions | 1,889,323,117 | 2,058,785,034 | +8.97% |
+
+The profiler evidence isolates the next optimization target.  R147 is
+correct, spill-free, and near timing parity, but normal M8/M16/M32 tasks still
+execute code from the M64-safe epilogue.  The next iteration should compile a
+local-bucket epilogue and select it uniformly when `valid_m` fits, retaining a
+separate M64 fallback only for cross-rank hotspots.  It must avoid the stack
+frame caused by per-chunk runtime predication.  Formal timing, NSYS, and NCU
+artifacts are archived under `iter473`, `iter476`, and `iter477`.
