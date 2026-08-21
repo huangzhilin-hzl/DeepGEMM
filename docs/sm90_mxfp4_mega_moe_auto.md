@@ -8976,3 +8976,64 @@ and NSYS were not warranted after the reverse formal failure.  R153 is fully
 reverted; R152 remains the accepted kernel.  Resource/correctness and both
 timing orders are archived under `iter508-r153-active-reduction-resource`
 through `iter510-r153-r152-r153-flash16-reverse-formal`.
+
+## R154 rejected: move inactive Flash M16 accumulator loads under the gate
+
+### Reason and initial evidence
+
+R152's active-chunk branch starts after packed-BF16 accumulator values have
+already been converted to FP32.  R154 moved those reads/conversions inside the
+same exact Flash M16 uniform branch while retaining static chunk indices.  It
+passed production and hotspot correctness at `0.000654/0.000663` and stayed
+at 128 registers/thread with zero stack/local allocation.
+
+Both direct R152 comparisons initially looked positive.  The
+R152/R154/R152 maximum-rank medians were
+`346.551/342.428/350.323 us` (-1.19%/-2.25%), and the reverse
+R154/R152/R154 run was `331.712/348.206/345.568 us`
+(-4.74%/-0.76% against the shared control).  Rank-zero improvements were
+larger, suggesting that a tail-rank effect rather than local arithmetic might
+be driving the result.
+
+### Profiler falsification
+
+Distributed rank-zero NCU did not show the intended work reduction:
+
+| metric | R152 | R154 | change |
+| --- | ---: | ---: | ---: |
+| duration | 673.60 us | 687.81 us | +2.11% |
+| warp instructions | 66,579,296 | 66,758,616 | +0.27% |
+| thread instructions | 2,012,664,876 | 2,014,581,702 | +0.10% |
+| XU/SFU-pipe instructions | 35,104 | 35,104 | 0.00% |
+| branch instructions | 2,856,587 | 2,913,416 | +1.99% |
+
+An NCCL-free one-rank, 32-expert-shard NCU replay removed rendezvous
+perturbation and confirmed that the two forms are locally equivalent:
+`265.63/265.76 us`, `60,244,240/60,245,872` warp instructions, and identical
+37,718 XU instructions.  The compiler had already predicated or eliminated
+the inactive accumulator reads in R152; source-level relocation adds no local
+mechanism.
+
+### Final-standard rejection
+
+A PR383/R154/PR383 sandwich measured
+`326.211/347.567/322.239 us`, leaving R154 7.21% behind the control mean.
+Because sessions move materially, the deciding run placed both MXFP4
+candidates between the same PR383 controls:
+
+| implementation | maximum-rank median us | rank-zero median us |
+| --- | ---: | ---: |
+| PR383 first | 324.768 | 314.013 |
+| R152 | 344.272 | 328.778 |
+| R154 | 357.930 | 320.058 |
+| PR383 second | 330.497 | 320.274 |
+
+R154 improves rank zero but worsens the authoritative maximum-rank median by
+3.97% relative to R152 and expands the same-session PR383 control-mean gap
+from 5.08% to 9.25%.  The earlier pairwise wins were therefore a tail-rank
+session artifact, not a reproducible kernel improvement.  R154 is fully
+reverted and R152 remains accepted.  Resource/correctness, both pairwise
+orders, distributed and single-rank NCU, PR383 sandwich, and the final
+four-way comparison are archived under
+`iter511-r154-active-accum-load-resource` through
+`iter517-pr383-r152-r154-pr383-flash16-fourway`.
