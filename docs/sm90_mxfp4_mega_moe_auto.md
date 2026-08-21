@@ -9312,3 +9312,62 @@ R160a are rejected before NSYS and final-standard three-observation timing,
 fully reverted to R152, and are not production changes.  Correctness,
 resources, NCU, source snapshots, and both screens are archived under
 `iter523` through `iter527` on the pod and local artifact root.
+
+## R161 diagnostic: Flash M16 tail is two extra routed blocks
+
+### One-rank instruction baseline
+
+R152 is already locally faster than PR383 at Flash M16, but its distributed
+maximum-rank median remains about 3.6--5.1% slower in matched controls.  R161
+first collected a five-pass SourceCounters report for the unchanged R152
+one-rank/32-expert specialization.  It takes 264.80 us, executes 60,241,422
+warp and 1,874,340,628 thread instructions, and has zero local-memory
+traffic.  The largest classes are integer 786,537,558, bit 231,727,726,
+memory 131,927,337, conversion 49,354,560, FP32 44,919,712, and inter-thread
+communication 68,846,764.
+
+SASS aggregation remains decoder-heavy: `LOP3` contributes 313.92M thread
+instructions, `PRMT` 221.15M, `IMAD.SHL` 99.32M, `SHF.R` 98.48M,
+`STS.128` 50.30M, `F2FP` 49.78M, `LDS.64` 48.76M, and the M64N8 QGMMA
+instructions 48.76M.  Expanded-B shared publication is already ideal and the
+remaining shared replay is too small to explain the distributed residual.
+The report and opcode export are archived under
+`iter528-r161-flash-m16-instruction-breakdown`.
+
+### Eight-rank phase attribution
+
+A temporary opt-in `globaltimer` trace then recorded dispatch-rendezvous exit,
+L1/L2 task spans, last local GEMM drain, combine-rendezvous exit, and combine
+completion.  It was byte-for-byte the R156 diagnostic probe, ran for six
+captures, and was fully removed afterward.  The first compile capture is
+excluded.  One of the five cached captures experienced a roughly 180-ms
+process-arrival disturbance and a 327.2-us median local segment; it is
+retained in the raw evidence but excluded from the stable four-run medians
+below.
+
+Seed zero fixes the routed-block distribution at `[30,31,30,30,32,30,30,29]`.
+In every stable capture rank 4 owns the last GEMM drain and rank 7 is first.
+The per-run Pearson correlations between block count and
+`dispatch-ready -> GEMM-drained` time are `0.922/0.891/0.891/0.898`.
+
+| rank | routed M64 blocks | median local GEMM us | median combine wait us | median combine body us |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 30 | 249.120 | 15.472 | 4.656 |
+| 1 | 31 | 250.304 | 14.688 | 3.952 |
+| 2 | 30 | 248.944 | 16.560 | 3.968 |
+| 3 | 30 | 250.576 | 14.688 | 3.744 |
+| 4 | 32 | 261.616 | 2.912 | 3.360 |
+| 5 | 30 | 248.656 | 16.048 | 3.568 |
+| 6 | 30 | 250.528 | 13.648 | 3.728 |
+| 7 | 29 | 237.024 | 27.200 | 3.888 |
+
+The 23.6--25.4-us stable local spread is absorbed almost exactly by the
+combine rendezvous.  Combine arithmetic itself is only 3.4--4.7 us.  Most
+importantly, rank 4's two extra blocks relative to a typical rank cost about
+12 us, matching the remaining same-session PR383 maximum-rank deficit even
+though R152 already wins the one-rank L1+L2 comparison.  Flash M16 therefore
+has a real distributed route-quantization tail rather than a combine or
+launch-arrival bottleneck.  The next production experiment must reduce the
+fixed cost of the common tiny expert block; changing combine or polling
+cannot close this residual.  Six raw JSON logs and exact instrumented source
+snapshots are archived under `iter529-r161-flash-m16-phase-trace`.
