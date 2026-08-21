@@ -9138,3 +9138,45 @@ route-count-only reordering cannot close a roughly 0.5 ms GEMM spread.
 The raw six-rank-set JSON logs plus the exact instrumented kernel and benchmark
 snapshots are archived under `iter519-r156-pro-m512-phase-trace`.  Production
 source remains byte-for-byte R152 after removing the temporary trace.
+
+## R157-R157a rejected: pair-major complete-row Pro M512 decode
+
+### Reason and direction
+
+R156 shows that reducing fixed work per routed Pro M512 block is the relevant
+tail objective.  R127's complete-row mapping demonstrated a 16% instruction
+reduction but spills because both packed pairs and their decoded results cross
+the live 64-value WGMMA fragment.  R157 tested a different static schedule:
+each lane owns its scale row directly, but finishes every K32 group for one
+bank-permuted LDS.64 pair before starting the second pair.  The two passes
+intentionally rebuild the exponent lookup.  This gives up part of R127's
+instruction saving to keep only one pair live, eliminates the duplicated
+row-scale shuffle, preserves fully static code, and avoids R130c's runtime
+pair loop.
+
+The selector was exact for routed Pro M512: hidden 7168, regular orientation,
+bank-permuted pair loads, no L2 C/D swizzle, and no shared experts.  The two
+static passes use R127's validated `0/2/2/0` quarter-warp pair order and keep
+the expanded-B address set unchanged.
+
+### Resource rejection
+
+The first form retained one-pair LDS lookahead across K32 and compiled at
+`REG:128, STACK:32, SHARED:1024, LOCAL:0`.  R157a removed that lookahead and
+loaded each LDS.64 immediately before decode.  Fully unrolled address
+rematerialization made the result worse at
+`REG:128, STACK:48, SHARED:1024, LOCAL:0`.
+
+| variant | K32 packed load schedule | stack bytes | decision |
+| --- | --- | ---: | --- |
+| R152 pair-row control | one-pair lookahead | 0 | accepted control |
+| R157 pair-major | one-pair lookahead | 32 | reject |
+| R157a pair-major | direct LDS.64 | 48 | reject |
+
+Changing the complete-row loop order therefore does not isolate its address
+and decode state from the regular accumulator.  Even one static pair pass is
+large enough for PTXAS to create a frame; direct-load unrolling retains more
+addresses rather than shortening the live range.  Both variants fail the
+zero-stack gate before correctness, NCU, NSYS, or distributed timing and are
+fully reverted to R152.  Compile logs, the exact R157a source, and resource
+dump are archived under `iter520-r157-pro-m512-pair-major-gates`.
