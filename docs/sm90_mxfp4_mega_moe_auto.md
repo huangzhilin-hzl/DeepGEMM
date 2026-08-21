@@ -9462,3 +9462,15 @@ versus R152's zero stack/spill.  It therefore fails the predeclared two-CTA
 resource gate before NCU, NSYS, or distributed timing and is fully reverted.
 The exact candidate source, correctness logs, and repeated PTXAS resource
 reports are archived under `iter536-r163-flash-m16-lds128-gates`.
+
+## R164 rejected: serialize the Flash M16 LDS.128 row load
+
+R164 removed R163's next-K32 lookahead and loaded each 16-byte packed row only
+when its decoder iteration began.  This isolates whether the frame came from
+holding current and next rows together.  Production correctness still passes,
+but PTXAS remains exactly `REG:128, STACK:8` with 16-byte spill stores and
+20-byte spill loads.  The pressure is therefore the four-result LDS.128
+overlapping the x8 decoder itself, not lookahead.  R164 fails the same resource
+gate before hotspot, NCU, NSYS, or timing and is fully reverted.  Source and
+compile/correctness evidence are archived under
+`iter537-r164-flash-m16-serial-lds128-gate`.
