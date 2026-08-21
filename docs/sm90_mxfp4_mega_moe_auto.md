@@ -8824,3 +8824,38 @@ diagnostic.  Expert-aware pairing, static task ownership, and route-block
 rebalancing are not reopened.  The raw logs are archived under
 `iter494-r148b-pro-m512-rank-times` and
 `iter495-r148b-pro-m512-route-rank-times`.
+
+## R151 rejected: runtime live-chunk guards in the safe swap epilogue
+
+### Reason and variants
+
+R147 enlarged the swap-AB storage and epilogue bound to M64 so a destination
+rank remains safe when all small-M sources route to one expert.  Ordinary
+Flash M16 experts use only one or two 8-token chunks, but the single safe
+epilogue still executes the SwiGLU/amax body for all eight chunks with zero
+weights on inactive chunks.  R151 attempted to skip that arithmetic without
+R148's duplicate hot/fallback templates or R149's dynamically indexed sliced
+array.
+
+The first variant kept the eight-iteration `#pragma unroll` loops and used an
+early `continue` for chunks at or above `ceil(valid_m / 8)`.  Production Flash
+M16, the all-ranks-to-rank-zero M16 hotspot, Pro M8, and Flash M64 all passed
+at `diff=0.000654`, `0.000663`, `0.000716`, and `0.000660`.  PTXAS, however,
+stopped scalarizing the chunk arrays: every inspected cubin used 128
+registers/thread and a 128-byte stack frame.
+
+R151a replaced `continue` with a predicated
+`if (chunk < num_swap_token_chunks) { body }`, leaving the inverse-scale and
+store loops in their original form.  Production Flash M16 again passed at
+`diff=0.000654`, but its cubin still used 128 registers/thread and a 72-byte
+stack frame.  Both forms therefore fail the resource gate before timing.
+
+The exact failure boundary is now established: a runtime control-flow guard
+around the large `swap_swiglu[2][8][2]` producer prevents the compiler from
+keeping all chunk indices scalar, even when the loop retains an explicit
+unroll directive.  Future safe-epilogue work must keep compile-time chunk
+indices and cannot rely on `break`, `continue`, or a runtime outer predicate.
+Both variants are fully reverted; the branch kernel is byte-for-byte R150.
+Correctness and resource reports are archived under
+`iter496-r151-live-chunk-resource-correctness` and
+`iter497-r151a-predicated-live-chunk-resource`.
