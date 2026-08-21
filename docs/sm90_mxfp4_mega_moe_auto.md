@@ -8578,3 +8578,98 @@ local-bucket epilogue and select it uniformly when `valid_m` fits, retaining a
 separate M64 fallback only for cross-rank hotspots.  It must avoid the stack
 frame caused by per-chunk runtime predication.  Formal timing, NSYS, and NCU
 artifacts are archived under `iter473`, `iter476`, and `iter477`.
+
+## R148: specialize the safe Flash M8 swap epilogue
+
+### Reason and implementation
+
+R147 fixed the PR411 cross-rank correctness bugs by making the swap-AB
+epilogue large enough for a destination task with `valid_m=64`.  Its Flash
+M16 NCU result nevertheless showed that compiling every local small-M task
+with eight token chunks increased warp instructions by 8.26% and thread
+instructions by 8.97%.  R148 targets that generated-code overhead without
+weakening the M64 safety invariant.
+
+The L1 swap epilogue is now a compile-time token-chunk lambda.  A uniform
+runtime branch selects the local one-chunk form when the exact Flash M8 task
+has `valid_m <= 8`; otherwise it selects the complete eight-chunk M64 form.
+The fallback therefore still covers the PR411 hotspot where all eight ranks'
+routes arrive at one rank.  Other Flash and Pro signatures remain on R147's
+single M64-safe form, so the experiment cannot perturb their established
+policies or add duplicate large epilogues to their cubins.
+
+### Scope-reduction experiments
+
+The first R148 applied the local-bucket selection to all Flash and Pro
+M8/M16/M32 signatures.  A 10-observation R147/R148/R147 screen gave:
+
+| model | M | first R147 us | R148 us | second R147 us | mean change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash | 8 | 323.914 | 306.444 | 303.460 | -2.31% |
+| Flash | 16 | 355.934 | 369.454 | 349.454 | +4.75% |
+| Flash | 32 | 356.151 | 344.280 | 341.607 | -1.32% |
+| Pro | 8 | 744.560 | 752.061 | 752.294 | +0.49% |
+| Pro | 16 | 987.325 | 980.524 | 951.649 | +1.14% |
+| Pro | 32 | 1006.500 | 1009.500 | 1005.385 | +0.35% |
+
+The broad form is rejected because Flash M16 is clearly slower and none of
+the Pro points has a robust benefit.  R148a narrowed the specialization to
+Flash M8/M32 and used the authoritative 50-observation test:
+
+| M | first R147 us | R148a us | change | second R147 us | reverse change |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 321.171 | 297.887 | -7.25% | 319.414 | -6.74% |
+| 32 | 339.428 | 355.209 | +4.65% | 329.791 | +7.71% |
+
+Flash M32 is therefore also rejected.  The final R148b retains only Flash M8
+and restores every other signature to R147 code generation.
+
+### Final correctness, resources, and machine code
+
+The final implementation passes the exact cross-rank hotspot at
+`diff=0.000641`, production Flash M8 at `diff=0.000671`, and the restored
+Flash M32 path at `diff=0.000666`.  The exact Flash M8 cubin uses 128
+registers/thread with zero stack and local memory.  R148a and the final R148b
+Flash M8 cubins have identical normalized `nvdisasm -c` SHA-256
+`7b7730ef50e1c7187d53367dd5e54cda3dca1a7ed7b49958524d8eed813b3da0`,
+so the accepted R148a 50-observation M8 measurement directly represents the
+final scoped code.
+
+Against R147, R148b is double-positive by 6.7-7.2% in the formal sandwich:
+
+| first R147 us | R148b-equivalent us | change | second R147 us | reverse change |
+| ---: | ---: | ---: | ---: | ---: |
+| 321.171 | 297.887 | -7.25% | 319.414 | -6.74% |
+
+### NCU and NSYS mechanism result
+
+The one-pass rank-zero NCU capture confirms that the gain comes from deleting
+the unused seven epilogue chunks rather than a timing-only fluctuation:
+
+| metric | R147 | R148b | change |
+| --- | ---: | ---: | ---: |
+| duration | 722.85 us | 660.80 us | -8.58% |
+| warp instructions | 57,883,920 | 54,627,254 | -5.63% |
+| thread instructions | 1,711,701,927 | 1,619,887,563 | -5.36% |
+
+Low-perturbation NSYS independently measures the distributed persistent
+kernel at 696.447 us for R147 and 685.440 us for R148b, a 1.58% reduction.
+Both profiler directions agree with the formal maximum-rank result.
+
+### Fresh PR383 comparison
+
+The final 50-observation PR383/R148b/PR383 run uses 20 launches per
+observation, one warmup, cold L2, seed zero, and maximum-rank medians:
+
+| first PR383 us | R148b us | change | second PR383 us | reverse change | control-mean change |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 311.977 | 297.728 | -4.57% | 305.678 | -2.60% | -3.59% |
+
+R148b therefore closes the R147 safe-bound overhead and exceeds PR383 at
+Flash M8 under the final benchmark standard.  Correctness and resource gates,
+the rejected broad screens, formal R147 timing, NCU, NSYS, and the fresh
+PR383 sandwich are archived under
+`iter478-r148-local-fallback-epilogue-gate` through
+`iter485-pr383-r148b-flash-m8-formal`.  The next iteration must refresh the
+complete Flash/Pro matrix and optimize only the remaining points that are
+still slower than PR383.
