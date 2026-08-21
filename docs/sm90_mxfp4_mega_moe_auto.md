@@ -9037,3 +9037,44 @@ orders, distributed and single-rank NCU, PR383 sandwich, and the final
 four-way comparison are archived under
 `iter511-r154-active-accum-load-resource` through
 `iter517-pr383-r152-r154-pr383-flash16-fourway`.
+
+## R155 rejected: phase-selective complete-row decode at Pro M512
+
+### Reason and direction
+
+R127 proved that regular Pro M512 complete-row ownership removes 16.25% of
+warp instructions and 16.48% of thread instructions, but its fully static
+decoder overlapped a 64-value WGMMA fragment and produced a compiler frame.
+R128-R130 showed that serializing the whole decode or retaining runtime loops
+can remove the frame only by exposing decode latency or multiplying shared
+replay.  R155 tested an untried narrower question: whether the register
+pressure was phase-asymmetric, so the static complete-row mapping could be
+retained in only Linear1 or only Linear2 while the other phase kept R152's
+accepted pair-row mapping.
+
+The selector was exact for routed Pro M512: regular orientation, hidden 7168,
+bank-permuted pair loads enabled, L2 C/D swizzle disabled, and no shared
+experts.  No address set, expanded-B layout, WGMMA input, or pipeline order
+changed.  Two separate cubins were compiled from a clean JIT cache, first with
+the complete-row path only for Linear1 and then only for Linear2.
+
+### Resource-gate result
+
+Both one-phase variants compile at `REG:128, STACK:32, SHARED:1024, LOCAL:0`.
+The result is identical to R127's original lookahead form and worse than
+R127b's 16-byte direct-load frame:
+
+| Pro M512 selector | registers | stack bytes | local bytes | result |
+| --- | ---: | ---: | ---: | --- |
+| R152 pair-row control | 128 | 0 | 0 | accepted control |
+| complete-row in Linear1 only | 128 | 32 | 0 | reject |
+| complete-row in Linear2 only | 128 | 32 | 0 | reject |
+
+Thus either logical phase independently overlaps enough decoder state with
+the regular M64xN128 WGMMA fragment to exceed the two-CTA 128-register limit.
+Phase selection cannot recover the demonstrated instruction saving.  Because
+both candidates fail the predeclared zero-stack resource gate, they were not
+advanced to correctness, NCU, NSYS, or distributed timing.  The kernel is
+fully reverted to R152.  The two compile logs, Linear2 source snapshot, and
+resource dump are archived under
+`iter518-r155-pro-m512-phase-row-decode-gates`.
