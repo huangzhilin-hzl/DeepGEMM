@@ -8673,3 +8673,106 @@ PR383 sandwich are archived under
 `iter485-pr383-r148b-flash-m8-formal`.  The next iteration must refresh the
 complete Flash/Pro matrix and optimize only the remaining points that are
 still slower than PR383.
+
+## R149: refresh PR383 residuals and reject sliced Flash M16 epilogue
+
+### Complete authoritative matrix
+
+R148b was rerun between two fresh PR383 controls over both required DSV4
+models and all eleven token counts.  M8-M128 use 50 observations, M256-M8192
+use three observations, and every observation contains 20 launches after one
+warmup with cold L2 and seed zero.  The change column compares R148b with the
+arithmetic mean of the two PR383 maximum-rank medians; negative is faster.
+
+| model | M | first PR383 us | R148b us | second PR383 us | mean change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash | 8 | 296.181 | 319.780 | 303.114 | +6.72% |
+| Flash | 16 | 304.319 | 326.906 | 306.468 | +7.04% |
+| Flash | 32 | 322.555 | 329.132 | 334.668 | +0.16% |
+| Flash | 64 | 361.527 | 364.567 | 364.925 | +0.37% |
+| Flash | 128 | 437.723 | 409.666 | 430.649 | -5.65% |
+| Flash | 256 | 531.079 | 476.916 | 497.820 | -7.30% |
+| Flash | 512 | 935.607 | 893.551 | 925.397 | -3.97% |
+| Flash | 1024 | 1537.241 | 1518.000 | 1525.451 | -0.87% |
+| Flash | 2048 | 2713.000 | 2726.000 | 2777.848 | -0.71% |
+| Flash | 4096 | 5069.000 | 5114.000 | 5093.000 | +0.65% |
+| Flash | 8192 | 9842.000 | 9892.000 | 9854.000 | +0.45% |
+| Pro | 8 | 715.901 | 737.933 | 720.322 | +2.76% |
+| Pro | 16 | 1001.793 | 921.328 | 1014.092 | -8.59% |
+| Pro | 32 | 1105.536 | 995.681 | 1106.516 | -9.98% |
+| Pro | 64 | 1150.968 | 1030.500 | 1162.149 | -10.90% |
+| Pro | 128 | 1272.214 | 1187.000 | 1269.116 | -6.58% |
+| Pro | 256 | 1623.634 | 1637.000 | 1630.342 | +0.62% |
+| Pro | 512 | 2401.920 | 2566.000 | 2406.695 | +6.73% |
+| Pro | 1024 | 4019.000 | 3899.000 | 4037.000 | -3.20% |
+| Pro | 2048 | 7010.000 | 6877.000 | 7008.000 | -1.88% |
+| Pro | 4096 | 12907.000 | 12976.000 | 12938.000 | +0.41% |
+| Pro | 8192 | 25025.000 | 25173.000 | 25046.000 | +0.55% |
+
+Flash M8 contradicts R148's immediately preceding `-3.59%` focused result,
+and its R148b observations are visibly bimodal.  A targeted PR383/R148b/PR383
+repeat therefore separated matrix-session drift from stable residuals.  Flash
+M8 returned to `296.945/301.007/317.201 us`, placing R148b between its two
+controls.  Flash M16 remained double-negative at
+`310.610/331.008/305.758 us`, or `+7.41%` versus the control mean.  A ten-
+observation diagnostic at Pro M512 was likewise stable at
+`2424.707/2657.500/2417.206 us`, or `+9.77%`.  Flash M16 and Pro M512 are
+therefore the two structural priorities; the long-matrix Flash M8 movement is
+not attributed to R148.
+
+### Matched distributed profiler attribution
+
+Low-perturbation NSYS followed rank zero while the other seven ranks ran
+normally.  Its launch durations invert the production ordering because
+profiling one rank changes the distributed rendezvous timing:
+
+| point | PR383 L1 + L2 us | R148b persistent us | change |
+| --- | ---: | ---: | ---: |
+| Flash M16 | 444.864 + 419.648 = 864.512 | 641.824 | -25.76% |
+| Pro M512 | 1722.656 + 1172.512 = 2895.168 | 2671.040 | -7.74% |
+
+The NSYS durations are therefore mechanism diagnostics, not the acceptance
+score.  Single-pass distributed NCU avoids application replay and gives the
+more stable dynamic-work comparison:
+
+| point | metric | PR383 L1 + L2 | R148b | change |
+| --- | --- | ---: | ---: | ---: |
+| Flash M16 | warp instructions | 43,782,332 | 68,441,672 | +56.32% |
+| Flash M16 | thread instructions | 1,316,986,129 | 2,064,298,956 | +56.74% |
+| Flash M16 | duration | 607.81 us | 670.53 us | +10.32% |
+| Pro M512 | warp instructions | 233,272,019 | 551,958,396 | +136.62% |
+| Pro M512 | thread instructions | 7,250,187,111 | 17,361,883,635 | +139.47% |
+
+The fused kernel still saves weight traffic and can lead PR383 under a
+profiled rendezvous, but its decoder, scheduler, and wait paths execute much
+more work.  Historical R97-R120 results already reject two-task claims,
+sparse completion, altered L1/L2 replenishment, static task ownership, owner
+caches, and N-major pairing at Pro M512.  Those mechanisms are not repeated.
+
+### Rejected sliced-M16 safe fallback
+
+R147's PR411 fix makes Flash M16 storage cover a possible M64 destination
+task.  R148 showed that compiling separate local and fallback epilogues hurts
+M16, so R149 tried one two-chunk body in a non-unrolled loop: ordinary
+`valid_m<=16` tasks execute it once, while a cross-rank M64 task reuses it four
+times.  The first implementation passed normal Flash M16 at `diff=0.000654`
+but failed the new all-routes-to-rank-zero M16 case.  Each slice stored its
+quantized output into C/D, then the next slice reused the same C/D bytes as
+scale scratch and overwrote earlier rows.  Moving scale scratch past the 4 KiB
+Flash L1 output within the existing 16 KiB C/D allocation fixed the alias:
+normal and hotspot cases passed at `0.000654/0.000663`.
+
+PTXAS nevertheless generated `REG:128, STACK:160, LOCAL:0`.  This is worse
+than the already rejected 128-byte predicated-frame experiment and fails the
+resource gate before timing.  The sliced implementation and scratch offset
+are fully reverted to R148b.  The new
+`swap_ab_cross_rank_bound.flash_m16` regression remains permanently: it
+forces all eight ranks' M16 routes onto rank zero and guards future attempts
+to specialize the safe epilogue.
+
+The complete matrix, targeted repeats, matched NSYS/NCU reports, initial alias
+failure, corrected numerical gates, and resource rejection are archived under
+`iter486-r148b-pr383-full-matrix` through
+`iter492-r149-reverted-r148b-m16-hotspot-gate`.  The final reverted branch
+passes the new hotspot at `diff=0.000663` and restores the exact cubin to
+`REG:128, STACK:0, LOCAL:0`.

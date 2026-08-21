@@ -880,6 +880,17 @@ def _full_scenarios(
                 activation_clamp=10.0,
                 hot_route_rank=0,
             )),
+            ('swap_ab_cross_rank_bound.flash_m16', dict(
+                num_max_tokens_per_rank=128,
+                num_tokens=16,
+                hidden=4096,
+                intermediate_hidden=2048,
+                num_experts=32 * num_ranks,
+                num_topk=6,
+                fast_math=True,
+                activation_clamp=10.0,
+                hot_route_rank=0,
+            )),
             ('dispatch_mixed_protocol.flash_m32_m64', dict(
                 num_max_tokens_per_rank=128,
                 num_tokens_by_rank=(32,) + (64,) * (num_ranks - 1),
