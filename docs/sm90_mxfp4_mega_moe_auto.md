@@ -9078,3 +9078,63 @@ advanced to correctness, NCU, NSYS, or distributed timing.  The kernel is
 fully reverted to R152.  The two compile logs, Linear2 source snapshot, and
 resource dump are archived under
 `iter518-r155-pro-m512-phase-row-decode-gates`.
+
+## R156 diagnostic: Pro M512 tail is routed-block work imbalance
+
+### Why R150 needed a phase-level recheck
+
+R150 compared each rank's complete Kineto kernel duration with its routed M64
+block count.  The maximum owner moved between sessions and the correlation of
+rank medians was `-0.55`, so static route imbalance was provisionally
+rejected.  The later matched NCU result complicated that conclusion: R152 is
+7.74% faster than PR383 on one rank at Pro M512, yet it remains about 9.8%
+slower in the authoritative eight-rank run.  R156 therefore separated local
+GEMM drain from launch arrival, the cross-rank combine rendezvous, and combine
+arithmetic.
+
+A temporary opt-in `globaltimer` trace reused the benchmark's statistics
+buffer only for one-launch `profile-only` diagnostics.  It recorded dispatch
+rendezvous exit, first/last L1 and L2 task, last CTA GEMM drain, combine
+barrier exit, and combine completion on every rank.  The instrumentation was
+never used for acceptance timing and was fully removed after six successful
+captures.  Five cached-cubin captures are used below; the initial compile-run
+capture shows the same direction but is excluded from medians.
+
+### Stable phase attribution
+
+The route distribution is fixed by seed zero.  Across all five cached runs,
+rank 4 owns the most work at 78 M64 blocks and is the last GEMM rank every
+time.  Ranks 2 and 7 own 62 blocks and are fastest.  The Pearson correlation
+between block count and `dispatch-ready -> GEMM-drained` time is
+`1.000/0.999/0.998/0.998/0.999` in the five individual runs.
+
+| rank | routed M64 blocks | median local GEMM us | median combine-barrier wait us |
+| ---: | ---: | ---: | ---: |
+| 0 | 75 | 2480.448 | 90.816 |
+| 1 | 68 | 2250.816 | 325.280 |
+| 2 | 62 | 2069.632 | 502.880 |
+| 3 | 73 | 2416.960 | 153.312 |
+| 4 | 78 | 2570.528 | 3.232 |
+| 5 | 75 | 2458.176 | 112.992 |
+| 6 | 72 | 2381.312 | 196.384 |
+| 7 | 62 | 2063.712 | 508.224 |
+
+The slowest-to-fastest local GEMM spread is 500.5-510.9 us in every run.
+The fastest ranks wait essentially that same amount at the cross-rank combine
+barrier, while rank 4 waits only 2.9-4.0 us.  Combine after the barrier has a
+median duration of only 12.9-13.7 us.  The five-run correlation between block
+count and per-rank median local GEMM time is `0.99928`.
+
+R150's whole-kernel, cross-session medians mixed launch/device arrival and
+barrier waiting into local duration, which can invert the apparent rank
+ordering.  Phase isolation shows that the static routed-block distribution is
+in fact the direct source of this seed's maximum-rank tail; combine only
+absorbs the difference.  This does not justify static task ownership or
+expert remapping, both already rejected or outside kernel semantics.  It
+changes the optimization criterion: the next Pro M512 experiment must reduce
+fixed work per routed block.  Scheduler atomics, combine arithmetic, and
+route-count-only reordering cannot close a roughly 0.5 ms GEMM spread.
+
+The raw six-rank-set JSON logs plus the exact instrumented kernel and benchmark
+snapshots are archived under `iter519-r156-pro-m512-phase-trace`.  Production
+source remains byte-for-byte R152 after removing the temporary trace.
