@@ -9180,3 +9180,39 @@ addresses rather than shortening the live range.  Both variants fail the
 zero-stack gate before correctness, NCU, NSYS, or distributed timing and are
 fully reverted to R152.  Compile logs, the exact R157a source, and resource
 dump are archived under `iter520-r157-pro-m512-pair-major-gates`.
+
+## R158 rejected: fused x16 decode for regular Pro M512
+
+### Reason and direction
+
+R156 attributes the Pro M512 tail to fixed work per routed M64 block.  The
+regular hidden-7168 decoder builds one exponent lookup and calls the x8
+conversion helper for each word of an LDS.64 pair.  Hidden 4096 already uses
+an inline-PTX x16 helper which generates the lookup and converts both words in
+one asm block.  R158 applied that helper only to the exact routed Pro M512
+selector: hidden 7168, regular orientation, bank-permuted pair loads, no L2
+C/D swizzle, and no shared experts.  The loaded address set, exponent, decoded
+bytes, expanded-B stores, WGMMA schedule, and epilogue were unchanged.  The
+intended mechanism was a shorter compiler-visible temporary live range, not
+additional decode work.
+
+### Profiler rejection
+
+The matched one-rank/48-expert M512 cubins both compile at
+`REG:128, STACK:0, SHARED:1024, LOCAL:0`, so the fused block passes the spill
+gate but does not reduce static resources.  A same-pod, seed-zero NCU gate
+then shows no dynamic instruction saving:
+
+| metric | R152 two x8 calls | R158 fused x16 | change |
+| --- | ---: | ---: | ---: |
+| NCU duration | 2.43 ms | 2.43 ms | unchanged at reported precision |
+| executed warp instructions | 512,863,245 | 512,878,715 | +15,470 (+0.0030%) |
+| executed thread instructions | 16,188,576,498 | 16,188,615,869 | +39,371 (+0.0002%) |
+
+PTXAS therefore already schedules the shared lookup plus two x8 calls at
+least as efficiently as the forced x16 asm block.  The fused expression
+slightly increases executed work and provides no measurable duration or
+resource mechanism.  R158 was stopped before correctness, NSYS, and
+distributed timing, fully reverted to R152, and is not a production change.
+The source snapshot, resource dumps, NCU reports, and raw metric exports are
+archived under `iter521-r158-pro-m512-x16-fused-gate`.
