@@ -9216,3 +9216,99 @@ resource mechanism.  R158 was stopped before correctness, NSYS, and
 distributed timing, fully reverted to R152, and is not a production change.
 The source snapshot, resource dumps, NCU reports, and raw metric exports are
 archived under `iter521-r158-pro-m512-x16-fused-gate`.
+
+## R159 diagnostic: Pro M512 instruction and shared-store attribution
+
+### Reason and method
+
+R158 showed that grouping the same pair-decode instructions does not reduce
+work.  R159 therefore collected a five-pass SourceCounters report for the
+unchanged R152 one-rank/48-expert Pro M512 specialization.  The matched
+seed-zero kernel takes 2.42 ms, executes 512,888,496 warp instructions and
+16,188,686,502 thread instructions, and retains zero local load/store
+sectors.  The largest thread-instruction classes are integer
+6,977,211,203, conversion 1,607,663,616, bit 1,282,068,782, memory
+813,381,350, FP32 264,237,056, and inter-thread communication 230,773,932.
+
+Opcode aggregation explains why further decode-helper reshaping is unlikely
+to dominate: `LOP3` accounts for 3.582B thread instructions, while the
+necessary per-K128 packed-BF16 promotion contributes 1.606B `F2FP` and 1.541B
+`HFMA2` instructions.  The latter two implement the phase-varying activation
+and weight scales and cannot be deleted without changing the numerical
+contract or retaining a spill-producing FP32 persistent fragment.
+
+The source report also corrects the initial aggregate-counter interpretation.
+The regular paired decoder's expanded-B `STS.128` sites each use four ideal
+wavefronts and report zero excessive wavefronts.  The aggregate 8.81M shared
+store conflicts instead concentrate in the regular L2 epilogue's 32
+predicated scalar BF16 stores.  They write the unswizzled M64xN128 tile before
+the NVLink scatter.  The next experiment must therefore target that epilogue,
+not the already ideal expanded-B publication.  The NCU report, raw metric
+breakdown, and SASS-level CSV are archived under
+`iter522-r159-pro-m512-instruction-breakdown`.
+
+## R160-R160a rejected: STSM regular Pro M512 L2 epilogue
+
+### Reason and direction
+
+R69 previously applied B128 swizzling to the scalar M512 L2 stores, but the
+address overhead made the distributed result mixed.  R160 tested the
+previously uncovered collective-store mechanism.  Exact routed Pro M512
+replaced 32 scalar BF16 store instructions per warp with 16
+`stmatrix.sync.aligned.x2.m8n8.shared.b16` instructions.  STSM writes two N64
+atoms in B128-swizzled shared memory; the NVLink scatter maps the unchanged
+logical M64xN128 output through the same atom view.  No global output layout,
+BF16 value, routing, or combine operation changes.
+
+The first prototype incorrectly let scatter interpret the two atom-major N64
+regions as a single row-major N128 region and failed at diff 0.983877.  After
+making the atom view explicit, one- and eight-rank M512 correctness both pass
+at the normal diff 0.000708.  All seven production Pro guards pass, including
+the M16-M128 physical-ring checks.  The capacity-8192 cubin remains at 128
+registers/thread, zero stack/local memory, and 1024 bytes static shared
+memory.
+
+### NCU mechanism and address refinement
+
+Matched one-rank NCU shows that collective stores remove replay but do not
+reduce total machine work.  R160a then hoisted the STSM row base/XOR and used
+the scatter lane's known N64 atom directly, removing repeated generic
+row/column recovery.  The table uses the mean of two R160 captures and the
+single refined R160a capture against a fresh R152 control:
+
+| NCU metric | R152 | R160 | R160a |
+| --- | ---: | ---: | ---: |
+| duration | 2.43 ms | 2.41 ms | 2.41 ms |
+| warp instructions | 512,882,458 | 513,934,238 (+0.205%) | 513,429,687 (+0.107%) |
+| thread instructions | 16,188,763,431 | 16,222,170,093 (+0.206%) | 16,206,147,922 (+0.107%) |
+| integer instructions | 6,975,487,713 | 7,017,312,231 (+0.600%) | 7,001,146,159 (+0.368%) |
+| conversion instructions | 1,607,663,616 | 1,612,709,888 (+0.314%) | 1,612,709,888 (+0.314%) |
+| memory instructions | 813,367,536 | 810,405,650 (-0.364%) | 810,404,330 (-0.364%) |
+| shared-store conflicts | 8,908,530 | 6,747,341 (-24.26%) | 6,617,318 (-25.72%) |
+| local load/store sectors | 0 / 0 | 0 / 0 | 0 / 0 |
+
+The extra conversions come from collective STSM filling complete 8x8 atoms
+where the scalar path predicates partial expert rows.  Atom addressing also
+costs integer work.  R160a halves the residual total-instruction penalty, but
+still executes more work than R152.  The 0.02-ms profiler movement is smaller
+than NCU's displayed precision and requires distributed validation.
+
+### Distributed rejection
+
+Two 20-observation, 20-launch, one-warmup, cold-L2 screens use maximum-rank
+medians and opposite run orders.  Both change sign:
+
+| order | first us | middle us | second us | candidate vs first/second control |
+| --- | ---: | ---: | ---: | --- |
+| R152 / R160 / R152 | 2567.0 | 2565.5 | 2552.5 | -0.06% / +0.51% |
+| R160a / R152 / R160a | 2558.0 | 2546.0 | 2539.0 | +0.47% / -0.27% |
+
+Rank-zero medians also change sign rather than revealing a hidden local gain:
+`2537.0/2557.0/2537.5 us` in the first order and
+`2544.0/2539.0/2523.5 us` in the reverse order.  The replay reduction is real
+but too small to control Pro M512's route-imbalanced maximum-rank tail, while
+the address and full-atom costs prevent an instruction-count win.  R160 and
+R160a are rejected before NSYS and final-standard three-observation timing,
+fully reverted to R152, and are not production changes.  Correctness,
+resources, NCU, source snapshots, and both screens are archived under
+`iter523` through `iter527` on the pod and local artifact root.
