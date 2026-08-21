@@ -8776,3 +8776,51 @@ failure, corrected numerical gates, and resource rejection are archived under
 `iter492-r149-reverted-r148b-m16-hotspot-gate`.  The final reverted branch
 passes the new hotspot at `diff=0.000663` and restores the exact cubin to
 `REG:128, STACK:0, LOCAL:0`.
+
+## R150: reject Pro M512 route-block imbalance as the tail cause
+
+### Reason and diagnostic direction
+
+Pro M512 routes exactly 24,576 token-expert pairs over 384 experts, or 64
+tokens per expert on average.  That is the M64 tiling boundary, so a small
+receive-count skew can create a second routed block for many experts.  R150
+tested whether this quantization explains the stable Pro M512 deficit before
+reopening an expert-aware task order or block-pairing experiment.
+
+The benchmark gained two opt-in diagnostics.  `--report-rank-times` gathers
+the local Kineto duration from all ranks after the existing maximum-rank
+reduction.  `--report-route-stats` gathers the already-generated routing
+indices before warmup and reports each rank's receive-token count, number of
+`ceil(expert_tokens / 64)` blocks, experts above 64 tokens, and exact expert
+counts.  Both flags are off by default; route collection happens before the
+warmup and rank-time collection happens after each timed observation, so
+neither changes the measured kernel region.
+
+### Evidence and rejection
+
+The first 20-observation R148b diagnostic measured a maximum-rank median of
+2566.0 us and rank-zero median of 2541.5 us.  Rank 4 and rank 5 were the
+maximum-time owner in 7 and 9 observations respectively.  A repeat with
+route reporting measured 2571.0/2549.0 us and produced:
+
+| rank | receive tokens | routed M64 blocks | local median us | maximum owner count |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 3143 | 75 | 2549.0 | 5 |
+| 1 | 3039 | 68 | 2552.0 | 0 |
+| 2 | 2929 | 62 | 2551.5 | 2 |
+| 3 | 3153 | 73 | 2559.0 | 0 |
+| 4 | 3184 | 78 | 2539.0 | 0 |
+| 5 | 3078 | 75 | 2555.0 | 1 |
+| 6 | 3066 | 72 | 2560.0 | 2 |
+| 7 | 2984 | 62 | 2567.5 | 10 |
+
+The block count varies from 62 to 78, but its Pearson correlation with rank
+median is `-0.55`: rank 4 has the most blocks and the lowest median, while
+rank 7 has the fewest blocks and the highest median.  The maximum-time owner
+also moves from ranks 4/5 in the first session to rank 7 in the second.
+Static local expert load therefore does not explain the distributed tail;
+device/session arrival variation and the cross-rank rendezvous dominate this
+diagnostic.  Expert-aware pairing, static task ownership, and route-block
+rebalancing are not reopened.  The raw logs are archived under
+`iter494-r148b-pro-m512-rank-times` and
+`iter495-r148b-pro-m512-route-rank-times`.
