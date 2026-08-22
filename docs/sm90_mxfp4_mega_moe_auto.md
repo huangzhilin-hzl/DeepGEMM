@@ -12000,3 +12000,60 @@ recovery `production.pro_m512` passes at `diff=0.000715`.  Exact sources,
 correctness/resources, three NCU reports/CSVs, formal logs, hashes, and
 recovery evidence are archived under
 `iter621-r201-pro-m512-row-xor-cd-gate`.
+
+## R202 rejected: extend the M1024+ C/D swizzle to three row bits
+
+### Reason and temporary implementation
+
+R201's exact M512 row-XOR needed an additional address permutation and lost
+distributed timing despite reducing shared-store conflicts.  M1024 and above
+already pay for `Swizzle<3,4,3>`, so R202 tested a one-line, instruction-shape
+preserving replacement with `Swizzle<3,4,4>`.  The old mapping XORs the high
+column bit and two row bits into the 16-byte segment index; the candidate uses
+three row bits, giving the eight simultaneous epilogue row groups eight
+distinct bank quartets.  Both mappings preserve the low four address bits and
+are their own inverse, so vector scatter alignment, logical values, and remote
+addresses remain unchanged.
+
+The generated device signature is shared by M2048/M4096/M8192, while M1024
+adds its sparse-dispatch macro.  The existing correctness list's largest
+affected case, eight-rank `production.flash_m1024`, passes at `diff=0.000658`.
+Attempts to select nonexistent Flash/Pro M8192 and Pro M1024 scenario names
+were rejected by the test harness before a kernel launch and are excluded,
+not numerical failures.  The matched Pro M2048 cubin uses `REG=128`,
+`STACK=0`, `LOCAL=0`, and `SHARED=1024`.  The temporary header SHA256 was
+`663256a678cc5203071361e41b644dd1a56f86598dd0118e8d655fd03c86aa25`.
+
+### Matched NCU rejection
+
+The one-rank/48-expert Pro M2048 order was R202/R191/R202 with seed zero,
+cold L2, and identical 39-pass full NCU sections.  Pro M2048 exercises the
+same non-sparse generated template as Pro M4096/M8192:
+
+| metric | R202 first | R191 control | R202 last | candidate change |
+| --- | ---: | ---: | ---: | ---: |
+| duration | 7.433600 ms | 7.420000 ms | 7.427648 ms | +0.183% / +0.103% |
+| elapsed cycles/SM | 948,684,710 | 948,424,064 | 949,200,938 | +0.027% / +0.082% |
+| executed instructions | 1,612,892,103 | 1,612,895,027 | 1,613,045,556 | -0.0002% / +0.0093% |
+| issued instructions | 1,616,684,044 | 1,616,513,292 | 1,616,645,637 | +0.0106% / +0.0082% |
+| issue active | 42.690% | 42.675% | 42.659% | +0.016 / -0.015 pp |
+| eligible warps/cycle | 0.543 | 0.542 | 0.543 | +0.27% / +0.22% |
+| short-scoreboard samples | 15,405 | 15,282 | 15,425 | +0.80% / +0.94% |
+| long-scoreboard samples | 150,050 | 150,181 | 149,605 | -0.09% / -0.38% |
+| barrier samples | 152,009 | 150,705 | 151,588 | +0.87% / +0.59% |
+| shared-load conflicts | 483,170 | 491,606 | 481,476 | -1.72% / -2.06% |
+| shared-store conflicts | 19,942,487 | 21,809,964 | 19,747,344 | -8.56% / -9.46% |
+
+Because the swizzle instruction shape is unchanged, executed work remains
+effectively flat.  The third row bit removes another 8.6--9.5% of store
+conflicts, but raises short-scoreboard and barrier samples; both duration and
+elapsed-cycle captures regress.  The existing two-row-plus-column mapping has
+already captured the useful replay benefit, so R202 fails the local mechanism
+gate before distributed timing, NSYS, or the full affected-point screen.
+
+The source is restored locally and on the pod to R191 SHA256
+`7abe0773a73b6295226872cd92762732c16a7115b7a08e3cdfa8bea738d0d56d`;
+recovery `production.flash_m1024` passes at `diff=0.000658`.  Exact sources,
+valid and excluded correctness logs, resources, three NCU reports/CSVs,
+hashes, and recovery evidence are archived under
+`iter622-r202-m1024plus-three-row-swizzle-gate`.
