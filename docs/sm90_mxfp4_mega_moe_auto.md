@@ -9876,3 +9876,73 @@ is fully reverted to byte-identical R152.  The production log, generated
 kernel, cubins, full SASS, local-memory opcode extracts, resource reports,
 source snapshot, and hashes are archived under
 `iter549-r169-dispatch-lookup-gate`.
+
+## R170 rejected: compact Flash M16 activation TMA boxes
+
+### Stall diagnosis and direction
+
+An R152 one-rank/32-expert Flash M16 NCU capture adds SpeedOfLight,
+SchedulerStats, WarpStateStats, and source sampling to R161's instruction
+breakdown.  The kernel takes 263.55 us, issues only 0.45 warps per scheduler,
+and has no eligible warp in 54.87% of scheduler cycles.  The apparent 31.9%
+barrier-stall headline is dominated by the two dispatch warps waiting at the
+final 192-thread dispatch/math rendezvous; it is an effect of the longer math
+path, not a useful barrier to remove.  The first math-loop stall instead sits
+at the three-stage full-barrier wait and is classified as long scoreboard,
+showing that an activation/weight TMA stage is not always ready when the math
+warpgroup reaches it.  This diagnostic is archived under
+`iter550-r152-flash-m16-stalls`.
+
+Swap-AB N8/N16 consumes only the first 8/16 activation rows, but R152's A and
+SFA producer descriptors fetch an M64 box.  R170 therefore built separate M16
+activation and SFA tensor maps for exact routed DSV4 Flash M16.  To avoid
+kernel-parameter growth it passed them through the shared-expert descriptor
+slots, which are unused when `kNumSharedExperts == 0`.  Tasks with
+`valid_m <= 16` selected the compact maps and adjusted the transaction-barrier
+byte count; route-hotspot tasks retained the original M64 descriptors.  The
+weight TMA, MXFP4 decoder, expanded-B stores, three-stage allocation, WGMMA,
+epilogue, scheduler, and launch topology were unchanged.
+
+Production Flash M16, the all-ranks-to-rank-zero PR411 hotspot, and the
+non-target Flash M64 fallback pass at `diff=0.000654/0.000663/0.000660`.
+The exact eight-rank M16 cubin remains at 128 registers, zero stack/spill, and
+four barriers.
+
+### Local NCU mechanism
+
+Matched-configuration one-rank/32-expert NCU is locally positive:
+
+| metric | R152 | R170 | change |
+| --- | ---: | ---: | ---: |
+| duration | 263.55 us | 260.42 us | -1.19% |
+| issued warps/scheduler | 0.45 | 0.46 | +2.22% |
+| cycles with no eligible warp | 54.87% | 54.04% | -0.83 pp |
+| warp cycles/issued instruction | 8.65 | 8.58 | -0.81% |
+| warp instructions | 60,241,422 | 60,233,067 | -0.014% |
+| thread instructions | 1,874,340,628 | 1,873,598,811 | -0.040% |
+| sampled total stalls | 16,309 | 16,115 | -1.19% |
+| sampled long-scoreboard stalls | 4,644 | 4,579 | -1.40% |
+| sampled wait stalls | 1,916 | 1,858 | -3.03% |
+
+The instruction stream is effectively unchanged while duration and waiting
+fall together, which validates the intended local TMA-latency mechanism.
+The complete R170 correctness, host build, cubins, SASS, resources, NCU
+report, and source counters are archived under
+`iter551-r170-compact-a-tma-gate`.
+
+### Authoritative distributed rejection
+
+The required 50-observation, 20-launch, one-warmup, cold-L2, seed-zero
+R152/R170/R152 comparison reverses the local result at the maximum rank:
+
+| metric | first R152 | R170 | second R152 | R170 vs controls |
+| --- | ---: | ---: | ---: | ---: |
+| maximum-rank median | 337.6185 us | 345.6110 us | 337.1235 us | +2.37% / +2.52% |
+| rank-zero median | 325.2075 us | 321.8425 us | 326.9055 us | -1.03% / -1.55% |
+
+Compact activation TMA therefore improves a local rank but does not reduce the
+route-quantized slow-rank tail identified by R161.  It is double-negative
+against the authoritative maximum-rank controls, so NSYS cannot override the
+acceptance failure.  R170 is fully reverted to byte-identical R152 and is not
+a production change.  Forced host rebuild logs, all three raw timing runs,
+and control source snapshots are archived under `iter552-r170-formal`.
