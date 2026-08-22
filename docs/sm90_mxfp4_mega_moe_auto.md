@@ -10290,3 +10290,56 @@ passes the same one-rank and eight-rank Flash M16 production scenarios at
 `diff=0.000649` and `diff=0.000654`, respectively.  Both CUDA-error logs, the
 exact temporary source, recovery logs, and hashes are archived under
 `iter562-r177-flash-m16-secondary-cache-gate`.
+
+## R178 rejected: forward Flash M16 secondary scale in TaskInfo
+
+### Reason and temporary implementation
+
+R177 showed that the expert-count scratch cannot safely hold a whole
+secondary-scale table during the persistent task stream.  R178 removed that
+alias and instead moved exactly one value with each task.  The B scheduler's
+lane zero loaded the selected expert's L1 or L2 FP32 secondary immediately
+after claiming a routed task and before publishing its mailbox.  Its 32-bit
+representation reused `TaskInfo::shape_n`, which is populated by the generic
+scheduler but not consumed by this SM90 implementation.  The math warpgroup
+then read the already-broadcast TaskInfo register instead of executing its
+four warp-uniform global loads.
+
+The scheduler gained an optional `prepare_task` callback; its existing
+two-argument overload supplied an empty callback, so non-target signatures
+retained the original claim/publish/process ordering.  TaskInfo size, shared
+memory, task numbering, barriers, decoder, WGMMA, and epilogue were unchanged.
+Production Flash M16 and the PR411 concentrated-routing hotspot pass at
+`diff=0.000654/0.000663`.
+
+The one-rank/32-expert candidate cubin compiles at 114 registers and zero
+stack/local memory, versus 118 registers and zero stack/local memory for the
+matched R152 specialization.  Thus forwarding the value also shortened its
+live range enough to create four registers of headroom.
+
+### Matched NCU rejection
+
+Fresh R178 and R152 captures used the same H20, one-rank/32-expert Flash M16
+shape, profiler sections, and launch command.  Elapsed cycles are the timing
+authority because the SM clocks were 1.63 and 1.65 GHz:
+
+| metric | R152 | R178 task forwarding | change |
+| --- | ---: | ---: | ---: |
+| elapsed cycles | 435,923 | 437,086 | +0.27% |
+| raw duration | 263.39 us | 266.08 us | +1.02% |
+| global-load sectors | 834,968 | 823,466 | -1.38% |
+| warp instructions | 60,250,843 | 60,240,674 | -0.017% |
+| thread instructions | 1,874,305,044 | 1,873,951,072 | -0.019% |
+| cycles with no eligible warp | 54.62% | 54.65% | +0.03 pp |
+| warp cycles/issued instruction | 8.68 | 8.68 | unchanged |
+
+The memory mechanism is real but immaterial: forwarding removes about 11.5K
+global sectors and 354K thread instructions, yet moves the dependency onto
+the B scheduler and makes elapsed cycles slightly worse.  It fails the local
+NCU mechanism gate, so NSYS and distributed A/B/A cannot override the result.
+
+Both headers are restored to byte-identical R152 and eight-rank recovery
+passes at `diff=0.000654`.  Candidate/control sources, correctness and
+resource logs, cubin/SASS, matched NCU reports/details/source counters,
+recovery log, and hashes are archived under
+`iter563-r178-flash-m16-task-secondary-gate`.
