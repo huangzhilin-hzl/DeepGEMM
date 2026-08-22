@@ -12057,3 +12057,175 @@ recovery `production.flash_m1024` passes at `diff=0.000658`.  Exact sources,
 valid and excluded correctness logs, resources, three NCU reports/CSVs,
 hashes, and recovery evidence are archived under
 `iter622-r202-m1024plus-three-row-swizzle-gate`.
+
+## R203 accepted: remove padded-token selects from the Flash M16 N8 scale path
+
+### SourceCounter diagnosis and implementation
+
+Fresh lineinfo NCU compared the retained R191 Flash M16 kernel with PR383 on
+one H20, one rank, 32 experts, seed zero, and cold L2.  R191 executes one fused
+persistent kernel in `261.280 us` under replay and about 62.76 million SASS
+instructions.  PR383 splits the same operation into L1 and L2 kernels; their
+replay durations are `172.288 + 98.208 = 270.496 us` and their instruction
+counts are `27.487 + 14.453 = 41.940 million`.  The fused kernel therefore
+avoids one launch and the global L1/L2 handoff, but executes about 49.7% more
+instructions.  SourceCounters place the actionable R191 excess in the N8
+pre-wait scale path: repeated token bounds materialize zero pairs and select
+the second scale even though the producer always transfers a complete
+`BLOCK_M` SFA vector into shared memory.
+
+R203 changes only the exact fast-math Flash M16/N8 specialization selected by
+`hidden=4096`, local swap policy M16, and `N_SWAP=8`.  It unconditionally
+vector-loads the aligned `float2` SFA pair and consumes both components.  The
+Pro M8 vector path retains both old bounds, and Flash N16/N32/N64 plus every
+ordinary promotion specialization are compile-time unchanged.
+
+This is safe without initializing padding.  `token_0/token_1` are at most 6/7,
+inside the 64-row stage allocation, and the producer TMA has already filled
+that allocation before the full barrier releases the math warpgroup.  Each
+swap-AB accumulator column represents an independent token; padded columns
+are never read by a valid token reduction and are never written by the
+valid-M epilogue.  Their numerical scale is therefore irrelevant, while every
+valid token uses the same address, load, multiplication, BF16 conversion, and
+HFMA2 sequence as R191.  Scheduler state, PR411's cross-rank M64 storage bound,
+wire completion, decoder, WGMMA, stage release, and output addresses do not
+change.  The retained R203 device-header SHA256 is
+`80237849c5870eea3e8af0fb74efb9a207d40fecce9a7d0346408f90c9df8b1e`.
+
+### Correctness and resource gates
+
+Eight-rank `production.flash_m16`, including physical ring wrap on every
+rank, passes at `diff=0.000654`.  The PR411-derived concentrated-routing bound
+`swap_ab_cross_rank_bound.flash_m16` passes at `diff=0.000663`.  The production
+cubin remains at `REG=128`, `STACK=0`, `LOCAL=0`, and `SHARED=1024`.
+
+The final complete suite passes 43/43 scenarios.  It includes every production
+Flash/Pro case, the newly covered Flash M256/M512 points, both concentrated
+routing bounds, mixed local wire protocols, physical ring wrap, shared
+experts, masked routes, fast-math endpoints, and eight randomized stress
+cases.  No correctness result relies on the arbitrary values in padded
+accumulator columns.
+
+### Matched R203/R191/R203 NCU mechanism
+
+The one-rank, 32-expert NCU sandwich uses independent lineinfo JIT caches,
+seed zero, cold L2, and identical 20-pass SpeedOfLight, SourceCounters,
+InstructionStats, WarpStateStats, and MemoryWorkloadAnalysis sections:
+
+| metric | R203 first | R191 control | R203 last | candidate change |
+| --- | ---: | ---: | ---: | ---: |
+| duration | 255.808 us | 261.120 us | 256.608 us | -2.03% / -1.73% |
+| GPC elapsed cycles | 420,884 | 427,228 | 420,279.7 | -1.48% / -1.63% |
+| warp instructions | 54,317,186 | 58,338,728 | 54,327,961 | -6.89% / -6.88% |
+| predicated-on thread instructions | 1,731,219,964 | 1,854,003,239 | 1,731,756,362 | -6.62% / -6.59% |
+| issue active | 41.39% | 43.79% | 41.45% | -2.40 / -2.34 pp |
+| warps active per instruction | 9.337 | 8.835 | 9.391 | +5.68% / +6.29% |
+| long-scoreboard / issued | 2.757 | 2.556 | 2.766 | +7.86% / +8.18% |
+| short-scoreboard / issued | 0.495 | 0.381 | 0.495 | +30.0% / +30.0% |
+
+The relative stall ratios rise because the denominator loses instructions;
+both elapsed time and cycles fall.  Unique-address source/SASS aggregation
+confirms the intended deletion rather than a line-number artifact:
+
+| opcode | R203 first | R191 | R203 last |
+| --- | ---: | ---: | ---: |
+| `FSEL` | 98,208 | 606,112 | 98,208 |
+| `VOTEU` | 191,456 | 572,384 | 191,456 |
+| `CS2R` zero-pair materialization | 78,759 | 590,504 | 78,432 |
+| `ISETP` | 1,525,919 | 1,923,237 | 1,525,482 |
+| `LEA` | 660,140 | 977,580 | 660,140 |
+| `ULEA` | 1,246,924 | 1,564,364 | 1,246,924 |
+| `LDS` | 2,267,640 | 2,267,640 | 2,267,640 |
+| `FMUL` | 2,151,648 | 2,151,648 | 2,151,648 |
+| `F2FP` | 1,571,328 | 1,571,328 | 1,571,328 |
+| `QGMMA` | 1,523,712 | 1,523,712 | 1,523,712 |
+
+The load and arithmetic counts for valid data are byte-for-byte stable; the
+removed work is bounds voting, zero-pair construction, and selection.
+
+### Authoritative R191 double-order timing
+
+Both orders use eight ranks, seed zero, cold L2, one warmup, 50 observations,
+20 launches per observation, and the maximum-rank median:
+
+| order | first | middle | last | R203 comparison |
+| --- | ---: | ---: | ---: | --- |
+| R191 / R203 / R191 | 332.7165 us | 330.5665 us | 339.0975 us | R203 is 0.65% / 2.52% faster |
+| R203 / R191 / R203 | 332.2000 us | 339.7320 us | 327.0730 us | R203 is 2.22% / 3.73% faster |
+
+All four comparisons are positive.  The three R203 medians average
+`329.9465 us`; the three R191 medians average `337.1820 us`, an average
+improvement of 2.15%.  The conservative retained benefit is 0.65%.
+
+An earlier run accidentally inverted the two harness counts and collected 20
+observations with 50 launches each.  It also favored R203 by 5.43%/1.10%, but
+is explicitly excluded from the acceptance result.  Its logs remain archived
+to make the protocol correction auditable.
+
+### Low-perturbation NSYS qualification
+
+Only rank zero is wrapped by NSYS; ranks 1--7 run ordinary profile-only
+workers.  Each independent cache is prewarmed, `cudaProfilerStart/Stop` wraps
+one launch, CPU sampling and context-switch tracing are disabled, and every
+report contains exactly one 156-CTA persistent kernel.  R203/R191/R203 reports
+`654.080 / 680.608 / 654.912 us`, so the candidate is 3.90% and 3.78% faster.
+NCU, both formal orders, and NSYS therefore agree that instruction deletion
+shortens the persistent critical path.
+
+### Final Flash/Pro matrix against PR383
+
+The user-requested final matrix uses `tests/bench_mega_moe_sm90.py`, eight H20
+ranks, seed zero, cold L2, maximum-rank medians, 50 observations for M<=128,
+three for M>=256, and 20 launches per observation.  R203 is bracketed by two
+fresh PR383 runs; the percentage below compares R203 with their pointwise
+mean.  The last column reproduces R191's previous matched-matrix gap so this
+round's movement remains visible.
+
+| M | Flash R203 us | Flash PR383 mean us | R203 gap | R191 gap | Pro R203 us | Pro PR383 mean us | R203 gap | R191 gap |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 293.9795 | 299.8483 | -1.96% | -1.64% | 718.5870 | 709.9823 | +1.21% | +1.62% |
+| 16 | 315.4985 | 310.9150 | +1.47% | +2.95% | 922.0145 | 1,007.4580 | -8.48% | -7.22% |
+| 32 | 324.3600 | 333.2873 | -2.68% | -0.46% | 996.3670 | 1,106.9205 | -9.99% | -9.41% |
+| 64 | 360.9235 | 364.9220 | -1.10% | -4.64% | 1,023.0000 | 1,166.5055 | -12.30% | -11.90% |
+| 128 | 412.4505 | 445.5215 | -7.42% | -5.39% | 1,180.0000 | 1,266.6705 | -6.84% | -6.67% |
+| 256 | 548.9800 | 505.7490 | +8.55% | +0.78% | 1,603.0000 | 1,626.2690 | -1.43% | +0.28% |
+| 512 | 918.2910 | 917.7065 | +0.06% | +1.90% | 2,543.0000 | 2,400.7155 | +5.93% | +4.02% |
+| 1024 | 1,513.0000 | 1,534.2315 | -1.38% | -3.51% | 3,902.0000 | 4,017.0000 | -2.86% | -2.48% |
+| 2048 | 2,740.0000 | 2,733.0000 | +0.26% | +0.81% | 6,869.0000 | 7,021.0000 | -2.16% | -1.87% |
+| 4096 | 5,109.0000 | 5,095.5000 | +0.26% | +0.28% | 12,971.0000 | 12,920.0000 | +0.39% | +0.57% |
+| 8192 | 9,944.0000 | 9,822.5000 | +1.24% | +0.59% | 25,288.0000 | 25,043.0000 | +0.98% | +1.00% |
+
+R203 wins 12/22 points against both fresh PR383 controls.  Geometric-mean
+gaps are `-0.31%` for Flash, `-3.38%` for Pro, and `-1.86%` for all 22 points
+(negative means R203 is faster).  R191's prior values were `-0.79%`, `-3.04%`,
+and `-1.92%`.  Only Flash M16 satisfies the R203 compile-time selector, so the
+large movements at the three-observation Flash M256 and Pro M512 points are
+node/order variance, not effects of this source change.  At the target point,
+the matrix moves from R191 `321.0800 us` to R203 `315.4985 us` (-1.74%) and
+shrinks the point estimate versus PR383 from +2.95% to +1.47%.
+
+That single-order point estimate is not used to claim the PR383 residual is
+closed.  The reverse direct order R203/PR383/R203 measures
+`343.5990 / 324.4115 / 360.8500 us`, while the matrix order PR383/R203/PR383
+measures `309.5995 / 315.4985 / 312.2305 us`.  Across both orders, R203 averages
+`339.9825 us`, PR383 averages `315.4138 us`, and the remaining direct gap is
+7.79%.  The previous R191 direct comparison was 7.08%; different sessions
+move PR383 and the persistent kernel unequally, so no cross-session percentage
+improvement is asserted.  What R203 establishes reproducibly is a 0.65--3.73%
+improvement over R191 under four same-implementation controls; PR383's
+two-kernel path remains the next optimization target.
+
+### Decision and artifacts
+
+R203 is accepted because correctness and resources are unchanged, the exact
+SASS work is deleted, both NCU captures, both authoritative timing orders, and
+both NSYS captures agree in sign, and the complete suite passes.  The final
+matrix and reverse PR383 order keep the unresolved 7--8% direct residual
+explicit rather than allowing a favorable single order to hide it.
+
+Curated sources, hashes, correctness/resource logs, R191 and PR383 lineinfo
+NCU reports, R203/R191/R203 NCU reports/CSVs, both correct formal orders, the
+excluded protocol-mismatch order, three NSYS reports and statistics, the 43
+scenario log, the complete matrix, and the reverse PR383 order are stored on
+the pod under `iter623` through `iter632` and locally under
+`.codex-artifacts/iter632-r203-curated-artifacts`.

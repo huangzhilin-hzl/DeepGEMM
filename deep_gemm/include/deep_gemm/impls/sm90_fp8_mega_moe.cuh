@@ -2378,21 +2378,49 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                             const uint32_t token_0 =
                                                 swap_col_idx * 2;
                                             const uint32_t token_1 = token_0 + 1;
-                                            const float2 scale_pair =
-                                                token_0 < valid_m ?
-                                                    ptx::ld_shared(
+                                            // Every producer TMA fills the
+                                            // complete BLOCK_M SFA vector.  In
+                                            // the exact Flash M16/N8 bucket,
+                                            // values for padded tokens are
+                                            // irrelevant because their
+                                            // accumulator columns are never
+                                            // written.  Loading them directly
+                                            // removes two per-promotion bounds
+                                            // selects from the critical path.
+                                            const float2 scale_pair = [&]() {
+                                                if constexpr (
+                                                        kPrecomputeFlashM16ScaleBeforeWait) {
+                                                    return ptx::ld_shared(
                                                         reinterpret_cast<
                                                             const float2*>(
                                                             smem_sfa[
                                                                 pipeline_stage] +
                                                             activation_sf_group *
                                                                 kL2SFAHalfStride +
-                                                            token_0)) :
-                                                    make_float2(0.0f, 0.0f);
+                                                            token_0));
+                                                } else {
+                                                    return token_0 < valid_m ?
+                                                        ptx::ld_shared(
+                                                            reinterpret_cast<
+                                                                const float2*>(
+                                                                smem_sfa[
+                                                                    pipeline_stage] +
+                                                                activation_sf_group *
+                                                                    kL2SFAHalfStride +
+                                                                token_0)) :
+                                                        make_float2(0.0f, 0.0f);
+                                                }
+                                            }();
                                             const float scale_a_0 = scale_pair.x;
-                                            const float scale_a_1 =
-                                                token_1 < valid_m ?
-                                                    scale_pair.y : 0.0f;
+                                            const float scale_a_1 = [&]() {
+                                                if constexpr (
+                                                        kPrecomputeFlashM16ScaleBeforeWait) {
+                                                    return scale_pair.y;
+                                                } else {
+                                                    return token_1 < valid_m ?
+                                                        scale_pair.y : 0.0f;
+                                                }
+                                            }();
                                             const float combined_scale_0 =
                                                 (compensate_secondary ?
                                                      scale_a_0 :
