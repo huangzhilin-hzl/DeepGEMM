@@ -10669,3 +10669,82 @@ limit.  The next optimization targets remain Flash M16 (+2.78%), Pro M512
 (+4.43%), and Pro M8 (+3.31%); Flash M2048 and the large-M tails are smaller
 secondary residuals.  The complete sources, harness hashes, and raw logs are
 archived under `iter576-pr383-r180-pr383-full-matrix`.
+
+## R182 rejected: compose Pro M8 scale-load and secondary factorization
+
+### Reason and temporary implementation
+
+The fresh matrix left Pro M8 3.31% behind the mean PR383 control.  R179 had
+already shown that factoring the expert-wide MXFP4 secondary scale out of
+every K-block promotion removes 3.24M local executed instructions, but the
+standalone candidate failed its distributed reverse-order gate.  R180's
+accepted adjacent `float2` activation-scale load removes a different repeated
+operation and is stable in both orders.  R182 tested whether composing those
+two independent instruction reductions made R179's local mechanism large
+enough to survive eight-rank route imbalance.
+
+Only `kHidden == 7168 && kLocalSwapABTokens == 8 && kFastMath` was changed.
+The temporary path retained R180's vector shared load, accumulated packed-BF16
+partials without the invariant secondary, and applied the overflow-safe
+secondary factor once while expanding the persistent BF16 sum to FP32.  The
+safe branch moved `secondary * 64` to the final factor; the unsafe branch kept
+the existing x64 token-scale compensation and used the unmodified secondary.
+All other model and M specializations remained compile-time identical.
+
+### Correctness and resource gates
+
+Eight-rank `production.pro_m8` passes at `diff=0.000716`, identical to R180.
+The production specialization stays at 128 registers/thread and the matched
+one-rank/48-expert profiler specialization stays at 107 registers/thread;
+both have zero stack and spill.  The temporary candidate header SHA256 is
+`a2c99536b6d28fcb91a74aac07e4a37379328506240b384aa03e3dda8f6a9a08`.
+
+### Matched NCU mechanism result
+
+The matched one-rank/48-expert capture used an R182/R180/R182 ordering, seed
+zero, cold L2, lineinfo, the same five NCU sections, and identical generated
+signatures.  Elapsed cycles are the primary local comparison:
+
+| metric | R182 first | R180 control | R182 last | candidate range vs control |
+| --- | ---: | ---: | ---: | ---: |
+| elapsed cycles | 1,119,866 | 1,122,521 | 1,120,583 | -0.24% to -0.17% |
+| duration | 678.208 us | 680.096 us | 678.816 us | -0.28% to -0.19% |
+| executed instructions | 157,016,716 | 159,203,779 | 157,013,929 | -1.37% to -1.38% |
+| issued instructions | 157,050,237 | 159,242,323 | 157,042,863 | -1.38% |
+| issue active | 45.38% | 45.89% | 45.46% | -0.51 to -0.43 pp |
+| eligible warps/cycle | 0.618 | 0.624 | 0.619 | -0.006 to -0.005 |
+| registers/thread | 107 | 107 | 107 | unchanged |
+
+Composition therefore removes another 2.19M instructions from R180, but only
+0.17--0.24% elapsed cycles.  The lower issue-active and eligible-warp values
+confirm the same limit seen in R179: shortening the arithmetic stream exposes
+more scheduler-idle time, so the instruction savings are not additive with
+R180's 0.77% cycle improvement.
+
+### Authoritative double-order rejection
+
+Both orders use the final Pro M8 standard: eight ranks, seed zero, cold L2,
+one warmup, 50 observations, 20 launches per observation, and maximum-rank
+median.  Each order uses fresh per-source caches and hash-fixed headers:
+
+| order | first | middle | last | R182 comparison |
+| --- | ---: | ---: | ---: | --- |
+| R180 / R182 / R180 | 749.1545 us | 752.5740 us | 760.8450 us | R182 is 0.46% slower and 1.09% faster |
+| R182 / R180 / R182 | 745.3180 us | 762.4930 us | 763.0330 us | R182 is 2.25% faster and 0.07% slower |
+
+The sign changes within both orders: one candidate loses to the first R180
+control in the forward order, and the second candidate loses to R180 in the
+reverse order.  R182 therefore fails the distributed stability gate despite
+its reproducible local NCU mechanism.  NSYS and the full 41-scenario suite are
+not advanced because neither can override the failed authoritative timing
+gate.
+
+The temporary source is fully reverted locally and on the pod.  The restored
+device header is byte-identical to retained R180 at
+`cf91f518a72aec9c897b617b565a81031d5fdcdb80f653a85c7bb59baf3d2fd9`,
+and recovery `production.pro_m8` again passes at `diff=0.000716`.  Exact
+candidate/control sources, correctness and PTXAS logs, all three NCU reports,
+both formal orders, recovery output, and hashes are archived under
+`iter580-r182-pro-m8-factor-vector-gate`,
+`iter581-r180-r182-r180-pro-m8-formal`, and
+`iter582-r182-r180-r182-pro-m8-reverse-formal`.
