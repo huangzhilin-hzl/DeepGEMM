@@ -11727,3 +11727,66 @@ recovery `production.flash_m16` passes at `diff=0.000654`.  Candidate/control
 sources, correctness/resources, all three NCU reports/CSVs, and the recovery
 log are archived under
 `iter616-r197-flash-m16-packed-half-pipeline-gate`.
+
+## R198 rejected: cache Flash M16 source-rank masks per expert
+
+### Reason and implementation
+
+The accepted Flash M16 single-slot dispatch path loads each expert's per-rank
+receive counts once, but rebuilt the same `multi_slot` and `nonempty` warp
+masks for every token owned by that expert.  R198 cached both masks at the
+existing expert-change point and reused them in the per-token source-rank
+selection.  The change was restricted to hidden-4096 local-M16 templates;
+M8/M32 retain their original ballots, and any duplicate source routes still
+take the byte-identical general round-robin fallback.  Token order, source
+metadata, pool addressing, scheduler tasks, math, and the PR411 cross-rank
+protocol were unchanged.  The temporary header SHA256 was
+`98b73b16b73f3ecbdd86cd9bf1da11a7243e5db90b8fc14ecaa9becba6b66522`.
+
+Eight-rank `production.flash_m16` and the PR411 concentrated-routing hotspot
+pass at `diff=0.000654/0.000663`.  The production cubin preserves
+`REG=128`, `STACK=0`, `LOCAL=0`, and `SHARED=1024`.
+
+### One-rank NCU context
+
+The one-rank/32-expert R198/R191/R198 NCU sandwich uses duplicate routes from
+its only source rank, so it validates only the fallback and the cached
+`multi_slot` mask, not the eight-rank nonempty common case:
+
+| metric | R198 first | R191 control | R198 last | candidate change |
+| --- | ---: | ---: | ---: | ---: |
+| duration | 260.896 us | 259.808 us | 261.280 us | +0.419% / +0.567% |
+| elapsed cycles/SM | 427,847 | 429,430 | 430,520 | -0.369% / +0.254% |
+| executed instructions | 58,333,670 | 58,340,293 | 58,346,462 | -0.011% / +0.011% |
+| issued instructions | 58,375,778 | 58,371,848 | 58,376,068 | +0.007% / +0.007% |
+| issue active | 43.731% | 43.567% | 43.460% | +0.377% / -0.246% |
+| barrier samples | 5,349 | 5,322 | 5,376 | +0.507% / +1.015% |
+| short-scoreboard samples | 696 | 647 | 681 | +7.573% / +5.255% |
+| wait samples | 1,924 | 1,862 | 1,900 | +3.330% / +2.041% |
+
+This is effectively a no-op for the fallback and provides no local timing
+mechanism.  As with R84/R85, the candidate was still advanced once to the
+eight-rank production gate because only that topology exercises the intended
+common path.
+
+### Authoritative timing rejection
+
+The eight-rank R191/R198/R191 run used seed zero, cold L2, one warmup, 50
+observations, 20 launches per observation, and maximum-rank medians:
+
+| order | first | middle | last | R198 comparison |
+| --- | ---: | ---: | ---: | --- |
+| R191 / R198 / R191 | 344.326 us | 346.950 us | 327.220 us | R198 is 0.762% and 6.030% slower |
+
+The two controls themselves move by 4.97%, but the candidate is slower than
+both rather than merely landing between them.  It fails the required first
+formal order, so a reverse order, NSYS, and the 43-scenario suite cannot change
+the decision and were not run.  Caching these ballots is not on Flash M16's
+maximum-rank critical path.
+
+The source is fully reverted locally and on the pod to R191 SHA256
+`7abe0773a73b6295226872cd92762732c16a7115b7a08e3cdfa8bea738d0d56d`;
+recovery `production.flash_m16` passes at `diff=0.000654`.  Correctness,
+resources, NCU reports/CSVs, exact sources, recovery, and formal logs are
+archived under `iter617-r198-flash-m16-cached-source-mask-gate` and
+`iter618-r191-r198-r191-flash-m16-formal`.
