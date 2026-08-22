@@ -10881,3 +10881,77 @@ is byte-identical to R180 at
 and recovery `production.pro_m512` passes at `diff=0.000778`.  Exact sources,
 correctness/PTXAS logs, cubins, three NCU reports, recovery output, and hashes
 are archived under `iter586-r184-pro-m512-lds128-row-gate`.
+
+## R185 rejected: share one address across two Pro M512 LDS.64 pairs
+
+### Reason and temporary implementation
+
+R183's two independent `LDS.64` pairs had favorable scoreboard behavior but
+recomputed the scoped packed-row address twice.  R184 computed one address and
+cut 10.53% of instructions with `LDS.128`, but all four results shared one
+scoreboard dependency.  R185 kept two `LDS.64` instructions while computing
+only the first B64-swizzled pair address; toggling shared-address bit three
+with `xor 8` produced the other pair address in the same aligned K32 segment.
+
+The exact routed Pro M512 complete-row path issued both independent loads in
+one inline block, then reused the row exponent lookup and published the same
+two expanded E4M3 segments.  The second logical pair index used the identical
+`pair ^ 2` mapping.  No layout, arithmetic, WGMMA, pipeline, scheduler,
+epilogue, or other specialization changed.
+
+### Correctness and resource gates
+
+Eight-rank `production.pro_m512` passes at `diff=0.001015`.  Production and
+one-rank/48-expert cubins use 125 registers/thread with zero stack, local
+allocation, and spills, one register lower than R183/R184.  The temporary
+header SHA256 is
+`62481a47c149f45ff2e01a168f7d22d34885a55467a8079e46a97013129dc982`.
+
+### Matched NCU mechanism result
+
+The matched one-rank/48-expert order was R185/R180/R185 with seed zero, cold
+L2, lineinfo, identical sections, and the same generated signature:
+
+| metric | R185 first | R180 control | R185 last | candidate range vs control |
+| --- | ---: | ---: | ---: | ---: |
+| elapsed cycles | 3,979,644 | 3,985,568 | 3,976,330 | -0.15% to -0.23% |
+| duration | 2.4186 ms | 2.4300 ms | 2.4166 ms | -0.47% to -0.55% |
+| executed instructions | 496,108,092 | 512,881,240 | 496,127,110 | -3.27% |
+| issued instructions | 496,135,386 | 512,901,480 | 496,142,107 | -3.27% |
+| issue active | 40.03% | 41.36% | 40.03% | -1.33 pp |
+| eligible warps/cycle | 0.499 | 0.521 | 0.500 | about -0.021 |
+| short-scoreboard samples | 5,963 | 5,303 | 5,927 | +11.8% to +12.4% |
+| barrier samples | 64,500 | 63,487 | 64,601 | +1.6% to +1.8% |
+
+Sharing the address reduces registers and instructions, but the opaque
+two-load block still has more short-scoreboard stalls than R180 and saves
+fewer instructions than either R183 or R184.  Its local cycle sign is stable,
+so it was advanced to the same distributed gate rather than rejected by
+subjective effect size.
+
+### Authoritative double-order rejection
+
+Both orders use eight ranks, seed zero, cold L2, one warmup, three
+observations, 20 launches per observation, and maximum-rank median:
+
+| order | first | middle | last | R185 comparison |
+| --- | ---: | ---: | ---: | --- |
+| R180 / R185 / R180 | 2,573 us | 2,536 us | 2,546 us | R185 is 1.44% and 0.39% faster |
+| R185 / R180 / R185 | 2,635 us | 2,581 us | 2,550 us | R185 is 2.09% slower and 1.20% faster |
+
+The reverse order changes sign across its two candidate runs.  R185 therefore
+fails the distributed reproducibility gate despite its small positive local
+NCU result.  Together R183--R185 bound this complete-row LDS family: the best
+local cycle gain is below 0.6%, while Pro M512's three-observation temporal
+movement is multi-percent.  Further variants in this family require a new
+mechanism capable of a materially larger local cycle reduction.
+
+R185 is fully reverted locally and on the pod.  The restored header is
+byte-identical to R180 at
+`cf91f518a72aec9c897b617b565a81031d5fdcdb80f653a85c7bb59baf3d2fd9`,
+and recovery `production.pro_m512` passes at `diff=0.000718`.  Exact sources,
+correctness/PTXAS logs, three NCU reports, both formal orders, recovery output,
+and hashes are archived under
+`iter587-r185-pro-m512-dual-lds64-row-gate`,
+`iter588-r180-r185-r180-pro-m512-formal`, and
+`iter589-r185-r180-r185-pro-m512-reverse-formal`.
