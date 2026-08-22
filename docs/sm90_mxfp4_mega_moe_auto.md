@@ -9996,3 +9996,61 @@ distributed A/B/A timing.  It is fully reverted to byte-identical R152; the
 correctness logs, exact temporary source, production/profile cubins, SASS,
 resource reports, NCU report, source counters, and hashes are archived under
 `iter553-r171-direct-lds64-flash-m16-gate`.
+
+## R172 rejected: compact valid-M8 activation TMA boxes
+
+### Reason and temporary implementation
+
+R161 found that every one of the seed-zero Flash M16 maximum-work rank's 32
+routed blocks has `valid_m<=8`.  R170's M16 activation/SFA descriptors reduced
+one-rank duration by 1.19% but failed the authoritative maximum-rank timing.
+R172 tested whether aligning the descriptor with the actual slow-rank task
+population would strengthen that local mechanism enough to justify another
+distributed run.
+
+The candidate reused R170's already validated shared-expert descriptor slots
+but changed the compact box from M16 to M8 and selected it only for exact
+routed Flash M16 tasks with `valid_m<=8`.  Larger cross-rank tasks retained
+the original M64 descriptors and transaction byte counts.  Weight TMA,
+packed-weight decode/lookahead, stages, WGMMA, scheduler, epilogue, and all
+non-M16 signatures were unchanged.  Both host and device changes were force
+rebuilt so the test could not reuse R152's extension.
+
+Production Flash M16, its all-ranks-to-rank-zero PR411 hotspot, and the
+non-target Flash M64 fallback pass at `diff=0.000654/0.000663/0.000660`.
+The exact eight-rank cubin remains at 128 registers and zero stack/local
+memory; the one-rank 32-expert cubin remains at 118 registers and zero
+stack/local memory.  Production SASS contains no `LDL` or `STL`.
+
+### Frequency-normalized NCU rejection
+
+R172's raw NCU duration appears much lower, but its SM clock boosted to 1.78
+GHz while both controls ran near 1.65 GHz.  Elapsed cycles and stall samples
+remove that false timing signal:
+
+| metric | R152 M64 TMA | R170 M16 TMA | R172 M8 TMA |
+| --- | ---: | ---: | ---: |
+| SM frequency | 1.65 GHz | 1.65 GHz | 1.78 GHz |
+| raw duration | 263.55 us | 260.42 us | 243.30 us |
+| elapsed cycles | 435,365 | 431,405 | 436,141 |
+| issued warps/scheduler | 0.45 | 0.46 | 0.45 |
+| cycles with no eligible warp | 54.87% | 54.04% | 54.79% |
+| warp cycles/issued instruction | 8.65 | 8.58 | 8.64 |
+| warp instructions | 60,241,422 | 60,233,067 | 60,225,028 |
+| thread instructions | 1,874,340,628 | 1,873,598,811 | 1,873,691,307 |
+| sampled total stalls | 16,309 | 16,115 | 16,298 |
+| sampled long-scoreboard stalls | 4,644 | 4,579 | 4,625 |
+| sampled wait stalls | 1,916 | 1,858 | 1,870 |
+
+R172 is `+0.18%` in elapsed cycles versus R152 and `+1.10%` versus R170.
+Its total stalls are effectively identical to R152, and its long-scoreboard
+reduction is only `0.41%`; reducing the activation box below M16 does not
+remove another material TMA wait.  The apparent raw-duration gain is entirely
+clock-rate variation and is not used as evidence.
+
+R172 therefore fails the local mechanism gate and is stopped before NSYS and
+distributed A/B/A timing.  Both source files and the force-built host
+extension are restored to byte-identical R152.  Build logs, three correctness
+gates, temporary source, production/profile cubins, SASS, resources, NCU
+report, source counters, and hashes are archived under
+`iter554-r172-compact-m8-tma-gate`.
