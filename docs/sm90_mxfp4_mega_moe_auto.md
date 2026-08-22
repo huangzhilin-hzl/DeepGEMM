@@ -9474,3 +9474,85 @@ overlapping the x8 decoder itself, not lookahead.  R164 fails the same resource
 gate before hotspot, NCU, NSYS, or timing and is fully reverted.  Source and
 compile/correctness evidence are archived under
 `iter537-r164-flash-m16-serial-lds128-gate`.
+
+## R165 rejected: evict exact Flash M16 routed weights first
+
+R165 audited the mechanisms summarized by the 2026-08-21
+[mainstream MegaMoE progress note](https://github.com/huangzhilin-hzl/julian-lab-notebook/blob/main/megamoe/megamoe-mainstream-pr-progress-20260806.md),
+then compared their actual patches with the current R152 implementation rather
+than transferring reported timings across different datatypes and timing
+scopes.
+
+* sgl-project/DeepGEMM PR 69's interleaved scheduler and fused shared-expert
+  path are already present here.  Its L2 epilogue swizzle, BLOCK_N=256/two-WG
+  widening, and ownership variants overlap rejected R69/R160, R43, and
+  R81/R118-R123 experiments.  In particular, the upstream FP8 H20 result does
+  not remove the MXFP4 decoder and expanded-B resource constraints measured in
+  this branch.
+* FlashInfer PR 4589's packed/folded/hot-folded/dual residency policies require
+  a different checkpoint and serving contract.  Its register-LUT decoder is
+  also not an uncovered primitive: this kernel already keeps the MXFP4 lookup
+  words in registers and issues x8/x16 conversion PTX.  The remaining decode
+  bottleneck is the instruction count and lifetime of expanded values, not a
+  missing global lookup table.
+* DeepGEMM PR 404's routed-weight `EVICT_FIRST` hint is small, isolated, and had
+  not been measured on the SM90 MXFP4 path.  That made it the only direct
+  candidate from the survey that did not repeat a previously rejected
+  topology, scheduler, or decoder experiment.
+
+### Direction and implementation
+
+The hypothesis was that exact DSV4 Flash M16 routed weights are streaming data,
+so promptly evicting their L2 lines might retain activation and workspace lines
+through the interleaved L1/L2 schedule.  R165 temporarily generalized
+`tma::copy` with a compile-time SM90/SM100-compatible cache-hint parameter and
+selected `EVICT_FIRST` only for the packed routed-weight TMA when
+`kHidden == 4096 && kLocalSwapABTokens == 16`.  Shared-expert weights, MXFP4
+scales, activations, and every other M/model specialization retained
+`EVICT_NORMAL`.
+
+This exact compile-time selector also follows the PR411 safety lesson: it does
+not change cross-rank storage bounds or completion protocol based on a rank's
+local M.  Production Flash M16 and the all-ranks-to-rank-zero hotspot pass at
+`diff=0.000654/0.000663`.  The selected cubin remains at 128 registers, zero
+stack, zero spills, and zero local-memory sectors.
+
+### NCU mechanism result
+
+Matched one-rank/32-expert cold-L2 NCU proves that the intended hint reached the
+hardware, but disproves the single-use-line hypothesis:
+
+| metric | R152 | R165 | change |
+| --- | ---: | ---: | ---: |
+| duration | 261.920 us | 262.144 us | +0.09% |
+| DRAM read | 429.242 MB | 451.070 MB | +5.09% |
+| L2 read lookup miss | 4,303,571 | 4,525,583 | +5.16% |
+| evict-first read requests | 12,543 | 8,487,222 | mechanism active |
+| evict-normal read requests | 11,370,477 | 3,086,538 | -72.85% |
+| warp instructions | 60,234,826 | 60,254,601 | +0.03% |
+| thread instructions | 1,874,315,772 | 1,874,385,317 | +0.004% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+
+The routed weight tiles are reused enough across K/N work that evict-first
+turns useful L2 hits into DRAM reads.  Preserving unrelated lines does not
+offset that loss.  The tiny instruction variation comes from dynamic task
+ownership and does not represent added source arithmetic.
+
+### Eight-rank rejection
+
+The authority-aligned R152/R165/R152 sandwich uses DSV4 Flash M16, 50
+observations, 20 launches per observation, one warmup, cold L2, seed zero, and
+maximum-rank median:
+
+| first R152 us | R165 us | change | second R152 us | reverse change |
+| ---: | ---: | ---: | ---: | ---: |
+| 341.082 | 343.5445 | +0.72% | 354.182 | -3.00% |
+
+R165 rank zero is locally faster at 323.1485 us versus 331.2165/337.8175 us,
+but the goal metric is the maximum-rank median.  Its sign changes across the
+two controls, and the first control is a regression.  Combined with NCU's
+5.16% extra L2 misses and 5.09% extra DRAM reads, this fails acceptance and is
+fully reverted.  NSYS was not advanced after the NCU mechanism gate and the
+authority comparison both failed; a timeline capture cannot reverse either
+criterion.  Source, resource/correctness logs, NCU reports/CSV, and the formal
+sandwich are archived under `iter538` through `iter540`.
