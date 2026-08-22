@@ -11288,3 +11288,106 @@ hashes, correctness/resource logs, three NCU reports and CSV exports, both
 formal orders, and recovery output are archived under
 `iter599-r190-flash-m16-prewait-scale-gate` through
 `iter601-r190-r189-r190-flash-m16-reverse-formal`.
+
+## R191 accepted: vector-load and hide the Flash M16 N8 scale pair
+
+### Reason, implementation, and scope
+
+R190 established that the Flash M16 N8 promotion work is independent of the
+in-flight WGMMA group, but its two scalar SFA loads did not survive the
+distributed reverse-order gate.  R191 keeps the same narrow selector and
+changes the load shape as well as the schedule: the exact Flash M16 template
+(`hidden=4096`, local M16 policy, `N_SWAP=8`, fast math) loads the two adjacent
+FP32 activation scales with one aligned `float2`, multiplies each component by
+its unchanged secondary scale, and packs the BF16x2 multiplier before
+`warpgroup_wait`.  The post-wait HFMA2 promotion then consumes the prepared
+pair without repeating those loads or products.
+
+The accepted R189 Pro M8 path uses the same helper condition and is otherwise
+unchanged.  Runtime N16/N32/N64 destinations do not satisfy the selector, so
+the PR411 cross-rank fallback retains its original post-wait scalar loop.  No
+arithmetic value, rounding order, address, decoder instruction, WGMMA, stage
+release, scheduler, epilogue, or non-N8 specialization changes.  The retained
+header SHA256 is
+`7abe0773a73b6295226872cd92762732c16a7115b7a08e3cdfa8bea738d0d56d`.
+
+### Correctness and resource gates
+
+Eight-rank `production.flash_m16` and the concentrated-routing PR411 hotspot
+pass at `diff=0.000654/0.000663`.  The production cubin remains at 128
+registers/thread with `STACK=0` and `LOCAL=0`.  The complete final suite passes
+41/41 scenarios, covering all production Flash/Pro cases, both concentrated
+routing bounds, physical ring wrap, shared experts, mixed protocols, masked
+routes, and the random stress set.
+
+### Matched NCU mechanism
+
+The one-rank R191/R189/R191 capture uses 32 experts, seed zero, cold L2,
+lineinfo, and identical 21-pass sections:
+
+| metric | R191 first | R189 control | R191 last | candidate range vs control |
+| --- | ---: | ---: | ---: | ---: |
+| elapsed cycles | 431,627 | 435,076 | 430,676 | -0.79% to -1.01% |
+| duration | 262.400 us | 264.320 us | 261.280 us | -0.73% to -1.15% |
+| executed instructions | 58,347,000 | 60,247,000 | 58,359,000 | about -3.15% |
+| issue active | 44.50% | 45.53% | 44.31% | -1.03 to -1.22 pp |
+| eligible warps/cycle | 0.602 | 0.621 | 0.600 | -0.019 to -0.021 |
+| warp cycles/issued instruction | 8.84 | 8.65 | 8.87 | +2.2% to +2.5% |
+
+Unlike R189 Pro M8, R191 does not win by improving issue supply.  The
+vectorized load removes enough dynamic instructions to outweigh the lower
+issue activity and the longer per-issued-instruction latency, leaving both
+cycle captures 0.79--1.01% faster.  This distinction is important: the NCU
+evidence supports instruction elimination plus overlap, not a generalized
+scheduler improvement.
+
+### Authoritative R189 double-order timing
+
+Both orders use eight ranks, seed zero, cold L2, one warmup, 50 observations,
+20 launches per observation, and maximum-rank median:
+
+| order | first | middle | last | R191 comparison |
+| --- | ---: | ---: | ---: | --- |
+| R189 / R191 / R189 | 348.494 us | 339.044 us | 350.654 us | R191 is 2.71% and 3.31% faster |
+| R191 / R189 / R191 | 338.141 us | 342.789 us | 339.319 us | R191 is 1.36% and 1.01% faster |
+
+All four maximum-rank comparisons are positive.  The conservative retained
+improvement is 1.01%, while the 1.01--3.31% range is directionally consistent
+with both NCU cycle captures.
+
+### Low-perturbation NSYS qualification
+
+Only rank zero was wrapped by NSYS while ranks 1--7 ran normally.  Two R191
+captures use independent prewarmed JIT caches and report persistent-kernel
+durations of `656.672/631.968 us`; the interleaved R189 control is
+`661.344 us`.  R191 is 0.71% and 4.44% faster, and its two-capture mean is
+2.57% faster than the control.  NSYS therefore agrees in sign with NCU and
+both formal orders despite the expected single-launch variance.
+
+### Fresh PR383 residual
+
+The direct target comparison uses the same seed-zero cold-L2 protocol and the
+user-requested maximum-rank standard.  PR383 reports the sum of its L1 and L2
+phase kernels; R191 reports its fused persistent kernel, so both measurements
+cover their implementation's complete timed kernel path:
+
+| order | first | middle | last | R191 comparison |
+| --- | ---: | ---: | ---: | --- |
+| PR383 / R191 / PR383 | 326.240 us | 349.065 us | 323.064 us | R191 is 7.00% and 8.05% slower |
+| R191 / PR383 / R191 | 341.799 us | 320.860 us | 348.011 us | R191 is 6.53% and 8.46% slower |
+
+Across both orders, the three R191 medians average `346.292 us` and the three
+PR383 medians average `323.388 us`; the remaining direct Flash M16 gap is
+7.08%.  R191 is accepted because it passes every matched R189 gate, not
+because it reaches the target.  The result also supersedes the earlier R180
+matrix's smaller point estimate for this case: the current interleaved target
+run is the fresher and stricter evidence.  The next iteration must attack the
+remaining fused-path latency rather than extending the N8 selector to
+cross-rank N16/N32/N64 templates, which would violate the PR411 bounds and
+does not follow from this local result.
+
+Exact sources, hashes, correctness/resource logs, three NCU reports and CSV
+exports, both R189 formal orders, the complete 41-scenario suite, three valid
+NSYS reports, and both PR383 orders are archived under
+`iter602-r191-flash-m16-vector-prewait-scale-gate` through
+`iter606-r191-vs-pr383-flash-m16`.

@@ -2253,9 +2253,13 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             constexpr bool kVectorProM8ActivationScales =
                                 kHidden == 7168 and
                                 kLocalSwapABTokens == 8;
-                            constexpr bool kPrecomputeProM8ScaleBeforeWait =
+                            constexpr bool kPrecomputeFlashM16ScaleBeforeWait =
+                                kHidden == 4096 and
+                                kLocalSwapABTokens == 16;
+                            constexpr bool kPrecomputeN8ScaleBeforeWait =
                                 kFastMath and
-                                kVectorProM8ActivationScales and
+                                (kVectorProM8ActivationScales or
+                                 kPrecomputeFlashM16ScaleBeforeWait) and
                                 N_SWAP == 8;
                             DG_STATIC_ASSERT(
                                 not kPipelineWeightHalves or
@@ -2367,10 +2371,10 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 const nv_bfloat162
                                     precomputed_scale_pair = [&]() {
                                         if constexpr (
-                                                kPrecomputeProM8ScaleBeforeWait) {
+                                                kPrecomputeN8ScaleBeforeWait) {
                                             DG_STATIC_ASSERT(
                                                 kSwapAccum / 4 == 1,
-                                                "Pro M8 precomputes one scale pair");
+                                                "N8 precomputes one scale pair");
                                             const uint32_t token_0 =
                                                 swap_col_idx * 2;
                                             const uint32_t token_1 = token_0 + 1;
@@ -2416,7 +2420,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                     const uint32_t token_1 = token_0 + 1;
                                     float combined_scale_0, combined_scale_1;
                                     if constexpr (
-                                            not kPrecomputeProM8ScaleBeforeWait) {
+                                            not kPrecomputeN8ScaleBeforeWait) {
                                         float scale_a_0, scale_a_1;
                                         if constexpr (
                                                 kVectorProM8ActivationScales) {
@@ -2500,7 +2504,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                                  kLocalSwapABTokens == 64)) {
                                             const nv_bfloat162 scale_pair = [&]() {
                                                 if constexpr (
-                                                        kPrecomputeProM8ScaleBeforeWait) {
+                                                        kPrecomputeN8ScaleBeforeWait) {
                                                     return precomputed_scale_pair;
                                                 } else {
                                                     return __floats2bfloat162_rn(
