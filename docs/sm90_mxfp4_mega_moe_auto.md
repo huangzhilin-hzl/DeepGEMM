@@ -9746,3 +9746,88 @@ runtime machine code, and is fully reverted to R152.  Correctness/resource
 evidence is archived under `iter545-r167-flash-m16-x16-gate`; NCU reports,
 raw CSV, cubin resource output, complete SASS, hashes, and opcode diagnostics
 are under `iter546-r167-flash-m16-ncu`.
+
+## FlashMoE audit and Flash M16 dispatch-lifetime trace
+
+FlashMoE's reusable idea is time-shifting workers rather than its arithmetic.
+Its public CUDA implementation targets FP16/BF16/FP32/FP64 through cuBLASDx;
+FP8 and lower precision remain roadmap items.  It launches a dedicated
+on-device-scheduler CTA and generic processor CTAs, then lets a processor CTA
+execute GEMM0, GEMM1, or combine work after its initial dispatch duty.  That
+one-CTA-per-SM queue topology cannot replace the retained Humming kernel's two
+independent CTAs per H20 SM: R43 already measured a 194--197% profiler
+regression after collapsing the same aggregate work into one CTA.  The narrow
+question worth testing was instead whether this kernel's 64 dispatch threads
+become idle early enough to assist the unchanged 128-thread math warpgroup.
+
+A temporary `%globaltimer` probe used ten 64-bit slots in the workspace's
+documented 44--127-byte padding.  It added no argument or SMEM allocation and
+was selected only for eight-rank DSV4 Flash M16.  Across all CTAs on each rank,
+it recorded earliest pull start, earliest/latest dispatch-pull completion,
+earliest/latest local GEMM-task-loop completion, the post-GEMM NVLink
+rendezvous, and combine completion.  The probe ran exactly one production
+seed-zero launch and was then fully removed.  Times below are microseconds
+relative to that rank's earliest pull start:
+
+| rank | earliest dispatch done | latest dispatch done | earliest math loop done | latest math loop done | idle-before-math-tail window |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 2.080 | 213.312 | 335.168 | 350.176 | 121.632 |
+| 1 | 2.016 | 136.928 | 235.712 | 247.680 | 98.592 |
+| 2 | 2.112 | 154.080 | 274.592 | 291.456 | 120.320 |
+| 3 | 2.080 | 172.384 | 291.424 | 311.744 | 118.816 |
+| 4 | 2.080 | 187.488 | 293.696 | 310.496 | 105.984 |
+| 5 | 2.080 | 158.560 | 279.872 | 297.760 | 121.120 |
+| 6 | 2.144 | 164.384 | 284.448 | 305.344 | 119.872 |
+| 7 | 1.952 | 163.520 | 281.536 | 292.896 | 117.824 |
+
+The final dispatch warp therefore becomes idle 98.6--121.6 us before even the
+first CTA on that rank exits its task loop.  Atomic timestamp contention makes
+the absolute probed kernel longer than the uninstrumented benchmark, but all
+eight independent ranks preserve a large same-order window.  This justified
+one resource-gated source experiment; it did not by itself predict a speedup.
+The raw per-rank timestamps are archived under
+`iter547-flash-m16-phase-trace`.
+
+## R168 rejected: reuse idle Flash M16 dispatch warps for packed-B decode
+
+### Reason and temporary implementation
+
+R168 preserved 156 CTAs, two resident CTAs per physical H20 SM, the two A/B
+TMA producer warps, and the 128-thread WGMMA owner.  Only eight-rank routed
+Flash M16 compiled the experiment.  After both dispatch warps completed token
+pull, a ready mbarrier made them available as decoders without making them
+consume the scheduler's already-live task mailbox.  The math warpgroup kept
+R152's decoder until that ready barrier completed.  For later packed stages it
+waited on the unchanged TMA full barrier, published `(pipeline stage,
+expanded slot)` through a separate job barrier, and waited for a done barrier.
+The 64 dispatch threads each decoded two B rows serially into the unchanged
+ping-pong expanded-B address.  A stop job returned them to the original final
+dispatch/epilogue rendezvous.  The producer warps never decoded or waited on
+the new job, which isolates this direction from R44's producer-critical-path
+failure.
+
+### Resource and correctness rejection
+
+The first production Flash M16 gate reached the routed ring-wrap launch but
+failed with an illegal memory access before numerical comparison.  More
+importantly, the exact generated eight-rank cubin already fails the
+predeclared resource gate:
+
+| resource | R152 | R168 |
+| --- | ---: | ---: |
+| registers/thread | 128 | 128 |
+| stack frame | 0 B | 96 B |
+| static shared | 1,024 B | 1,024 B |
+| explicit local allocation | 0 B | 0 B |
+
+The 96-byte stack appears before any attempt to diagnose the illegal access
+and repeats R44's structural result: adding a two-row frontend decoder and a
+persistent job loop exceeds the compact 48-register dispatch role even when
+TMA issue remains separate.  Fixing the address or handshake cannot make this
+version eligible for performance testing without first removing its stack
+frame, and R44's lower-live-range variants already showed that serializing the
+same decoder does not provide that route cheaply.  R168 is therefore stopped
+at resource/correctness, with no NCU, NSYS, or distributed A/B timing, and is
+fully reverted to byte-identical R152.  The failing log, generated kernel,
+cubin, source snapshots, resource report, and hashes are archived under
+`iter548-r168-dispatch-decode-gate`.
