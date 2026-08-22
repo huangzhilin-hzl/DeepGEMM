@@ -11391,3 +11391,50 @@ exports, both R189 formal orders, the complete 41-scenario suite, three valid
 NSYS reports, and both PR383 orders are archived under
 `iter602-r191-flash-m16-vector-prewait-scale-gate` through
 `iter606-r191-vs-pr383-flash-m16`.
+
+## R191 final PR383 full-matrix sandwich
+
+After accepting R191, the complete user-requested DSV4 Flash/Pro matrix was
+rerun in a PR383/R191/PR383 order on the same eight-H20 pod.  All three runs
+use seed zero, cold L2, one warmup, 20 launches per observation, 50
+observations for M8--M128, three observations for M256--M8192, and
+maximum-rank median.  The table compares R191 with the arithmetic mean of its
+two surrounding controls; negative percentages mean R191 is faster:
+
+| model | M | PR383 first | R191 | PR383 second | R191 vs control mean |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash | 8 | 303.539 us | 292.856 us | 291.936 us | -1.64% |
+| Flash | 16 | 312.930 us | 321.080 us | 310.823 us | +2.95% |
+| Flash | 32 | 327.930 us | 329.054 us | 333.203 us | -0.46% |
+| Flash | 64 | 371.983 us | 357.402 us | 377.562 us | -4.64% |
+| Flash | 128 | 436.328 us | 410.047 us | 430.521 us | -5.39% |
+| Flash | 256 | 509.870 us | 510.124 us | 502.454 us | +0.78% |
+| Flash | 512 | 924.180 us | 947.267 us | 935.093 us | +1.90% |
+| Flash | 1024 | 1543.898 us | 1483.000 us | 1529.957 us | -3.51% |
+| Flash | 2048 | 2705.489 us | 2729.000 us | 2708.655 us | +0.81% |
+| Flash | 4096 | 5098.000 us | 5114.000 us | 5101.000 us | +0.28% |
+| Flash | 8192 | 9834.000 us | 9895.000 us | 9840.000 us | +0.59% |
+| Pro | 8 | 710.111 us | 720.962 us | 708.849 us | +1.62% |
+| Pro | 16 | 1003.394 us | 933.708 us | 1009.356 us | -7.22% |
+| Pro | 32 | 1088.557 us | 996.716 us | 1111.956 us | -9.41% |
+| Pro | 64 | 1154.178 us | 1022.500 us | 1167.024 us | -11.90% |
+| Pro | 128 | 1260.163 us | 1177.000 us | 1262.059 us | -6.67% |
+| Pro | 256 | 1643.907 us | 1638.000 us | 1622.907 us | +0.28% |
+| Pro | 512 | 2445.275 us | 2516.000 us | 2392.135 us | +4.02% |
+| Pro | 1024 | 4081.000 us | 3939.000 us | 3997.000 us | -2.48% |
+| Pro | 2048 | 7016.000 us | 6884.000 us | 7015.000 us | -1.87% |
+| Pro | 4096 | 12911.000 us | 12978.000 us | 12898.000 us | +0.57% |
+| Pro | 8192 | 25100.000 us | 25290.000 us | 24979.000 us | +1.00% |
+
+R191's geometric-mean latency is 0.7904% lower for Flash and 3.0397% lower
+for Pro; across all 22 points it is 1.9215% lower than the surrounding PR383
+mean.  This is an aggregate lead, not the theoretical limit.  The largest
+double-positive residuals are Pro M512 (+4.02%), Flash M16 (+2.95%), Flash
+M512 (+1.90%), Pro M8 (+1.62%), and Pro M8192 (+1.00%).  Pro M512 is the next
+primary target because it has the largest relative and absolute deficit, but
+R183--R185 show that another complete-row LDS reshaping is insufficient: the
+next candidate needs a mechanism that reduces critical cycles by more than
+the roughly 0.5% achieved by that rejected family.
+
+The three raw JSON logs are archived remotely and in a fresh local snapshot
+under `iter607-pr383-r191-pr383-full-matrix`.
