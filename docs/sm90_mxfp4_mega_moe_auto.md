@@ -12794,3 +12794,82 @@ This closes source-level stage-release motion for both FP32 and packed-FP16
 accumulation.  Reducing R207's barrier penalty requires changing a real
 producer/consumer dependency or the amount of work before the barrier, not
 moving the arrival around register-only code that ptxas already reorders.
+
+## Rejected experiment R215: bulk-TMA Pro M512 weight-scale staging
+
+### Motivation and implementation
+
+R203's Pro M512 B producer executes one coalesced 16-byte global load and one
+shared store per lane for every 512-byte MXFP4 weight-scale stage.  R166 had
+shown that replacing the analogous lane-copy path with one 512-byte bulk TMA
+substantially reduces memory instructions, but that experiment covered only
+Flash M16.  Pro M512 has more K stages and is the remaining stable distributed
+loss, so R215 retested the mechanism only for that exact specialization.
+
+The compile-time selector required routed MXFP4, `H=7168`, non-swap-AB,
+bank-permuted pair loads, no L2 C/D swizzle, and no shared experts.  Under the
+retained heuristic this selects Pro M512 but not M256 or M1024+.  One elected
+producer lane issued `tma_load_1d` for the contiguous 512-byte scale tile and
+added those bytes to the existing B transaction barrier's expected count;
+the other 31 lane loads, stores, and their producer `__syncwarp()` were
+removed.  The sparse/normal dispatch completion protocol, worker count, ring
+bounds, and every rank-visible selector were unchanged, so the critical PR411
+cross-rank quorum constraints remain satisfied.
+
+The original R215 main-header SHA-256 was
+`9a72332f7f4be36e08405aeb1f342d073264a9854f5b2d9e527deacf24660652`.
+After the control-plane interruption, the same semantic patch was reconstructed
+with header SHA-256
+`df71a415e40ea2794fcb1326007839e4075ebfb2addf35fd694fd0b4d250bd93`.
+The first and reconstructed last cubins have different file hashes because the
+JIT input hash and metadata changed, but their complete normalized SASS output
+is byte-identical at SHA-256
+`6fae0b2f4cdc09237f0ef06dd31abcd7e27fc1c57839631bb912ba9c2837a583`.
+This verifies that the resumed last bracket executes the same candidate.
+
+### Correctness, resources, and matched NCU result
+
+The eight-rank production Pro M512 gate passed at `diff=0.000708`.  The
+candidate cubin used 125 logical registers (128 allocated) and no local-memory
+spill.  The formal R215/R203/R215 NCU sandwich used one H20, one rank, 48
+experts, Pro M512, capacity 8192, seed zero, cold L2, and application replay.
+All three reports used seven replay passes and the same 156-CTA kernel.
+
+| Metric | R215 first | R203 control | R215 last | Candidate change |
+| --- | ---: | ---: | ---: | ---: |
+| Duration | 2.422368 ms | 2.430592 ms | 2.433952 ms | -0.338% / +0.138% |
+| GPC elapsed cycles | 3,994,407 | 4,001,211 | 4,006,318 | -0.170% / +0.128% |
+| Average SM active cycles | 3,979,731 | 3,979,953 | 3,985,374 | -0.006% / +0.136% |
+| Executed SM instructions | 510,779,837 | 512,852,813 | 510,780,570 | -0.404% / -0.404% |
+| Executed thread instructions | 16,541,331,175 | 16,753,856,443 | 16,541,669,167 | -1.269% / -1.267% |
+| LSU global-load sectors | 359,611 | 4,873,541 | 359,894 | -92.621% / -92.615% |
+| Shared-memory wavefronts | 116,768,660 | 117,897,620 | 116,768,660 | -0.958% / -0.958% |
+| Warp cycles per instruction | 9.671 | 9.637 | 9.686 | +0.353% / +0.506% |
+| Barrier stall samples | 63,758 | 63,315 | 64,058 | +0.700% / +1.174% |
+| Long-scoreboard samples | 39,158 | 39,450 | 39,347 | -0.740% / -0.261% |
+| Short-scoreboard samples | 4,847 | 5,286 | 4,926 | -8.305% / -6.810% |
+| Wait samples | 16,190 | 15,854 | 15,929 | +2.119% / +0.473% |
+
+The bulk transfer eliminates almost all lane-level global-load sectors and
+reduces thread instructions by 1.27%, but DRAM traffic is unchanged.  The
+saved issue work therefore does not address the dominant dependency chain.
+Adding the scale bytes to the transaction barrier raises warp latency and
+barrier samples; active/GPC cycles and duration are statistically neutral,
+with the two duration brackets straddling zero and far below the 1.5% isolated
+gate required before distributed timing.
+
+### Decision and updated direction
+
+R215 was rejected at the isolated NCU gate and fully reverted to R203.  No
+eight-rank formal timing or NSYS improvement is claimed: identical SASS and
+independent hardware-cycle counters already show that the candidate only
+trades lane issue work for barrier latency.  The correctness/resource gate is
+stored under `iter658-r215-pro-m512-bulk-sfb-gate`; the three NCU reports,
+raw CSVs, source hashes, JIT cubins, and logs are under
+`iter659-r215-r203-r215-pro-m512-bulk-sfb-ncu`.
+
+R215 closes bulk-TMA staging of the 512-byte Pro M512 SFB tile.  A useful next
+change must shorten the routed block's true critical path rather than merely
+reduce producer instruction count: in particular, avoid adding another
+transaction-barrier dependency, preserve 156 workers, and remain independent
+of rank-local token counts as required by PR411.
