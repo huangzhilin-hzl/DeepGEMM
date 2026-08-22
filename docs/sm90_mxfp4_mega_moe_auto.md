@@ -13020,3 +13020,84 @@ kernel.  The heavy-rank tail remains the right diagnosis, but addressing it
 requires a representation with one numerical/accumulator contract or a
 separate rank-consistent kernel phase; compiling both orientations into the
 same CTA path is neither numerically compatible nor spill-free.
+
+## Rejected experiment R218: direct packed-BF16 regular L2 epilogue
+
+### Reason and direction
+
+R203's regular MXFP4 mainloop finishes every routed task in 32 packed BF16x2
+values.  It then expands those values to 64 FP32 registers; regular L2 packs
+the same exact values back to BF16 before the C/D shared-memory store.  R218
+tested whether removing this BF16-to-FP32-to-BF16 round trip could reduce the
+fixed work per routed Pro M512 block identified by R156.  The generated-source
+selector was exact for routed hidden-7168 M512.  L1 SwiGLU, every other final
+matrix point, scheduler ordering, ring bounds, dispatch/combine protocols, and
+all PR411 cross-rank quorum decisions were unchanged.
+
+Six executable refinements were screened.  R218a-c used predicated scalar
+32-bit stores in the original epilogue position and successively removed an
+address-taken BF16 temporary plus a nested row/column lambda.  R218d wrote the
+same scalar pairs immediately after the expanded-B/C-D alias changed lifetime.
+R218e used the previously validated row-major M64xN128 STSM atom mapping, and
+R218f inlined `stmatrix.sync.aligned.x2.m8n8.shared.b16` to remove the generic
+helper's two-element source array.  Every variant passed the eight-rank
+production Pro M512 gate at `diff=0.000708`.
+
+### Resource result and compiler cause
+
+All six variants compile at 128 registers/thread, 1024 bytes static shared
+memory, and zero reported local allocation, but every cubin has a 16-byte
+stack frame.  R218a-d execute 12 static `LDL`/`STL` sites; STSM reduces that
+to nine in R218e-f but does not remove the frame.  SASS attribution shows that
+the frame is not the BF16 value bit-cast: three lane-dependent packed-B
+decoder address/XOR values are stored at entry and reloaded in the routed L1
+and L2 decoder paths.  Keeping the packed result live until the direct store
+raises the existing 128-register peak just enough to evict those values.
+Moving the store to the expanded-B lifetime boundary and directly inlining
+STSM do not recover the three registers.
+
+The final header hashes were
+`5f2774cb36942eed61348e478ca8d7525654abdc99cbff89d14638c299e042f9`
+for the first scalar prototype,
+`6395efd12f99d910d1b8fb31e3cd9b4930e5097894441d2bcf20aa5c075eacd7`
+for the flattened scalar store, and
+`77f9c8829235d688e17813f047ccd9ad59cd41205a23ae36d92a3c7d8783f6d3`
+for the final inline-STSM variant.  The final scalar and STSM cubins are
+`b05acf5b88e479ed6246c6ee0e06bcbbe218f43c37b687026344db222523fd9a`
+and `3c0d773ef16acf1ddbcfab3c8e93e7ab13a766b7ebc260a1aa85db42bd093afa`.
+
+### Formal performance and decision
+
+The recovered R203 control was rebuilt after the control-plane outage and
+passed production Pro M512 at `diff=0.000712`.  Its authoritative eight-rank,
+seed-zero, one-warmup, 15-observation, 20-launch, cold-L2 result was max-rank
+`2553 us` and rank-zero `2542 us`.  Both representative R218 cubins used the
+same fixed route (`78` M64 blocks on the heaviest rank and `62` on the
+lightest) and the identical formal timing protocol:
+
+| variant | C/D publication | max-rank median | change vs R203 | rank-zero median | change vs R203 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| R203 | expand FP32, pack scalar BF16 | 2553 us | control | 2542 us | control |
+| R218c | direct packed scalar stores | 2611 us | +2.27% | 2600 us | +2.28% |
+| R218f | direct packed inline STSM | 2620 us | +2.62% | 2612 us | +2.75% |
+
+The scalar result rules out full-atom over-store as the sole explanation; the
+STSM result additionally shows that reducing store instructions does not
+repair the critical path.  The removed conversion round trip is not dominant,
+while extending the packed fragment into epilogue addressing spills the
+already register-saturated decoder.  R218 is rejected before NCU/NSYS because
+both representative variants fail the zero-stack resource gate and regress
+the authoritative distributed metric by more than two percent.  Running
+multi-pass profiling on a rejected spilled cubin would not justify a
+production optimization claim.
+
+The source was restored byte-for-byte to R203: main header
+`80237849c5870eea3e8af0fb74efb9a207d40fecce9a7d0346408f90c9df8b1e`,
+MMA helper
+`548fe0c63d7f36527a3d2b87d5ee8f1330c6fb5cc98bec1bc4bd9e20735482ff`,
+and WGMMA helper
+`dad341b3c4d2a1ea3a68c6028b454c72c6ce6105e86dfcdea6aaef243164ec1b`.
+Correctness, resource reports, hashes, the excluded reversed-count smoke run,
+the valid R203 15x20 recovery baseline, and both R218 15x20 timing logs are
+archived under `iter664-r203-resume-baseline` and
+`iter665-r218-pro-m512-packed-regular-l2` on the H20 pod.
