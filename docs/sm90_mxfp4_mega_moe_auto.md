@@ -11925,3 +11925,78 @@ recovery `production.pro_m512` passes at `diff=0.000904`.  The initial alignment
 failure, corrected sources, correctness/resources, three NCU reports/CSVs,
 distributed timing logs, hashes, and recovery evidence are archived under
 `iter620-r200-pro-m512-dedicated-scheduler-gate`.
+
+## R201 rejected: row-XOR the Pro M512 L2 C/D tile
+
+### Direction and temporary implementation
+
+The next topology audit did not reopen sgl-project PR69's BLOCK_N256/two-WG
+schedule.  R43 had already tested the same 384-thread, one-CTA-per-SM shape on
+H20: dynamic instructions changed only 0.53%, but NCU and NSYS regressed by
+about 197% and 194% after two independently resident WGMMA owners collapsed
+into one CTA.  R201 therefore retained the accepted 256-thread CTA and two
+resident CTAs per SM.
+
+R159 attributed roughly 8.8 million shared-store conflicts in Pro M512 to the
+regular L2 BF16 C/D epilogue.  R69's generic B128 mapping used
+`Swizzle<3,4,3>` and mixed the high column bit with two row bits; it reduced
+replay but did not produce stable distributed timing.  R201 tested a narrower
+address permutation only for exact routed Pro M512.  `Swizzle<3,4,4>` XORs
+three complete row bits into the three 16-byte segment bits.  The low four
+address bits stay unchanged, so every vectorized scatter load remains aligned
+and contiguous; the mapping is involutive and the logical BF16 values and
+remote output addresses are unchanged.  The PR411 cross-rank storage bound,
+wire completion protocol, scheduler, WGMMA, decoder, and all other matrix
+points were untouched.  The temporary header SHA256 was
+`e970d3f96968c0dabc60c5a4f20010a9359589fada61485d9415d6b73448f8e7`.
+
+Eight-rank `production.pro_m512` passes at `diff=0.000708`.  The production
+cubin remains at `REG=128`, `STACK=0`, `LOCAL=0`, and `SHARED=1024`.
+
+### Matched NCU mechanism result
+
+The matched one-rank/48-expert order was R201/R191/R201 with seed zero, cold
+L2, and identical 39-pass full NCU sections.  Percentages compare each
+candidate capture with the middle control:
+
+| metric | R201 first | R191 control | R201 last | candidate change |
+| --- | ---: | ---: | ---: | ---: |
+| duration | 2.426944 ms | 2.418656 ms | 2.416320 ms | +0.343% / -0.097% |
+| elapsed cycles/SM | 310,279,512 | 310,850,510 | 309,957,606 | -0.184% / -0.287% |
+| executed instructions | 515,777,687 | 512,857,647 | 515,761,644 | +0.569% / +0.566% |
+| issued instructions | 515,806,159 | 512,929,152 | 515,784,673 | +0.561% / +0.557% |
+| issue active | 41.650% | 41.353% | 41.676% | +0.297 / +0.323 pp |
+| eligible warps/cycle | 0.527 | 0.521 | 0.528 | +1.25% / +1.50% |
+| short-scoreboard samples | 4,949 | 5,244 | 4,975 | -5.63% / -5.13% |
+| long-scoreboard samples | 39,256 | 39,645 | 39,219 | -0.98% / -1.07% |
+| barrier samples | 63,495 | 63,420 | 63,208 | +0.12% / -0.33% |
+| shared-load conflicts | 122,201 | 126,208 | 119,463 | -3.17% / -5.34% |
+| shared-store conflicts | 6,869,560 | 8,866,263 | 6,790,141 | -22.52% / -23.42% |
+
+The intended local mechanism is real: row-XOR removes about two million
+shared-store conflicts, reduces both scoreboard classes, and lowers elapsed
+cycles on both sides.  The address permutation costs about 0.57% more dynamic
+instructions, however, and the net local cycle gain remains below 0.3%.
+
+### Authoritative timing rejection
+
+The first eight-rank formal order used seed zero, cold L2, one warmup, three
+observations, 20 launches per observation, and maximum-rank medians:
+
+| order | first | middle | last | R201 comparison |
+| --- | ---: | ---: | ---: | --- |
+| R191 / R201 / R191 | 2,550 us | 2,585 us | 2,565 us | R201 is 1.373% and 0.780% slower |
+
+R201 loses to both controls, so the sub-0.3% isolated cycle benefit does not
+survive the distributed production path.  This rejects the uncovered
+three-row-bit mapping and reinforces R69/R160's result: removing L2 C/D replay
+alone is not large enough to control Pro M512's route-imbalanced tail.  The
+reverse formal order, NSYS, and 43-scenario suite were not run after the first
+authoritative order failed.
+
+The device source is restored locally and on the pod to R191 SHA256
+`7abe0773a73b6295226872cd92762732c16a7115b7a08e3cdfa8bea738d0d56d`;
+recovery `production.pro_m512` passes at `diff=0.000715`.  Exact sources,
+correctness/resources, three NCU reports/CSVs, formal logs, hashes, and
+recovery evidence are archived under
+`iter621-r201-pro-m512-row-xor-cd-gate`.
