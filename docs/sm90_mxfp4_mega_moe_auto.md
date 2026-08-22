@@ -10826,3 +10826,58 @@ orders, recovery output, and hashes are archived under
 `iter583-r183-pro-m512-staggered-row-decode-gate`,
 `iter584-r180-r183-r180-pro-m512-formal`, and
 `iter585-r183-r180-r183-pro-m512-reverse-formal`.
+
+## R184 rejected: one LDS.128 per Pro M512 packed K32 row
+
+### Reason and temporary implementation
+
+R183 retained two scoped-address `LDS.64` operations per complete K32 row.
+Flash M16's analogous wide load had previously spilled, but R183's Pro M512
+specialization used only 126 registers.  R184 tested whether that two-register
+headroom allowed exact routed Pro M512 to load all four aligned packed words
+with one `LDS.128`, remove one scoped-address calculation/load sequence, and
+approach R127b's full 16% instruction reduction without its compiler frame.
+
+The selected path loaded one 16-byte B64-swizzled K32 segment, reused the
+row-owned exponent lookup, decoded its four words, and published the same two
+16-byte expanded E4M3 segments.  It changed no address set, values, WGMMA,
+pipeline, scheduler, epilogue, or other specialization.
+
+### Correctness and resource gates
+
+Eight-rank `production.pro_m512` passes at `diff=0.000709`.  Production and
+one-rank/48-expert cubins both use 126 registers/thread with zero stack,
+local allocation, and spills.  Unlike Flash M16, Pro's spare registers are
+enough to keep the four `LDS.128` outputs resident.  The temporary header
+SHA256 is
+`d1e9ca4e989723738868698ae38e7ad97afc6c862faf61608a8bd69bcc8caa22`.
+
+### Matched NCU rejection
+
+The matched one-rank/48-expert NCU order was R184/R180/R184 with seed zero,
+cold L2, lineinfo, and identical sections/signatures:
+
+| metric | R184 first | R180 control | R184 last | candidate range vs control |
+| --- | ---: | ---: | ---: | ---: |
+| elapsed cycles | 3,981,277 | 3,979,774 | 3,982,145 | +0.04% to +0.06% |
+| duration | 2.4283 ms | 2.4187 ms | 2.4197 ms | +0.04% to +0.40% |
+| executed instructions | 458,858,863 | 512,874,469 | 458,852,876 | -10.53% |
+| issued instructions | 458,875,254 | 512,915,793 | 458,881,663 | -10.53% |
+| issue active | 37.00% | 41.33% | 37.00% | -4.33 pp |
+| eligible warps/cycle | 0.458 | 0.520 | 0.458 | -0.062 |
+| short-scoreboard samples | 7,898 | 5,218 | 7,710 | +47.8% to +51.4% |
+| barrier samples | 64,512 | 63,505 | 64,338 | +1.3% to +1.6% |
+
+The wide row reaches the intended 10.53% instruction reduction, twice R183's
+saving, but serializes all four packed words behind one shared-load result.
+The 48--51% short-scoreboard increase and lower eligible-warp supply consume
+the entire instruction benefit; both candidate captures use more elapsed
+cycles than R180.  R184 therefore fails the local NCU mechanism gate and is
+not advanced to formal timing, NSYS, or the full matrix.
+
+The candidate is fully reverted locally and on the pod.  The restored header
+is byte-identical to R180 at
+`cf91f518a72aec9c897b617b565a81031d5fdcdb80f653a85c7bb59baf3d2fd9`,
+and recovery `production.pro_m512` passes at `diff=0.000778`.  Exact sources,
+correctness/PTXAS logs, cubins, three NCU reports, recovery output, and hashes
+are archived under `iter586-r184-pro-m512-lds128-row-gate`.
