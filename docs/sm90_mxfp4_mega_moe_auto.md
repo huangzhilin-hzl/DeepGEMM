@@ -12653,3 +12653,92 @@ that phase-local packed accumulation is not a resource-saving compromise.
 These decoder and phase-split families are closed.  The retained source remains
 R203, and the next experiment will change the rank-consistent launch geometry
 while keeping the proven ring allocation and PR411 completion protocol intact.
+
+## Rejected experiment R213: 152-worker Pro cooperative grid
+
+### Motivation, safety constraints, and implementation
+
+R213 tested whether Pro M512's residual loss came from launching more logical
+workers than its scheduler tail could use efficiently.  H20 exposes 78 physical
+SMs and R203 launches 156 cooperative worker CTAs.  The candidate removed four
+workers, producing a 152-CTA grid, while leaving the persistent kernel,
+dispatch/combine protocol, arithmetic, shared-memory allocation, and task
+schedule unchanged.
+
+This experiment incorporated the critical PR411 constraint before changing the
+grid.  Worker count is part of the compile-time completion quorum, so it must
+not be selected from rank-local `num_tokens`: uneven input ranks could otherwise
+generate different quorums and deadlock.  The prototype selected the shorter
+grid only from H/I, local-expert count, shared-expert count, and rank count,
+which are identical across ranks.  The single-rank NCU surrogate and the
+eight-rank production launch both represented 48 experts per rank and therefore
+generated the same 152-worker specialization.
+
+The live-ring bound was also recomputed at maximum production capacity rather
+than assumed.  For Pro (`M_capacity=8192`, eight ranks, top-k six, 48 local
+experts), there are at most 6,192 logical pool blocks, 48 Linear1 N clusters,
+and 56 Linear2 N clusters.  Both 156 and 152 workers require the same
+conservative 896-block live ring:
+
+| Workers | Live blocks after warmup | Frontier growth | Wave margin | Ring bound |
+| ---: | ---: | ---: | ---: | ---: |
+| 156 | 7 | 885 | 4 | 896 |
+| 152 | 7 | 885 | 4 | 896 |
+
+Allocation continued to use the full 156-worker bound, and the prototype added
+a host assertion that the allocated ring covered the selected grid's computed
+requirement.  The launch preflight still required two resident CTAs per
+physical SM and checked the exact cooperative grid against kernel occupancy.
+
+The production eight-rank Pro M512 gate passed at `diff=0.000819`; the
+single-rank profiler specialization also passed its warmup.  Both cubins used
+128 registers, zero stack, and zero local memory.  Cuobjdump confirmed
+`kNumSMs=152` in both the eight-rank E384 and one-rank E48 symbols.
+
+### Matched NCU result
+
+The formal R213/R203/R213 sandwich used one H20, one rank, 48 experts, Pro
+M512, seed zero, cold L2, and Nsight Compute's current 39-pass `full`
+application-replay set.  The middle control disabled only the short-grid
+selector; the host safety checks and kernel source remained identical.  Every
+report's generated symbol was inspected to verify the 152/156/152 order.
+
+| Metric | R213 first (152) | R203 control (156) | R213 last (152) | Candidate change |
+| --- | ---: | ---: | ---: | ---: |
+| Duration | 2.478944 ms | 2.447200 ms | 2.465440 ms | +1.30% / +0.75% |
+| GPC elapsed cycles | 4,062,084 | 4,007,605 | 4,057,864 | +1.36% / +1.25% |
+| Average SM active cycles | 4,037,153 | 3,983,216 | 4,038,863 | +1.35% / +1.40% |
+| Executed SM instructions | 512,916,109 | 512,872,464 | 512,921,442 | +0.009% / +0.010% |
+| Warp cycles per instruction | 9.515 | 9.636 | 9.512 | -1.26% / -1.29% |
+| Barrier stall samples | 63,328 | 63,384 | 63,889 | -0.09% / +0.80% |
+| Long-scoreboard samples | 39,873 | 39,529 | 40,051 | +0.87% / +1.32% |
+| Short-scoreboard samples | 5,571 | 5,371 | 5,611 | +3.72% / +4.47% |
+| Wait samples | 16,564 | 15,593 | 16,521 | +6.23% / +5.95% |
+
+The instruction stream is effectively unchanged, and the shorter grid slightly
+improves per-instruction latency.  It does not reduce the barrier tail: one
+bracket is neutral and the other is worse.  Instead, fewer workers increase
+both scoreboard classes and wait samples, raising active/GPC cycles by at least
+1.25% on both sides.  Duration agrees after accounting for clock variation.
+
+An earlier capture in the same artifact directory is explicitly named
+`r213-first-invalid156`: it was taken before rebuilding the host extension and
+its report symbol proved that the old 156-worker heuristic was still loaded.
+It is retained only as a build-chain diagnostic and is excluded from the table.
+
+### Decision and updated direction
+
+R213 was rejected at the isolated NCU gate.  No distributed formal timing or
+NSYS result is claimed because both duration brackets regress and hardware
+cycles independently confirm the loss.  The candidate was reverted completely,
+including its host-only safety plumbing, and the pod extension was rebuilt for
+R203's 156-worker grid.  Correctness, build logs, source hashes, the invalid
+diagnostic, and the three official NCU reports/CSVs are stored under
+`iter655-r213-pro-grid152-gate` and
+`iter656-r213-r203-r213-pro-grid152-ncu`.
+
+R213 closes reducing the Pro grid below the two-CTA-per-SM maximum: the current
+workload has enough independent tasks that scheduler parallelism is still more
+valuable than a smaller cooperative quorum.  Future scheduler work must keep
+156 workers and reduce work or synchronization inside each task/wave, while
+remaining independent of rank-local token count.
