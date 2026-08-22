@@ -11675,3 +11675,55 @@ recovery M256/M512 passes at `diff=0.000663/0.000662`.  Candidate/control
 sources, correctness and resources, all three NCU reports/CSVs, and recovery
 logs are archived under
 `iter615-r196-flash-m256-m512-scoped-full-row-gate`.
+
+## R197 rejected: pipeline packed Flash M16 weight halves
+
+### Reason and implementation
+
+Flash M16's packed-BF16 path still reused one compact WGMMA fragment
+sequentially for its two N64 weight halves.  The retained Pro schedule instead
+uses two commit groups, waits with `wait<1>`, promotes half zero while half one
+is in flight, and finishes with `wait<0>`.  R197 enabled that existing
+two-fragment schedule only for hidden-4096, local-M16 packed-BF16 templates
+when `2 * kSwapAccum` fits the unchanged 32-float allocation.  The runtime N64
+fallback cannot fit two fragments and therefore remains sequential, preserving
+the PR411 concentrated-routing bound.  Arithmetic, rounding, addresses,
+decoder, WGMMA operations, stage release, scheduler, and epilogue were
+unchanged.  The temporary header SHA256 was
+`e7fa3e0b6ecabdff8a53c6c755c232f9f793894a19b43983b3fbc9baf01cfa55`.
+
+Eight-rank `production.flash_m16` and the PR411 concentrated-routing hotspot
+pass at `diff=0.000654/0.000663`.  The production cubin preserves
+`REG=128`, `STACK=0`, `LOCAL=0`, and `SHARED=1024`.
+
+### NCU rejection
+
+Matched one-rank/32-expert Flash M16 used an R197/R191/R197 order, seed zero,
+cold L2, and identical 39-pass full NCU sections.  Percentages compare each
+candidate capture with the middle control:
+
+| metric | R197 first | R191 control | R197 last | candidate change |
+| --- | ---: | ---: | ---: | ---: |
+| duration | 260.864 us | 260.224 us | 259.904 us | +0.246% / -0.123% |
+| elapsed cycles/SM | 428,859 | 428,779 | 429,803 | +0.018% / +0.239% |
+| executed instructions | 56,866,119 | 58,345,403 | 56,882,363 | -2.535% / -2.508% |
+| issued instructions | 56,908,164 | 58,382,735 | 56,909,946 | -2.526% / -2.523% |
+| issue active | 42.531% | 43.641% | 42.439% | -2.544% / -2.755% |
+| barrier samples | 5,186 | 5,258 | 5,175 | -1.369% / -1.579% |
+| short-scoreboard samples | 1,060 | 722 | 1,060 | +46.814% / +46.814% |
+| long-scoreboard samples | 4,546 | 4,587 | 4,638 | -0.894% / +1.112% |
+| wait samples | 1,848 | 1,940 | 1,753 | -4.742% / -9.639% |
+
+The separate commit groups remove about 2.52% of the dynamic instructions,
+but they lower issue activity and add a repeatable 46.8% short-scoreboard
+penalty.  Both elapsed-cycle captures are slower, while wall-clock duration
+straddles the control.  The intended WGMMA overlap therefore does not create a
+local critical-path win on H20.  R197 is rejected before distributed timing,
+NSYS, or the 43-scenario suite.
+
+The source is fully reverted locally and on the pod to R191 SHA256
+`7abe0773a73b6295226872cd92762732c16a7115b7a08e3cdfa8bea738d0d56d`;
+recovery `production.flash_m16` passes at `diff=0.000654`.  Candidate/control
+sources, correctness/resources, all three NCU reports/CSVs, and the recovery
+log are archived under
+`iter616-r197-flash-m16-packed-half-pipeline-gate`.
