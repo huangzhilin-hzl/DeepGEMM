@@ -10450,3 +10450,96 @@ orders, recovery log, and hashes are archived under
 `iter567-r179-pro-m8-factor-secondary-gate`,
 `iter568-r152-r179-r152-pro-m8-formal`, and
 `iter569-r179-r152-r179-pro-m8-reverse-formal`.
+
+## R180: vectorize adjacent Pro M8 activation-scale loads
+
+### Reason and implementation
+
+R179's phase trace showed that Pro M8 time is almost perfectly correlated
+with the number of routed M64 blocks, while its SourceCounters report placed
+176.08M thread instructions in the activation-scale address/load path.  The
+rejected invariant-secondary factorization reduced local instructions but
+made the scheduler more idle and failed the reverse distributed timing gate.
+R180 therefore leaves the BF16 accumulation, compensation, and secondary
+scale dependency chain unchanged and targets only repeated shared-memory work
+inside each routed block.
+
+The swap-AB epilogue consumes tokens in adjacent pairs.  For exactly
+`kHidden == 7168 && kLocalSwapABTokens == 8`, R180 replaces the two scalar
+FP32 activation-scale shared loads with one aligned `float2` load.  `token_0`
+is always even, and the compile-time half-stride is asserted even, so every
+selected address is 8-byte aligned.  The existing `token_0 < valid_m` guard
+still suppresses an entirely absent pair, and `token_1 < valid_m` masks the
+second lane for an odd tail.  All other Flash, Pro M16+, shared-expert, and
+regular-orientation specializations retain the scalar path byte-for-byte.
+
+### Correctness and resource gates
+
+The first eight-rank `production.pro_m8` gate passes at `diff=0.000716`,
+identical to R152.  The complete final suite passes 41/41 scenarios, including
+all production Flash/Pro points, zero/one/max token boundaries, masked routes,
+both PR411 concentrated-routing bounds, ring wrap, shared experts, mixed
+protocols, and eight randomized stress cases.  Production Pro M8 still uses
+128 registers/thread with zero stack and spill; the matched one-rank,
+48-expert profiler specialization remains at 107 registers and about 25%
+achieved occupancy.
+
+### Matched NCU mechanism result
+
+Matched one-rank/48-expert NCU captures used the same H20, seed, cache mode,
+sections, launch, and generated signature.  The vector load reduces dynamic
+instructions and elapsed cycles without changing resources:
+
+| metric | R152 | R180 vector SFA | change |
+| --- | ---: | ---: | ---: |
+| elapsed cycles | 1,146,195 | 1,137,312 | -0.77% |
+| duration | 639.07 us | 631.46 us | -1.19% |
+| executed instructions | 164,514,428 | 159,195,799 | -3.23% |
+| issued instructions | 164,536,940 | 159,217,554 | -3.23% |
+| cycles with no eligible warp | 53.17% | 54.26% | +1.09 pp |
+| warp cycles/issued instruction | 8.50 | 8.71 | +2.47% |
+| registers/thread | 107 | 107 | unchanged |
+
+The intended mechanism is therefore real: combining the adjacent loads
+removes about 5.32M executed instructions and 0.77% elapsed cycles.  Like
+R179, the shorter instruction stream exposes more scheduler-idle time, so the
+distributed maximum-rank timing remains the acceptance authority.
+
+### Authoritative double-order timing
+
+Both orders use the final Pro M8 standard: eight ranks, seed zero, cold L2,
+one warmup, 50 observations, 20 launches per observation, and maximum-rank
+median.  Each order has a fresh JIT cache and fixed candidate/control source:
+
+| order | first | middle | last | R180 comparison |
+| --- | ---: | ---: | ---: | --- |
+| R152 / R180 / R152 | 755.4225 us | 748.0185 us | 756.4655 us | R180 is 0.98% and 1.12% faster |
+| R180 / R152 / R180 | 750.7640 us | 758.0320 us | 753.9960 us | R180 is 0.96% and 0.53% faster |
+
+Unlike R179, R180 is faster than every surrounding control in both execution
+orders.  The conservative reproduced improvement is therefore 0.53--1.12%,
+with the sign stable across all four candidate/control comparisons.
+
+### Low-perturbation NSYS qualification
+
+NSYS traces only rank zero while the other seven ranks run normally.  The
+R152/R180/R152 persistent-kernel durations are
+`1158.143/1139.519/1136.063 us`: R180 is 1.61% faster than the first control
+but 0.30% slower than the second.  Profiling one participant perturbs this
+distributed rendezvous, as in R152's Flash M16 analysis, so NSYS is honestly
+inconclusive and is retained as mechanism context rather than acceptance
+evidence.  An excluded process-tree capture that accidentally traced all
+eight children is also archived; its millisecond-scale startup skew is not
+used for any comparison.
+
+The exact candidate/control sources, correctness and PTXAS resource logs,
+matched NCU reports and CSV exports, both formal timing orders, complete
+41-scenario suite, and both NSYS methods are archived under
+`iter570-r180-pro-m8-vector-sfa-gate` through
+`iter575-r152-r180-r152-pro-m8-nsys-rank0`.  The retained device-header
+SHA256 is
+`cf91f518a72aec9c897b617b565a81031d5fdcdb80f653a85c7bb59baf3d2fd9`.
+The fresh PR383/R180/PR383 22-point matrix is tracked separately because its
+second PR383 control was interrupted by a Kubernetes control-plane outage;
+it is not needed to establish the R152-to-R180 improvement above and will be
+appended only after the missing control is measured.

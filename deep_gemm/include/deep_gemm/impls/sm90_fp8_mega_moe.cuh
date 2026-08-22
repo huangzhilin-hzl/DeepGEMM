@@ -2250,6 +2250,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             constexpr uint32_t kWeightHalfAccumStride =
                                 kPipelineWeightHalves ? kSwapAccum :
                                     kSwapABHalfAccumPerThread;
+                            constexpr bool kVectorProM8ActivationScales =
+                                kHidden == 7168 and
+                                kLocalSwapABTokens == 8;
                             DG_STATIC_ASSERT(
                                 not kPipelineWeightHalves or
                                     2 * kWeightHalfAccumStride <= kAccumStorage,
@@ -2365,22 +2368,42 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                     const uint32_t token_0 =
                                         chunk * 8 + swap_col_idx * 2;
                                     const uint32_t token_1 = token_0 + 1;
-                                    const float scale_a_0 =
-                                        token_0 < valid_m ?
+                                    float scale_a_0, scale_a_1;
+                                    if constexpr (
+                                            kVectorProM8ActivationScales) {
+                                        DG_STATIC_ASSERT(
+                                            kL2SFAHalfStride % 2 == 0,
+                                            "Vector SFA rows must stay aligned");
+                                        const float2 scale_pair =
+                                            token_0 < valid_m ?
+                                                ptx::ld_shared(
+                                                    reinterpret_cast<
+                                                        const float2*>(
+                                                        smem_sfa[
+                                                            pipeline_stage] +
+                                                        activation_sf_group *
+                                                            kL2SFAHalfStride +
+                                                        token_0)) :
+                                                make_float2(0.0f, 0.0f);
+                                        scale_a_0 = scale_pair.x;
+                                        scale_a_1 = token_1 < valid_m ?
+                                            scale_pair.y : 0.0f;
+                                    } else {
+                                        scale_a_0 = token_0 < valid_m ?
                                             ptx::ld_shared(
                                                 smem_sfa[pipeline_stage] +
                                                 activation_sf_group *
                                                     kL2SFAHalfStride +
                                                 token_0) :
                                             0.0f;
-                                    const float scale_a_1 =
-                                        token_1 < valid_m ?
+                                        scale_a_1 = token_1 < valid_m ?
                                             ptx::ld_shared(
                                                 smem_sfa[pipeline_stage] +
                                                 activation_sf_group *
                                                     kL2SFAHalfStride +
                                                 token_1) :
                                             0.0f;
+                                    }
                                     const float combined_scale_0 =
                                         (compensate_secondary ?
                                              scale_a_0 : scale_a_0 * 64.0f) *
