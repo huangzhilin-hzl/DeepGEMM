@@ -10955,3 +10955,59 @@ and hashes are archived under
 `iter587-r185-pro-m512-dual-lds64-row-gate`,
 `iter588-r180-r185-r180-pro-m512-formal`, and
 `iter589-r185-r180-r185-pro-m512-reverse-formal`.
+
+## R186 rejected: share one address across Flash M16 LDS.64 pairs
+
+### Reason and temporary implementations
+
+The fresh R180 matrix leaves Flash M16 2.78% behind mean PR383.  R185 showed
+that one shared address plus an `xor 8` second address can reduce the complete
+row decoder's address instructions without the scoreboard serialization of
+one `LDS.128`.  R186 applied that mechanism only to the exact routed Flash
+M16 specialization (`kSmallMSwapAB`, hidden 4096, 16 local tokens), while
+preserving the R147/PR411 cross-rank storage bound and all other paths.
+
+The initial form returned four packed words as a `uint4` and retained the
+existing next-K32 lookahead.  R186a changed the helper to write into the
+existing two `uint2` arrays, avoiding a separate aggregate return value.
+R186b then removed next-K32 lookahead only in this selected branch and loaded
+the current two pairs through the same shared address immediately before
+decode.  Addresses, exponent lookup, decoded values, stores, WGMMA, pipeline,
+scheduler, and epilogue were unchanged in all three forms.  Their temporary
+header SHA256 values were respectively
+`a22ba8e4b585980ce43470eac5e996076b7777bfae435afb16bed01d0b13b501`,
+`e0a956a9df171c512ce4b03e95a248145596be29aae1e9d9e9838b06ed024e80`,
+and
+`6261d8bee5133ec5e26c1235dc89cc83863af2c352cd0e2e843c9a2e64cf905d`.
+
+### Correctness and resource rejection
+
+The initial candidate passes eight-rank `production.flash_m16` and the exact
+PR411 concentrated-routing hotspot at `diff=0.000654/0.000663`.  Its
+one-rank/32-expert profiler cubin uses 118 registers with zero stack and
+spills, but the authoritative eight-rank production specialization uses 128
+registers and has an 8-byte stack frame with 8-byte spill stores and 8-byte
+spill loads.  This difference again proves that the reduced profiler shape
+cannot stand in for the production resource gate.
+
+Both attempts to shorten live ranges fail to change the production result.
+R186a passes at `diff=0.000654` but remains at 128 registers with the same
+8-byte frame and spills.  R186b also passes at `diff=0.000654` and again
+compiles to 128 registers, an 8-byte frame, and 8-byte spill traffic in each
+direction.  Removing lookahead is therefore insufficient: the four
+simultaneous inline-assembly outputs themselves consume the last production
+registers.
+
+R186 fails the zero-stack/zero-spill hard gate before NCU, formal timing,
+NSYS, or the full matrix.  Further Flash M16 complete-row shared-load variants
+must either reduce the number of simultaneously live load outputs below four
+or remove registers elsewhere in the production-only routing specialization;
+repackaging the same four outputs is closed.
+
+The candidate is fully reverted locally and on the pod.  The restored header
+is byte-identical to R180 at
+`cf91f518a72aec9c897b617b565a81031d5fdcdb80f653a85c7bb59baf3d2fd9`,
+and recovery `production.flash_m16` passes at `diff=0.000654`.  Exact candidate
+sources/hashes, correctness and PTXAS logs, the profiler cubin, and recovery
+output are archived under
+`iter590-r186-flash-m16-shared-pair-address-gate`.
