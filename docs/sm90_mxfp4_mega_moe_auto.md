@@ -11221,3 +11221,70 @@ three NCU reports and CSV exports, both R180 timing orders, the complete
 41-scenario suite, three valid NSYS reports, and both PR383 orders are archived
 under `iter593-r189-pro-m8-prewait-scale-gate` through
 `iter598-r189-pr383-r189-pro-m8-reverse-formal`.
+
+## R190 rejected: precompute Flash M16 N8 scales before WGMMA wait
+
+### Reason and temporary implementation
+
+R189 proves that the single N8 promotion multiplier can be prepared while a
+swap-AB WGMMA group is still in flight.  R161 also shows that every routed
+block on the seed-zero Flash M16 maximum-work rank has `valid_m<=8`.  R190
+therefore extended the pre-wait schedule only to the exact Flash M16
+`N_SWAP=8` template.  It retained Flash's two original scalar SFA loads, so
+the experiment isolated scheduling rather than also adding R180's Pro-only
+`float2` load.  Runtime N16/N32/N64 destinations retained R189 exactly,
+preserving the PR411 cross-rank fallback.
+
+Arithmetic, rounding, addresses, decoder, WGMMA, stage release, scheduler,
+and epilogue were unchanged.  The temporary header SHA256 was
+`fe25fdbfbb482169d52e597325743a143b1699c0470fd9ebbc979a0589cdb404`.
+Production Flash M16 and the PR411 concentrated-routing hotspot pass at
+`diff=0.000654/0.000663`.  The production cubin stays at 128 registers with
+`STACK=0` and `LOCAL=0`; the one-rank/32-expert profiler cubin stays at 118
+registers with no stack or spills.
+
+### Matched NCU mechanism
+
+The one-rank R190/R189/R190 capture uses 32 experts, seed zero, cold L2,
+lineinfo, and identical 21-pass sections:
+
+| metric | R190 first | R189 control | R190 last | candidate range vs control |
+| --- | ---: | ---: | ---: | ---: |
+| elapsed cycles | 432,509 | 435,275 | 431,006 | -0.64% to -0.98% |
+| duration | 262.016 us | 264.800 us | 261.024 us | -1.05% to -1.43% |
+| executed instructions | 60,253,729 | 60,242,703 | 60,248,691 | effectively flat |
+| issue active | 45.52% | 45.26% | 45.65% | +0.27 to +0.39 pp |
+| eligible warps/cycle | 0.625 | 0.617 | 0.627 | +0.008 to +0.010 |
+| warp cycles/issued instruction | 8.637 | 8.693 | 8.618 | -0.65% to -0.87% |
+| short-scoreboard samples | 690 | 802 | 751 | -14.0% to -6.4% |
+| wait samples | 1,828 | 1,908 | 1,821 | -4.2% to -4.6% |
+
+The local mechanism is real: without deleting instructions, the candidate
+fills part of the WGMMA wait and improves both cycle captures.
+
+### Authoritative maximum-rank rejection
+
+Both orders use eight ranks, seed zero, cold L2, one warmup, 50 observations,
+20 launches per observation, and maximum-rank median:
+
+| order | first | middle | last | R190 comparison |
+| --- | ---: | ---: | ---: | --- |
+| R189 / R190 / R189 | 344.622 us | 327.982 us | 343.860 us | R190 is 4.83% and 4.62% faster |
+| R190 / R189 / R190 | 341.542 us | 345.424 us | 350.594 us | R190 is 1.12% faster and 1.50% slower |
+
+The reverse order changes sign.  Its rank-zero medians remain favorable:
+R189 is 343.144 us while the two R190 runs are 336.587/338.372 us, or
+1.91%/1.39% faster.  The failure is therefore specifically the distributed
+maximum-rank tail, not the local schedule.  Because the user-requested final
+standard is maximum-rank DSV4 Flash/Pro timing, the last candidate's 1.50%
+loss is authoritative.  R190 is rejected before the 41-scenario suite, NSYS,
+or PR383 timing; those tools cannot override a failed double-order gate.
+
+The candidate is fully reverted locally and on the pod.  The restored R189
+header is byte-identical to the accepted
+`1047639cd57876c1a0b6f8f5506949f29cb75a446b590f9fe6519b9a45fe9372`,
+and recovery `production.flash_m16` passes at `diff=0.000654`.  Exact sources,
+hashes, correctness/resource logs, three NCU reports and CSV exports, both
+formal orders, and recovery output are archived under
+`iter599-r190-flash-m16-prewait-scale-gate` through
+`iter601-r190-r189-r190-flash-m16-reverse-formal`.
