@@ -10343,3 +10343,110 @@ passes at `diff=0.000654`.  Candidate/control sources, correctness and
 resource logs, cubin/SASS, matched NCU reports/details/source counters,
 recovery log, and hashes are archived under
 `iter563-r178-flash-m16-task-secondary-gate`.
+
+## R179 rejected: factor the invariant Pro M8 secondary scale
+
+### Distributed phase attribution
+
+The remaining Pro M8 gap was first isolated before changing arithmetic.  A
+temporary `%globaltimer` trace recorded dispatch-ready, L1/L2 task spans,
+GEMM drain, combine wait, and combine body on all eight H20 ranks for the
+fixed seed-zero route.  The rank-local routed-block counts were
+`[29, 34, 30, 29, 35, 32, 26, 29]`.  Across five cached runs, Pearson
+correlation between block count and dispatch-ready-to-GEMM-drain time was
+`0.999488/0.999772/0.999879/0.999427/0.999762`; the per-run GEMM spread was
+`188.064/186.752/185.760/184.768/185.600 us`.
+
+| rank | routed blocks | GEMM median | combine wait median | combine body median |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 29 | 626.816 us | 126.912 us | 6.752 us |
+| 1 | 34 | 730.112 us | 22.656 us | 6.912 us |
+| 2 | 30 | 646.848 us | 106.144 us | 6.560 us |
+| 3 | 29 | 628.512 us | 124.672 us | 6.400 us |
+| 4 | 35 | 749.280 us | 2.816 us | 6.336 us |
+| 5 | 32 | 688.064 us | 64.640 us | 6.752 us |
+| 6 | 26 | 562.816 us | 188.928 us | 6.688 us |
+| 7 | 29 | 625.152 us | 127.264 us | 6.624 us |
+
+The fast ranks spend the saved GEMM time waiting at combine, while the actual
+combine body is only 6.3--6.9 us.  Pro M8 is therefore limited by fixed work
+per routed block plus seed-dependent block imbalance, not by the combine
+barrier implementation.  The temporary trace is fully removed; its source and
+five cached captures are archived under `iter564-r179-pro-m8-route-diagnostic`
+and `iter565-r179-pro-m8-phase-trace`.
+
+Fresh R152 SourceCounters then identified the per-block arithmetic targets.
+The largest dynamic opcodes include 27.33M warp `LOP3.LUT`, 19.26M `PRMT`,
+8.61M `IMAD.SHL.U32`, 8.59M `SHF.R.U32.HI`, and 5.87M `FMUL`.  Decoder/scale
+hotspots include 176.08M thread instructions at the SFA address path, 170.31M
+at the lookup helper, 101.78M/96.51M at the paired decoder calls, and 45.42M
+at each combined-scale multiply.  The report, source attribution, and SASS
+exports are archived under `iter566-r179-pro-m8-source-counters`.
+
+### Temporary direction and numerical gate
+
+Every routed task loads one expert-wide MXFP4 secondary scale, but R152
+multiplies it into both token scales on every K-block promotion.  R179 scoped a
+factorization to `kHidden == 7168 && kLocalSwapABTokens == 8`: promotion kept
+the token scale and the existing overflow-safe x64 compensation, accumulated
+the packed BF16 persistent sum without the invariant secondary, and multiplied
+the secondary once while expanding that sum to FP32.  The endpoint branch was
+preserved algebraically: a safe secondary used `secondary * 64` as the final
+factor, while an unsafe secondary retained `secondary` and kept x64 on the
+token scale.
+
+This changes BF16 rounding order, so correctness preceded timing.  Eight-rank
+`production.pro_m8` passed at `diff=0.000716`, identical to R152.  The
+production specialization remained at 128 registers/thread with zero stack
+and spill; the matched one-rank/48-expert profiler specialization remained at
+107 registers and 25% theoretical occupancy.
+
+### Matched NCU mechanism result
+
+Matched 33-pass NCU captures on the same H20 used one rank, 48 experts, seed
+zero, cold L2, lineinfo, and identical sections.  Elapsed cycles are the
+primary local authority because clocks differed slightly:
+
+| metric | R152 | R179 factorization | change |
+| --- | ---: | ---: | ---: |
+| elapsed cycles | 1,146,028 | 1,135,651 | -0.91% |
+| duration | 639.33 us | 630.43 us | -1.39% |
+| executed instructions | 164,505,657 | 161,268,537 | -1.97% |
+| no eligible warp | 53.19% | 53.84% | +0.65 pp |
+| warp cycles/issued instruction | 8.50 | 8.61 | +1.29% |
+| registers/thread | 107 | 107 | unchanged |
+| achieved occupancy | 24.80% | 24.80% | unchanged |
+
+The intended mechanism is real: factoring removes about 3.24M executed
+instructions and 0.91% cycles.  It also exposes slightly more scheduler idle
+time, so the local gain remains below the routed-block imbalance measured by
+the phase trace and must pass the distributed double-order gate.
+
+### Formal double-order rejection
+
+The authoritative eight-rank test used the final Pro M8 standard: seed zero,
+cold L2, one warmup, 50 observations, 20 launches per observation, and
+maximum-rank median.  Each source was hash-fixed, and both orders reused their
+own JIT cache:
+
+| order | first | middle | last | R179 comparison |
+| --- | ---: | ---: | ---: | --- |
+| R152 / R179 / R152 | 762.6225 us | 750.1205 us | 755.5975 us | R179 is 1.64% and 0.72% faster |
+| R179 / R152 / R179 | 747.8275 us | 748.6570 us | 757.7205 us | R179 is 0.11% faster and 1.21% slower |
+
+The reverse order does not reproduce the first order: the second candidate
+run is slower than its surrounding control, while the first candidate is only
+0.11% faster.  R179 therefore fails the required double-order gate despite its
+positive local NCU mechanism.  NSYS and the full 22-point matrix are not run
+for a rejected candidate because they cannot repair the failed authoritative
+timing result.
+
+R179 is fully reverted to byte-identical R152 locally and on the pod; the
+device header SHA256 is again
+`1bec2fc553ec8512357491019fb8a66b2677a7091fdd8008ddebf7a1b179dd47`.
+Eight-rank recovery passes at `diff=0.000716`.  Exact candidate/control source,
+correctness and PTXAS resources, both NCU reports and CSV exports, both formal
+orders, recovery log, and hashes are archived under
+`iter567-r179-pro-m8-factor-secondary-gate`,
+`iter568-r152-r179-r152-pro-m8-formal`, and
+`iter569-r179-r152-r179-pro-m8-reverse-formal`.
