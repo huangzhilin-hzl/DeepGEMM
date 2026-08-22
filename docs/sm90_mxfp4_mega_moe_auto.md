@@ -9946,3 +9946,53 @@ against the authoritative maximum-rank controls, so NSYS cannot override the
 acceptance failure.  R170 is fully reverted to byte-identical R152 and is not
 a production change.  Forced host rebuild logs, all three raw timing runs,
 and control source snapshots are archived under `iter552-r170-formal`.
+
+## R171 rejected: remove Flash M16 packed-row LDS lookahead
+
+### Reason and temporary implementation
+
+R170's source counters leave long-scoreboard waiting as the first actionable
+math-loop stall, while the current complete-row MXFP4 decoder keeps two
+current and two next `uint2` pairs live across each K32 group.  Earlier
+direct-load experiments were not equivalent: R127a and R157a targeted regular
+Pro M512 with a 64-value accumulator, and R164 serialized one four-result
+`LDS.128`.  R171 therefore tested the previously uncovered small-accumulator
+case for exact routed Flash M16 only (`hidden=4096`, local policy M16).
+
+The temporary specialization removed the initial and next-K32 pair preloads.
+For each K32 group it built the exponent lookup, then issued each of the same
+two bank-permuted `LDS.64` loads immediately before decoding and storing that
+pair.  Packed and expanded shared-memory addresses, scale lookup, x8 decode,
+`STS.128`, WGMMA, stages, scheduler, epilogue, and every non-M16 specialization
+were unchanged.
+
+Production Flash M16 and the all-ranks-to-rank-zero PR411 hotspot pass at
+`diff=0.000654/0.000663`.  The exact eight-rank cubin remains at 128 registers,
+zero stack/local memory, and four barriers; the one-rank 32-expert profile
+cubin remains at 118 registers and zero stack/local memory.  Both SASS images
+contain no `LDL` or `STL`.
+
+### NCU mechanism rejection
+
+Matched one-rank/32-expert Flash M16 NCU shows that the small instruction
+reduction is overwhelmed by newly exposed shared-load latency:
+
+| metric | R152 lookahead | R171 direct LDS.64 | change |
+| --- | ---: | ---: | ---: |
+| duration | 263.55 us | 275.87 us | +4.67% |
+| issued warps/scheduler | 0.45 | 0.39 | -13.33% |
+| cycles with no eligible warp | 54.87% | 60.56% | +5.69 pp |
+| warp cycles/issued instruction | 8.65 | 9.96 | +15.14% |
+| warp instructions | 60,241,422 | 60,079,305 | -0.27% |
+| thread instructions | 1,874,340,628 | 1,869,019,430 | -0.28% |
+| sampled total stalls | 16,309 | 18,541 | +13.69% |
+| sampled barrier stalls | 5,317 | 6,031 | +13.43% |
+| sampled long-scoreboard stalls | 4,644 | 4,803 | +3.42% |
+| sampled wait stalls | 1,916 | 2,118 | +10.54% |
+
+The lookahead is therefore useful latency hiding, not avoidable register
+state.  R171 fails the local mechanism gate and is stopped before NSYS and
+distributed A/B/A timing.  It is fully reverted to byte-identical R152; the
+correctness logs, exact temporary source, production/profile cubins, SASS,
+resource reports, NCU report, source counters, and hashes are archived under
+`iter553-r171-direct-lds64-flash-m16-gate`.
