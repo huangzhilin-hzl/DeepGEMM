@@ -12544,3 +12544,112 @@ critical path.  The retained implementation is again R203.  The next candidate
 must reduce the R207 barrier/long-scoreboard penalty or move independent work
 into its latency slots; extending decoder value lifetimes is explicitly ruled
 out.
+
+## Rejected experiment R209: serial complete-row decoding
+
+### Motivation and implementation
+
+R209 tested whether R208's loss came specifically from keeping both packed
+pairs live at once.  It retained R207's exact Pro M512 packed-FP16 selector,
+assigned each warp-group thread one output row, and consumed that row's two
+packed-word pairs serially through a single current/next lookahead.  This
+reduced the decoder's simultaneous values while preserving the same arithmetic,
+scheduler, ring bounds, and cross-rank completion protocol.
+
+The production eight-rank correctness gate passed at `diff=0.000598`.  Ptxas
+used 114 registers with zero stack and zero spill stores/loads, so the trial
+isolated dependency ordering rather than compiler spilling.
+
+### Matched NCU result and decision
+
+The R209/R203/R209 NCU sandwich used one H20, one rank, 48 experts, Pro M512,
+seed zero, cold L2, and 20 application-replay launches.
+
+| Metric | R209 first | R203 control | R209 last | Candidate change |
+| --- | ---: | ---: | ---: | ---: |
+| Duration | 2.222624 ms | 2.239680 ms | 2.220800 ms | -0.76% / -0.84% |
+| GPC elapsed cycles | 3,987,640 | 4,009,952 | 3,984,987 | -0.56% / -0.62% |
+| Executed SM instructions | 378,949,579 | 512,854,739 | 378,925,655 | -26.11% / -26.11% |
+| Warp cycles per instruction | 12.964 | 9.652 | 12.999 | +34.31% / +34.68% |
+| Barrier stall samples | 73,187 | 63,719 | 72,620 | +14.86% / +13.97% |
+| Long-scoreboard samples | 40,036 | 39,697 | 40,290 | +0.85% / +1.49% |
+| Short-scoreboard samples | 6,845 | 5,291 | 7,119 | +29.37% / +34.55% |
+| Wait samples | 13,464 | 15,947 | 13,303 | -15.57% / -16.58% |
+
+Serializing the pairs reduces R208's barrier and long-scoreboard penalties but
+converts the saved parallelism into short-scoreboard stalls.  Both duration
+brackets remain below the 1.5% isolated-kernel gate, so R209 was rejected
+without distributed timing or NSYS.  Its gate and captures are on the pod under
+`iter649-r209-pro-m512-f16-serial-row-gate` and
+`iter650-r209-r203-r209-pro-m512-ncu`.
+
+## Rejected experiments R210 and R211: phase-local packed-FP16 accumulation
+
+### Motivation and implementation
+
+R210 and R211 asked whether the persistent packed-FP16 accumulator should be
+limited to only one GEMM phase.  R210 used it only for Linear1 and restored the
+regular decoder; R211 used it only for Linear2.  This split was intended to
+retain the register saving where it mattered while leaving the other phase's
+FP32 accumulation and scheduling behavior unchanged.
+
+Both production correctness gates passed (`diff=0.000629` for R210 and
+`diff=0.000673` for R211), but both failed the resource gate before profiling:
+
+| Trial | Packed-FP16 phase | Registers | Stack | Spill stores | Spill loads |
+| --- | --- | ---: | ---: | ---: | ---: |
+| R210 | Linear1 only | 128 | 16 B | 12 B | 20 B |
+| R211 | Linear2 only | 128 | 8 B | 8 B | 16 B |
+
+The phase-local compile-time split forces both accumulator representations into
+the generated kernel's live/resource envelope.  The all-phase R207 selector is
+therefore cheaper than either apparently narrower variant.  R210 and R211 were
+rejected without NCU, NSYS, or distributed timing.  Their ptxas and correctness
+artifacts are on the pod under `iter651-r210-pro-m512-l1-f16-gate` and
+`iter652-r211-pro-m512-l2-f16-gate`.
+
+## Rejected experiment R212: staggered complete-row pair decoding
+
+### Motivation and implementation
+
+R212 returned to R207's all-phase packed-FP16 path and tested the remaining
+complete-row scheduling order.  It loaded both current LDS64 pairs, decoded and
+stored pair zero, issued the next pair-zero load, then decoded and stored pair
+one while that load was outstanding before issuing next pair one.  The stagger
+was motivated by an older decoder result that reduced short-scoreboard stalls;
+the exact selector and all inter-rank protocol values remained unchanged.
+
+The eight-rank correctness gate passed at `diff=0.000595`.  Ptxas used 110
+registers with zero stack and zero spills.
+
+### Matched NCU result and decision
+
+| Metric | R212 first | R203 control | R212 last | Candidate change |
+| --- | ---: | ---: | ---: | ---: |
+| Duration | 2.218272 ms | 2.237216 ms | 2.215936 ms | -0.85% / -0.95% |
+| GPC elapsed cycles | 3,980,400 | 4,008,855 | 3,979,914 | -0.71% / -0.72% |
+| Executed SM instructions | 378,963,198 | 512,877,126 | 378,958,875 | -26.11% / -26.11% |
+| Warp cycles per instruction | 12.990 | 9.650 | 12.990 | +34.60% / +34.61% |
+| Barrier stall samples | 74,993 | 63,969 | 74,234 | +17.23% / +16.05% |
+| Long-scoreboard samples | 40,438 | 39,570 | 40,387 | +2.19% / +2.07% |
+| Short-scoreboard samples | 5,829 | 5,236 | 5,742 | +11.32% / +9.66% |
+| Wait samples | 12,698 | 15,807 | 13,021 | -19.67% / -17.63% |
+
+The stagger does not recover enough latency hiding: it executes 26.11% fewer
+instructions but increases per-instruction latency by 34.6%, barrier samples by
+16--17%, and both scoreboard classes.  Both duration brackets miss the 1.5%
+NCU gate, so R212 was rejected without distributed timing or NSYS.  Its gate
+and captures are on the pod under
+`iter653-r212-pro-m512-f16-stagger-row-gate` and
+`iter654-r212-r203-r212-pro-m512-ncu`.
+
+### Updated direction after R209--R212
+
+R208, R209, and R212 now cover parallel, serial, and staggered complete-row
+pair schedules.  All three produce the same large instruction reduction and
+the same approximately 35% latency increase; rearranging the decoder cannot
+move it off the shared-memory/barrier critical path.  R210 and R211 also show
+that phase-local packed accumulation is not a resource-saving compromise.
+These decoder and phase-split families are closed.  The retained source remains
+R203, and the next experiment will change the rank-consistent launch geometry
+while keeping the proven ring allocation and PR411 completion protocol intact.
