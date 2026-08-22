@@ -10615,3 +10615,57 @@ and both formal orders are archived under
 `iter577-r181-flash-m16-evict-first-gate`,
 `iter578-r181-r180-r181-flash-m16-formal`, and
 `iter579-r180-r181-r180-flash-m16-reverse-formal`.
+
+## Fresh R180/PR383 full matrix after R181
+
+The control-plane recovery completed the interrupted second PR383 control.
+All three runs contain the required 22 summaries: Flash and Pro at
+`M={8,16,32,64,128,256,512,1024,2048,4096,8192}`.  Small shapes use 50
+observations, large shapes use three, every observation uses 20 launches,
+and the reported value is maximum-rank median.  The PR383 controls use its
+restored original benchmark harness, SHA256
+`117d342713827a8f2a335091e5fbf1eb3dba797fad8c6192f1085b58fdf8562b`.
+The R180 device header is the retained
+`cf91f518a72aec9c897b617b565a81031d5fdcdb80f653a85c7bb59baf3d2fd9`.
+
+The comparison below uses the arithmetic mean of the two surrounding PR383
+controls.  Negative percentages mean R180 is faster:
+
+| model | M | PR383 first | R180 | PR383 second | PR383 mean | R180 vs mean |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Flash | 8 | 297.598 us | 302.524 us | 311.608 us | 304.603 us | -0.68% |
+| Flash | 16 | 312.293 us | 321.613 us | 313.543 us | 312.918 us | +2.78% |
+| Flash | 32 | 329.549 us | 330.798 us | 329.095 us | 329.322 us | +0.45% |
+| Flash | 64 | 369.008 us | 360.081 us | 364.824 us | 366.916 us | -1.86% |
+| Flash | 128 | 433.587 us | 417.367 us | 439.816 us | 436.701 us | -4.43% |
+| Flash | 256 | 511.332 us | 484.179 us | 508.805 us | 510.069 us | -5.08% |
+| Flash | 512 | 913.064 us | 886.460 us | 908.906 us | 910.985 us | -2.69% |
+| Flash | 1024 | 1518.574 us | 1485.000 us | 1562.724 us | 1540.649 us | -3.61% |
+| Flash | 2048 | 2705.719 us | 2752.000 us | 2721.929 us | 2713.824 us | +1.41% |
+| Flash | 4096 | 5109.000 us | 5126.000 us | 5074.000 us | 5091.500 us | +0.68% |
+| Flash | 8192 | 9850.000 us | 9921.000 us | 9881.000 us | 9865.500 us | +0.56% |
+| Pro | 8 | 703.069 us | 731.662 us | 713.318 us | 708.194 us | +3.31% |
+| Pro | 16 | 997.089 us | 929.150 us | 1012.495 us | 1004.792 us | -7.53% |
+| Pro | 32 | 1100.099 us | 998.005 us | 1100.344 us | 1100.221 us | -9.29% |
+| Pro | 64 | 1161.126 us | 1021.500 us | 1164.843 us | 1162.985 us | -12.17% |
+| Pro | 128 | 1264.630 us | 1181.500 us | 1267.084 us | 1265.857 us | -6.66% |
+| Pro | 256 | 1647.818 us | 1619.000 us | 1631.277 us | 1639.548 us | -1.25% |
+| Pro | 512 | 2408.030 us | 2516.000 us | 2410.460 us | 2409.245 us | +4.43% |
+| Pro | 1024 | 4039.000 us | 3879.000 us | 4052.000 us | 4045.500 us | -4.12% |
+| Pro | 2048 | 6985.000 us | 6882.000 us | 7032.000 us | 7008.500 us | -1.81% |
+| Pro | 4096 | 12885.000 us | 12974.000 us | 12899.000 us | 12892.000 us | +0.64% |
+| Pro | 8192 | 25081.000 us | 25294.000 us | 25043.000 us | 25062.000 us | +0.93% |
+
+R180's geometric-mean latency is 1.1649% lower for Flash and 3.1828% lower
+for Pro than the mean PR383 control.  Comparing against each control
+independently gives a stable aggregate lead: 0.8332--1.4879% for Flash and
+3.0254--3.3385% for Pro.  R180 beats both controls at five of eleven Flash
+points and seven of eleven Pro points; it loses to both at five Flash and four
+Pro points.  The controls disagree most at Flash M8 (4.71%) and Flash M1024
+(2.91%), so the mean is used instead of selecting the favorable control.
+
+This establishes aggregate PR383 leadership, not a pointwise theoretical
+limit.  The next optimization targets remain Flash M16 (+2.78%), Pro M512
+(+4.43%), and Pro M8 (+3.31%); Flash M2048 and the large-M tails are smaller
+secondary residuals.  The complete sources, harness hashes, and raw logs are
+archived under `iter576-pr383-r180-pr383-full-matrix`.
