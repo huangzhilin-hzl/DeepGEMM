@@ -11063,3 +11063,57 @@ and recovery `production.flash_m16` passes at `diff=0.000654`.  Exact sources,
 hashes, correctness/resource logs, three NCU reports and CSV exports, and
 recovery output are archived under
 `iter591-r187-flash-m16-offset-xor-gate`.
+
+## R188 rejected: packed BF16 Pro M8 scale product
+
+### Reason and implementation
+
+R180 loads adjacent Pro M8 activation scales with one `float2`, but still
+multiplies the two FP32 lanes independently by the expert-wide compensated
+secondary before packing the result for existing HFMA2 accumulation.  R188
+converted the activation pair and invariant compensated secondary to BF16x2
+and used one `__hmul2` on the ordinary, overflow-safe secondary branch.  The
+rare high-secondary endpoint retained R180's FP32 product and final BF16
+conversion.  Only exact routed Pro M8 selected the packed product; decoder,
+WGMMA, persistent BF16 sum, pipeline, scheduler, and all other signatures
+were unchanged.  The temporary header SHA256 was
+`6ff97c46ca31ba89d9d3361a37029eb3ab9eebb7093856eaee13a1f24393debd`.
+
+Eight-rank `production.pro_m8` passes at `diff=0.000716`, identical to R180.
+The production cubin remains at 128 registers with `STACK=0` and `LOCAL=0`;
+the matched one-rank/48-expert cubin remains at 107 registers with no stack or
+spills.
+
+### Matched NCU rejection
+
+The matched R188/R180/R188 order used one rank, 48 experts, seed zero, cold
+L2, lineinfo, and identical 21-pass sections:
+
+| metric | R188 first | R180 control | R188 last | candidate range vs control |
+| --- | ---: | ---: | ---: | ---: |
+| elapsed cycles | 1,171,555 | 1,121,269 | 1,172,705 | +4.48% to +4.59% |
+| duration | 712.416 us | 679.872 us | 710.272 us | +4.47% to +4.79% |
+| executed instructions | 157,949,211 | 159,214,929 | 157,948,075 | -0.80% |
+| issued instructions | 157,972,562 | 159,228,487 | 157,971,070 | -0.79% |
+| issue active | 43.59% | 45.92% | 43.72% | -2.20 to -2.34 pp |
+| eligible warps/cycle | 0.579 | 0.624 | 0.580 | about -0.045 |
+| short-scoreboard samples | 4,095 | 3,470 | 4,191 | +18.0% to +20.8% |
+| long-scoreboard samples | 12,195 | 11,902 | 12,132 | +1.9% to +2.5% |
+| wait samples | 5,188 | 4,430 | 5,193 | about +17.2% |
+
+Packing deletes roughly 1.27M executed instructions, but `HMUL2` becomes a
+serial producer of the HFMA2 promotion multiplier.  The large short-
+scoreboard and wait increases reduce eligible-warp supply and make both
+candidate captures more than 4.4% slower.  R188 therefore fails the local
+mechanism gate before formal timing, NSYS, or the full matrix.  Future Pro M8
+scale work must preserve the two independent FP32 multiply chains or move the
+secondary outside the persistent promotion as R179 did; reducing scalar
+instruction count with a packed dependency is counterproductive on H20.
+
+R188 is fully reverted locally and on the pod.  The restored header is
+byte-identical to R180 at
+`cf91f518a72aec9c897b617b565a81031d5fdcdb80f653a85c7bb59baf3d2fd9`,
+and recovery `production.pro_m8` passes at `diff=0.000716`.  Exact sources,
+hashes, correctness/resource logs, three NCU reports and CSV exports, and
+recovery output are archived under
+`iter592-r188-pro-m8-packed-scale-product-gate`.
