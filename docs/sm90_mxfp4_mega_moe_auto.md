@@ -10248,3 +10248,45 @@ extension is force rebuilt.  The original eight-rank hang log, three one-rank
 diagnostic logs, exact R176b device and R176 host sources, build logs, recovery
 correctness log, and hashes are archived under
 `iter561-r176-flash-m16-cluster2-gate`.
+
+## R177 rejected: cache Flash M16 secondary scales in count scratch
+
+### Reason and temporary implementation
+
+Each Flash M16 CTA processes roughly one hundred routed L1/L2 N tasks in the
+seed-zero workload.  Every task reloads one expert's FP32 MXFP4 secondary
+scale from global memory before the K loop, although there are only 32 local
+experts and two scale arrays.  R177 tested whether replacing those repeated
+uniform global loads could reduce long-scoreboard waiting without changing
+decode, WGMMA, scheduling, or the cross-rank protocol.
+
+The exact Flash M16 B-loader temporarily loaded all 32 L1 and 32 L2 secondary
+values once and wrote their 256-byte bit representation into the beginning of
+the expert-count shared-memory region.  The math warpgroup then used a
+shared-memory multicast load selected by phase and local expert.  The intended
+trade was at most 64 global loads per CTA up front instead of approximately
+one uniform global load per task; every other specialization retained the
+original `__ldg` path.
+
+### Correctness-gate rejection
+
+The first eight-rank production gate failed before producing a numerical
+comparison.  Ranks reported CUDA illegal-instruction and illegal-address
+errors; the independent concentrated-routing hotspot reproduced the failure.
+All child processes terminated and all eight GPUs returned idle.
+
+Although static offsets fit inside the declared expert-count allocation, the
+runtime failure proves that this scratch region is not safely reusable at the
+B-loader's publication point.  Dispatch/pull and later phase aliases have a
+lifetime not represented by the simple post-rendezvous source references.
+Adding another barrier solely to protect a 256-byte cache would increase the
+fixed small-block cost and is not justified before a dedicated lifetime
+trace identifies a safe interval.
+
+R177 therefore has no valid latency, NCU, or NSYS comparison: it fails the
+correctness gate, so profiler data could not establish an acceptable
+mechanism.  The device header is restored to byte-identical R152.  Recovery
+passes the same one-rank and eight-rank Flash M16 production scenarios at
+`diff=0.000649` and `diff=0.000654`, respectively.  Both CUDA-error logs, the
+exact temporary source, recovery logs, and hashes are archived under
+`iter562-r177-flash-m16-secondary-cache-gate`.
