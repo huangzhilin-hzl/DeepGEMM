@@ -12742,3 +12742,55 @@ workload has enough independent tasks that scheduler parallelism is still more
 valuable than a smaller cooperative quorum.  Future scheduler work must keep
 156 workers and reduce work or synchronization inside each task/wave, while
 remaining independent of rank-local token count.
+
+## Rejected experiment R214: early stage release on packed-FP16 R207
+
+### Motivation and implementation
+
+R207 removes 9.92% of Pro M512's executed instructions but increases barrier
+samples by about 8%, limiting its isolated gain to roughly 1.1%.  The retained
+FP32 path had previously shown that moving the empty-stage arrival immediately
+after the final WGMMA wait is a compiler no-op, but R207's 107-register packed
+accumulator creates a different dependency graph.  R214 therefore rebuilt the
+byte-exact R207 source and enabled `kEarlyReleaseMXFP4Stage` for its exact
+packed-FP16 selector.  This permits the producer to refill A/SFA while the math
+warpgroup performs register-only FP16x2 promotion.  The first Linear2 K64 group
+still uses `promote_mxfp4<false>` because the stage remains live until its
+second WGMMA group; only the final group can release early.
+
+The R207 snapshot was recovered from the valid R207 NCU artifact and verified
+before editing.  Its MMA and WGMMA helper SHA-256 values were exactly
+`7c83089f2599aab83bad295b4c5af6b24ede8baa5519f33ee09854eb078648fc`
+and `1bb7eaee870367c715b3350f19a086b3f27409bfc4beeb52db50093324181b1f`;
+the R214 main-header SHA-256 was
+`070d80bf121a161a461df84045820a0a3259bf59aacddb55c66114b4a3017599`,
+and its only difference from R207 was the early-release boolean.
+
+### Correctness, resources, and SASS result
+
+Eight-rank production Pro M512 passed at the same R207 numerical result,
+`diff=0.000595`.  The capacity-512 E384 cubin used 107 registers, zero stack,
+and zero local memory, also identical to R207.
+
+The machine-code gate then compared the same production specialization from
+R207 and R214 with `nvdisasm`.  Full cubin hashes differ because compiler flags
+and internal-symbol metadata are embedded in the files, so the comparison was
+restricted to the complete kernel `.text` section.  Both normalized outputs
+contain 6,577 lines and have the identical SHA-256
+`958302bbb661201ab250ce786ab78ba349d807a5fdec6a0bbb5d95590c2b7e9f`.
+There is no instruction-order, control-flow, or scheduling difference.
+
+### Decision and updated direction
+
+R214 is a compiled no-op and was rejected without NCU, NSYS, or distributed
+timing.  As in the earlier FP32 trial, ptxas already advances the empty-stage
+arrival as far as the true shared-memory dependencies allow; expressing the
+release earlier in C++ cannot reduce R207's barrier stalls.  R214 and R207 were
+fully reverted to R203.  The correctness/resource gate, source hashes, both
+SASS dumps, normalized `.text` sections, and diff are on the pod under
+`iter657-r214-pro-m512-f16-early-release-gate`.
+
+This closes source-level stage-release motion for both FP32 and packed-FP16
+accumulation.  Reducing R207's barrier penalty requires changing a real
+producer/consumer dependency or the amount of work before the barrier, not
+moving the arrival around register-only code that ptxas already reorders.
