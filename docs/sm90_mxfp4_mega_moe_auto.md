@@ -10054,3 +10054,69 @@ extension are restored to byte-identical R152.  Build logs, three correctness
 gates, temporary source, production/profile cubins, SASS, resources, NCU
 report, source counters, and hashes are archived under
 `iter554-r172-compact-m8-tma-gate`.
+
+## R173-R174 rejected: spill-free complete-row Pro M512 decode
+
+### R173 dynamic-register rebalance fails the static resource gate
+
+R127b's complete-row Pro M512 decoder removed about 16% of dynamic
+instructions but retained a 16-byte stack frame.  R173 first tested whether
+the existing Hopper warpgroup register reconfiguration could absorb that
+small peak without changing the decoder.  Exact routed Pro M512 lowered the
+64 dispatch plus 64 TMA/frontend threads from 48 to 40 registers/thread and
+raised the 128 math threads from 208 to 216.  The CTA total remains exactly
+32,768 registers, preserving the two-CTA-per-SM contract.
+
+R173 uses R127a's direct two-`LDS.64` complete-row decoder and passes
+eight-rank production correctness at `diff=0.000708`.  PTXAS nevertheless
+still emits `REG:128, STACK:16`, and SASS contains four `STL` plus six `LDL`
+instructions.  Dynamic `setmaxnreg` limits therefore do not change the
+compiler's static 128-register allocation ceiling.  R173 fails before NCU.
+
+SASS identifies the four stack values as hoisted packed-row offsets: each is
+loaded, added to the packed shared-memory base, and immediately consumed by
+an `LDS.64`.  They are neither WGMMA accumulators nor decoded payloads.
+
+### R174 removes the frame but exposes the LDS dependency chain
+
+R174 restored the normal 48/48/208 role limits and kept the same complete-row
+ownership.  A narrow inline-PTX helper computes the packed K-pair byte offset,
+applies the existing B64 swizzle XOR, forms the shared address, and issues
+`LDS.64` in one block.  Only the two loaded words escape the helper, so PTXAS
+cannot hoist four addresses across the persistent stage loop.  Decode,
+lookup, expanded-B store addresses, WGMMA, stages, epilogue, and task ordering
+remain unchanged.
+
+Production Pro M512 passes at `diff=0.000710`.  Both production and one-rank
+profile cubins compile at 125 registers, zero stack/local memory, and contain
+no `LDL` or `STL`.  This validates the spill-removal mechanism.
+
+Fresh same-clock one-rank/48-expert NCU nevertheless rejects its schedule:
+
+| metric | R152 paired lookahead | R174 scoped complete row | change |
+| --- | ---: | ---: | ---: |
+| SM frequency | 1.79 GHz | 1.79 GHz | unchanged |
+| elapsed cycles | 4,004,326 | 4,044,209 | +1.00% |
+| raw duration | 2.23 ms | 2.25 ms | about +0.9% |
+| warp instructions | 512,875,353 | 494,982,512 | -3.49% |
+| thread instructions | 16,188,657,803 | 15,616,643,800 | -3.53% |
+| issued warps/scheduler | 0.41 | 0.39 | -4.88% |
+| cycles with no eligible warp | 58.69% | 60.59% | +1.90 pp |
+| warp cycles/issued instruction | 9.63 | 10.11 | +4.98% |
+| sampled total stalls | 151,474 | 153,280 | +1.19% |
+| sampled long-scoreboard stalls | 39,650 | 39,547 | -0.26% |
+| sampled short-scoreboard stalls | 5,274 | 12,634 | +139.55% |
+
+Aggregate excessive shared wavefronts are effectively unchanged
+(`2,828,122 -> 2,827,776`), so replay is not the regression.  Recomputing the
+address inside the opaque load block serializes its integer-address result
+directly into `LDS.64`; the large short-scoreboard increase outweighs the
+3.5% instruction reduction.  This is the regular-Pro counterpart of R171's
+Flash direct-load failure.
+
+R174 is stopped before NSYS and distributed A/B/A timing and fully reverted
+to byte-identical R152.  R173's source/cubin/SASS/local-opcode diagnosis,
+R174's correctness/resources/source/cubin/SASS/NCU, and the fresh R152 NCU
+control are archived under `iter555-r173-pro-m512-reg-rebalance-gate`,
+`iter556-r174-pro-m512-scoped-lds-gate`, and
+`iter557-r152-pro-m512-ncu-control`.
