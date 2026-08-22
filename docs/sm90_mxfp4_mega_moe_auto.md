@@ -11438,3 +11438,57 @@ the roughly 0.5% achieved by that rejected family.
 
 The three raw JSON logs are archived remotely and in a fresh local snapshot
 under `iter607-pr383-r191-pr383-full-matrix`.
+
+## R192 rejected: PRMT exponent extraction for Pro M512
+
+### Reason and implementation correction
+
+The R191 matrix leaves Pro M512 4.02% behind the surrounding PR383 mean.
+R76 had already rejected replacing the regular decoder's pair-index bit
+expression with `PRMT`, but it did not test the separate UE8M0 exponent-byte
+extractor that is retained for Pro M32/M64.  R192 therefore tested that
+existing extractor only for the exact routed Pro M512 template.  It changes
+no packed address, exponent value, lookup, expanded tile, WGMMA, epilogue, or
+PR411 path.
+
+The first implementation changed only the native JIT generator source.  The
+pod's already built generator continued emitting `use_prmt=false`; the three
+captures under `iter608-r192-pro-m512-prmt-exponent-gate` therefore had
+identical machine work and are explicitly invalidated as a no-op.  R192a
+moved the selector into the device header using the exact signature
+`!shared && hidden=7168 && !swap_ab && bank_permute && !swizzle_l2_cd`, which
+uniquely identifies routed DSV4 Pro M512 under the retained host policy.  The
+effective temporary header SHA256 was
+`44e51aa924c56c5b6ef8ad11d2f8e2b1431f627f9d29660e4ae7e41c606986ca`.
+
+### Correctness, resources, and matched NCU rejection
+
+Eight-rank `production.pro_m512` passes at `diff=0.000713`.  Its cubin remains
+at 128 registers/thread with `STACK=0`, `LOCAL=0`, and the unchanged two-CTA
+occupancy contract.  The valid one-rank/48-expert R192a/R191/R192a NCU
+sandwich uses seed zero, cold L2, and identical 13-pass section sets:
+
+| metric | R192a first | R191 control | R192a last | candidate range vs control |
+| --- | ---: | ---: | ---: | ---: |
+| duration | 2.425280 ms | 2.419904 ms | 2.419392 ms | +0.222% to -0.021% |
+| executed instructions | 508,342,809 | 512,872,005 | 508,337,876 | -0.883% to -0.884% |
+| issued instructions | 508,374,497 | 512,910,724 | 508,367,097 | -0.884% to -0.886% |
+| issue active | 40.969% | 41.280% | 40.932% | -0.311 to -0.348 pp |
+| barrier samples | 63,854 | 63,594 | 64,205 | +0.41% to +0.96% |
+| short-scoreboard samples | 5,436 | 5,305 | 5,320 | +2.47% to +0.28% |
+| wait samples | 15,812 | 15,837 | 15,568 | -0.16% to -1.70% |
+
+The exponent substitution removes about 0.884% of dynamic instructions, but
+lowers issue activity and exposes more barrier/scoreboard pressure.  One
+candidate duration is slower and the other is effectively flat; there is no
+critical-cycle mechanism large enough to enter distributed timing.  R192 is
+rejected at the local NCU gate without NSYS or PR383 timing.
+
+The candidate is fully reverted locally and on the pod.  The restored R191
+header is byte-identical to
+`7abe0773a73b6295226872cd92762732c16a7115b7a08e3cdfa8bea738d0d56d`,
+and recovery `production.pro_m512` passes at `diff=0.000714`.  Effective
+sources, correctness/resource output, all three valid NCU reports and CSVs,
+the invalidated no-op evidence, and recovery output are archived under
+`iter608-r192-pro-m512-prmt-exponent-gate` and
+`iter609-r192a-pro-m512-device-prmt-exponent-gate`.
