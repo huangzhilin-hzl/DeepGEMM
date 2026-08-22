@@ -10543,3 +10543,75 @@ The fresh PR383/R180/PR383 22-point matrix is tracked separately because its
 second PR383 control was interrupted by a Kubernetes control-plane outage;
 it is not needed to establish the R152-to-R180 improvement above and will be
 appended only after the missing control is measured.
+
+## R181 rejected: evict Flash M16 packed weights first
+
+### Reason and temporary implementation
+
+The last retained PR383 matrix left Flash M16 as the largest Flash residual.
+DeepGEMM PR404 reported that marking small-token weight TMA traffic
+`EVICT_FIRST` helped SM100 by reducing the time that one-use weight rows occupy
+L2.  R181 tested the same mechanism on the SM90 packed-MXFP4 path without
+changing scheduling, arithmetic, tensor-map layout, staging, or barriers.
+
+The generic `tma::copy` helper temporarily accepted a compile-time cache hint,
+defaulting to `EVICT_NORMAL` for every existing caller.  Only the exact
+`kHidden == 4096 && kLocalSwapABTokens == 16` Flash M16 specialization passed
+`EVICT_FIRST` for packed-weight loads.  SASS comparison confirmed that the
+only generated-code change was the TMA descriptor cache-policy immediate,
+`0x10000000 -> 0x12f00000`, at the target weight loads; instruction layout and
+control flow were unchanged.
+
+### Correctness and resource gates
+
+The eight-rank `production.flash_m16` case passes at `diff=0.000654`, and the
+PR411 concentrated-routing `swap_ab_cross_rank_bound.flash_m16` case passes at
+`diff=0.000663`, both identical to R180.  The production specialization remains
+at 128 registers with zero stack/spill, and the matched one-rank, 32-expert
+profiler specialization remains at 118 registers with zero stack/spill.
+
+### Matched NCU result
+
+One-rank/32-expert, seed-zero, cold-L2 NCU used an R181/R180/R181 ordering with
+identical sections, launch, and profiler shape:
+
+| metric | R181 first | R180 control | R181 last | candidate range vs control |
+| --- | ---: | ---: | ---: | ---: |
+| elapsed cycles | 433,214 | 436,303 | 435,998 | -0.71% to -0.07% |
+| duration | 262.11 us | 263.49 us | 263.04 us | -0.52% to -0.17% |
+| global-load sectors | 831,819 | 833,710 | 836,940 | -0.23% to +0.39% |
+| warp instructions | 60,240,456 | 60,242,213 | 60,259,367 | -0.003% to +0.028% |
+| thread instructions | 1,874,374,579 | 1,874,474,683 | 1,874,223,117 | -0.005% to -0.013% |
+| L2 hit rate | 57.41% | 57.81% | 57.75% | -0.40 to -0.06 pp |
+| cycles with no eligible warp | 54.75% | 54.93% | 54.66% | -0.18 to -0.27 pp |
+
+The hint is encoded and both candidate captures use slightly fewer elapsed
+cycles, but the minimum advantage is only 0.07%.  Transactions, dynamic
+instructions, and L2 hit rate do not improve consistently.  This is a weak
+local signal, not evidence of a robust distributed mechanism.
+
+### Authoritative double-order rejection
+
+Both orders use eight ranks, seed zero, cold L2, one warmup, 50 observations,
+20 launches per observation, and maximum-rank median:
+
+| order | first | middle | last | R181 comparison |
+| --- | ---: | ---: | ---: | --- |
+| R181 / R180 / R181 | 345.1225 us | 348.0290 us | 334.5725 us | R181 is 0.84% and 3.87% faster |
+| R180 / R181 / R180 | 340.8075 us | 347.5430 us | 345.2680 us | R181 is 1.98% and 0.66% slower |
+
+The sign reverses with execution order.  In the required control/candidate/
+control order, R181 loses to both surrounding controls, so it fails the
+distributed acceptance gate despite the weak one-rank NCU result.  NSYS is not
+advanced after this rejection because it cannot override the authoritative
+timing result.
+
+Both temporary header changes are fully reverted.  The restored device header
+is byte-identical to R180 at
+`cf91f518a72aec9c897b617b565a81031d5fdcdb80f653a85c7bb59baf3d2fd9`,
+and the recovery `production.flash_m16` case again passes at `diff=0.000654`.
+Candidate source, hashes, correctness/resource logs, cubins/SASS, NCU reports,
+and both formal orders are archived under
+`iter577-r181-flash-m16-evict-first-gate`,
+`iter578-r181-r180-r181-flash-m16-formal`, and
+`iter579-r180-r181-r180-flash-m16-reverse-formal`.
