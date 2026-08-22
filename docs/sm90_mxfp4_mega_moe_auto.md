@@ -12229,3 +12229,110 @@ excluded protocol-mismatch order, three NSYS reports and statistics, the 43
 scenario log, the complete matrix, and the reverse PR383 order are stored on
 the pod under `iter623` through `iter632` and locally under
 `.codex-artifacts/iter632-r203-curated-artifacts`.
+
+## Rejected experiment R204: producer-built Flash M16 decoder lookup in C/D storage
+
+### Motivation and implementation
+
+R203 removes the padded-row scale selects, but its matched SourceCounters still
+show the inline UE8M0-to-E4M3 decoder as the dominant instruction excess over
+PR383: approximately 9.05 million `LOP3`, 6.91 million `PRMT`, and 4.25 million
+`IMAD` instructions remain.  R204 tested whether the packed-B producer could
+pay that decode cost once and let the math warp load already-decoded values.
+
+The experiment was compile-time restricted to the exact Flash M16/N8 case.  It
+temporarily used 12 KiB of the 16 KiB C/D shared-memory region as three
+stage-local `[K32][N]` decoder lookup tables.  While the elected B producer
+issued the packed-B TMA, the remaining lanes expanded UE8M0 offsets into E4M3
+bytes.  The consumer replaced the integer decode sequence with contiguous
+`LDS.64` loads.  No other shape or scheduler path changed.
+
+### Gate result and rejection
+
+The prototype compiled, but the eight-rank production correctness gate returned
+`diff nan`.  It also moved the exact kernel from R203's spill-free resource
+state to 128 registers, a 24-byte stack frame, 36 bytes of spill stores, and
+68 bytes of spill loads.  R203 is 128 registers with zero stack, local memory,
+and spills.
+
+The failure identifies a lifetime error in the proposed alias: the persistent
+producer may prefetch the next task while the previous task's epilogue is still
+using C/D storage.  The lookup writer can therefore overwrite live output even
+though the same-task mainloop appears to have finished with C/D.  The resource
+regression independently rejects the approach.  R204 was reverted immediately;
+the restored R203 source again passed at `diff=0.000654` with zero stack and
+spills.  No timing, NCU, NSYS, or matrix claim is made for R204.
+
+The raw gate logs are on the pod under
+`iter633b-r204-flash-m16-producer-lookup-gate`.  The source, hashes, gate logs,
+and recovery evidence are included locally in
+`.codex-artifacts/iter638-r204-r205-curated-artifacts`.
+
+## Rejected experiment R205: split packed-B TMA and scale-copy barrier arrival
+
+### Motivation and implementation
+
+R205 tested a smaller scheduling change that did not retain decoded values.
+For exact Flash M16 only, the full barrier used three arrivals instead of two.
+The elected B lane first called `arrive_and_expect_tx(8192)` and issued the
+packed-B TMA.  All warp lanes then performed the explicit 512-byte scale
+`LDG`/`STS` copy; after `__syncwarp()`, the elected lane made the third ordinary
+arrival to publish those scale stores.  The intent was to overlap the TMA
+engine with the software scale copy without changing the consumer or data
+layout.
+
+Correctness passed with `production.flash_m16 diff=0.000654`.  The ptxas gate
+also matched R203 at 128 registers with zero stack and spills.  The candidate
+header SHA-256 was
+`19e1963b7937ad83a4300ea6240f49c85675a39a5c575771ce0209ef587e2f42`.
+
+### NCU micro-profile
+
+The matched R205/R203/R205 one-rank SourceCounters runs used 32 experts, seed
+zero, cold L2, and 20 replay passes on one H20.  Both candidate captures show a
+small isolated-kernel improvement, but the instruction count rises slightly.
+
+| Metric | R205 first | R203 control | R205 last | Candidate change |
+| --- | ---: | ---: | ---: | ---: |
+| Duration | 254.336 us | 254.784 us | 254.400 us | -0.18% / -0.15% |
+| GPC cycles | 419,953.286 | 420,830.143 | 419,909.429 | -0.21% / -0.22% |
+| Instructions executed | 58,402,448 | 58,312,019 | 58,373,914 | +0.16% / +0.11% |
+| Barrier stall ratio | 3.038212 | 3.056603 | 3.036320 | -0.60% / -0.66% |
+| Long-scoreboard ratio | 2.788808 | 2.789448 | 2.791981 | -0.02% / +0.09% |
+| Shared conflicts | 489 | 489 | 489 | unchanged |
+| Excessive wavefronts | 28,422 | 28,422 | 28,422 | unchanged |
+
+### Authoritative distributed timing
+
+The acceptance gate used the exact eight-rank Flash M16 protocol: 50
+observations, 20 launches per observation, one warmup, cold L2, seed zero, and
+maximum-rank medians.  Both implementation orders were measured.
+
+| Order | First | Middle | Last | Candidate comparisons |
+| --- | ---: | ---: | ---: | --- |
+| R205 / R203 / R205 | 341.8015 us | 339.4495 us | 328.3210 us | +0.69% / -3.28% |
+| R203 / R205 / R203 | 330.4955 us | 341.6135 us | 340.7135 us | +3.36% / +0.26% |
+
+Three of four bracket comparisons regress.  The two candidate medians average
+337.2453 us, versus 336.8862 us for the three controls, so R205 is 0.11% slower
+on the authoritative distributed test.  The isolated NCU saving does not
+survive persistent multi-rank scheduling; the extra barrier arrival is not
+free at the final workload level.  R205 was therefore reverted without NSYS or
+full-matrix qualification.  The restored header SHA-256 is R203's
+`80237849c5870eea3e8af0fb74efb9a207d40fecce9a7d0346408f90c9df8b1e`.
+
+The R205 correctness/resource gate, three NCU reports, raw SourceCounters,
+candidate source, both formal orders, and hashes are on the pod under
+`iter634` through `iter637` and locally under
+`.codex-artifacts/iter638-r204-r205-curated-artifacts`; its manifest verifies
+all 37 files.
+
+### Updated direction after R204 and R205
+
+R204 rules out treating C/D as producer scratch across persistent tasks: its
+lifetime extends into the epilogue while the producer can already be working
+ahead.  R205 rules out an extra software arrival as a robust way to expose the
+packed-B TMA.  The retained implementation remains R203.  Subsequent work must
+avoid both longer decoder live ranges and more barrier protocol, and should
+first profile a current final-matrix losing point before changing arithmetic or
+scheduler policy again.
