@@ -12336,3 +12336,96 @@ packed-B TMA.  The retained implementation remains R203.  Subsequent work must
 avoid both longer decoder live ranges and more barrier protocol, and should
 first profile a current final-matrix losing point before changing arithmetic or
 scheduler policy again.
+
+## R203/PR383 residual recheck before R206
+
+The next diagnostic remeasured the apparent final-matrix losses instead of
+assuming that all four large-M point estimates represented source-level
+regressions.  It used the same H20 pod, eight ranks, seed zero, cold L2, 20
+launches per observation, one warmup, maximum-rank medians, and 15 observations
+at each selected point.  The order was R203/PR383/R203.
+
+| Model / M | R203 first | PR383 | R203 last | Mean R203 vs PR383 |
+| --- | ---: | ---: | ---: | ---: |
+| Flash / 256 | 514.583 us | 535.664 us | 495.908 us | -5.68% |
+| Flash / 512 | 913.969 us | 947.162 us | 957.217 us | -1.22% |
+| Pro / 256 | 1,643.000 us | 1,650.769 us | 1,635.000 us | -0.71% |
+| Pro / 512 | 2,535.000 us | 2,420.874 us | 2,530.000 us | +4.61% |
+
+Negative means R203 is faster.  Flash M256, Flash M512, and Pro M256 are not
+current structural losses: their earlier three-observation matrix points were
+order/noise effects.  Pro M512 is different: both brackets are slower than
+PR383 (+4.71% and +4.51%), so the subsequent experiment was scoped only to its
+exact compile-time configuration.  The raw diagnostic and generated cubins are
+stored under `iter639-r203-pr383-r203-m256-m512-diagnostic`.
+
+## Rejected experiment R206: packed FP16 WGMMA accumulation for Pro M512
+
+### Motivation and implementation
+
+Historical Pro M512 decoder batching variants reduced scalar instructions but
+lost their gains to spills or shared-memory scoreboards.  R206 instead tested
+whether reducing the WGMMA accumulator footprint would create enough issue
+headroom without lengthening decoder values.  It was compile-time restricted
+to the exact fast-math Pro M512 path (`H=7168`, packed-pair decoder enabled,
+non-swapped M, and non-swizzled C/D); all other shapes and strict-math paths
+retained the FP32 WGMMA.
+
+The prototype added an `MMA_64x128x32_F16E4M3E4M3_SS_TN` wrapper with 32 packed
+32-bit accumulator registers instead of 64 FP32 registers.  Each completed
+WGMMA fragment was converted from packed `half2` through `float2` into the
+existing `nv_bfloat162` persistent cross-K-block sum.  The latter was kept so
+the output/scale path and its accumulation contract remained unchanged.
+
+The production Pro M512 correctness gate passed at `diff=0.000709`.  Ptxas
+reported 126 registers, zero stack, zero spill stores/loads, and six barriers;
+R203 reports 128 registers with the same zero-stack/spill state.  Hardware
+allocation still rounds both launches to 128 registers per thread, so the
+two-register compiler reduction does not change occupancy.
+
+### Matched NCU result
+
+The NCU gate used R206/R203/R206 application-replay captures on one H20, one
+rank, 48 experts, seed zero, cold L2, and 20 replay passes.  Both candidate
+captures are slower and execute approximately 94.18 million more SM
+instructions than R203.
+
+| Metric | R206 first | R203 control | R206 last | Candidate change |
+| --- | ---: | ---: | ---: | ---: |
+| Duration | 2.272000 ms | 2.229408 ms | 2.260160 ms | +1.91% / +1.38% |
+| GPC elapsed cycles | 4,048,990 | 3,992,193 | 4,048,101 | +1.42% / +1.40% |
+| SM active cycles | 4,042,765 | 3,988,006 | 4,041,640 | +1.37% / +1.34% |
+| Executed SM instructions | 607,053,466 | 512,876,168 | 607,043,463 | +18.36% / +18.36% |
+| Thread instructions | 19,461,707,249 | 16,451,364,052 | 19,463,372,568 | +18.30% / +18.31% |
+| Issue active | 48.05% | 41.18% | 48.06% | +6.87 / +6.89 pp |
+| Warp cycles per instruction | 8.265 | 9.647 | 8.266 | -14.33% / -14.32% |
+| Barrier stall samples | 65,125 | 63,859 | 65,231 | +1.98% / +2.15% |
+| Long-scoreboard samples | 39,764 | 39,624 | 39,813 | +0.35% / +0.48% |
+| Short-scoreboard samples | 4,248 | 5,352 | 4,147 | -20.63% / -22.51% |
+| Warpgroup-arrive samples | 386 | 278 | 424 | +38.85% / +52.52% |
+
+The packed accumulator does make each warp easier to issue: short-scoreboard
+samples and cycles per instruction fall, while issue-active rises.  It does not
+reduce absolute barrier or long-scoreboard pressure, however, and the
+half2-to-float2-to-BF16 promotion creates enough fixed scalar work to increase
+the total instruction stream by 18.36%.  The resulting cycle and duration
+regressions agree on both sides of the control.
+
+### Decision and updated direction
+
+R206 was reverted at the NCU gate.  No NSYS or distributed full-matrix result is
+claimed because the isolated kernel already fails both candidate/control
+brackets.  The restored main header, MMA helper, and WGMMA helper SHA-256 values
+are R203's `80237849c5870eea3e8af0fb74efb9a207d40fecce9a7d0346408f90c9df8b1e`,
+`548fe0c63d7f36527a3d2b87d5ee8f1330c6fb5cc98bec1bc4bd9e20735482ff`, and
+`dad341b3c4d2a1ea3a68c6028b454c72c6ce6105e86dfcdea6aaef243164ec1b`.
+
+The evidence narrows the next direction: Pro M512 does not need more issue
+slots obtained by changing accumulator precision; it needs less fixed decoder
+and promotion work per routed block without adding shared-memory dependency or
+live ranges.  A future packed-F16 attempt would only be viable if scaling and
+cross-K accumulation can remain packed and remove the round-trip conversion,
+not merely move it after WGMMA.  R206 correctness, resources, source snapshots,
+three NCU reports/CSVs, and the preceding residual diagnostic are archived
+locally under `.codex-artifacts/iter642-r206-curated-artifacts` and on the pod
+under `iter642-r206-curated-artifacts`.
