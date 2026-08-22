@@ -11492,3 +11492,44 @@ sources, correctness/resource output, all three valid NCU reports and CSVs,
 the invalidated no-op evidence, and recovery output are archived under
 `iter608-r192-pro-m512-prmt-exponent-gate` and
 `iter609-r192a-pro-m512-device-prmt-exponent-gate`.
+
+## R193-R193b rejected: factor Pro M512 secondary scale
+
+### Reason and variants
+
+R179 showed that the expert-wide MXFP4 secondary can be factored out of the
+per-K-block packed-BF16 promotion for Pro M8.  Pro M512 has the largest fresh
+PR383 residual and performs about 80 L1/L2 promotions per routed task, so R193
+tested the same algebra under the exact routed Pro M512 selector.  The hot
+loop retained the activation scale and overflow-safe x64 compensation but
+omitted the invariant secondary; the secondary was applied once when the 32
+packed BF16 pairs were expanded into the regular 64-value FP32 fragment.
+
+Three final-scaling schedules were compiled:
+
+| variant | final secondary schedule | correctness diff | registers | stack | decision |
+| --- | --- | ---: | ---: | ---: | --- |
+| R193 | 64 unrolled FP32 multiplies during expansion | 0.000709 | 128 | 16 B | reject |
+| R193a | 32 unrolled in-place packed-BF16 `HMUL2`, then original expansion | 0.000819 | 128 | 16 B | reject |
+| R193b | serialized packed-BF16 pre-scaling loop, then original expansion | 0.000714 | 128 | 128 B | reject |
+
+The exact temporary header SHA256 values were
+`51c74488967d3ef8b9bc1fa5a42d7d628cb4854f15bd1149e03fd9c5288dc2ea`,
+`a4d8bdd204408ccc34f3dbfc87874111b4481e33873afe3e4e6e59ee9541cda2`,
+and
+`986ace525b71dc737e28625c770de70c24d7b5bb31e96febda3f573909038f02`.
+All variants preserve numerical behavior within the production tolerance,
+but none preserves the zero-stack two-CTA resource contract.  The regular
+M512 path already keeps a 64-value accumulator at the 128-register ceiling;
+delaying the secondary adds final-scaling state across that fragment.  Making
+the packed loop non-unrolled increases rather than reduces the compiler frame,
+matching the runtime-loop failures in R129/R130c.
+
+R193 is therefore rejected at the mandatory resource gate before NCU, NSYS,
+or distributed timing.  The source is fully reverted locally and on the pod
+to the R191 header SHA256
+`7abe0773a73b6295226872cd92762732c16a7115b7a08e3cdfa8bea738d0d56d`;
+recovery `production.pro_m512` passes at `diff=0.000715`.  All three source
+snapshots, correctness/resource logs, and recovery output are archived under
+`iter610-r193-pro-m512-factor-secondary-gate` through
+`iter612-r193b-pro-m512-serial-packed-secondary-gate`.
