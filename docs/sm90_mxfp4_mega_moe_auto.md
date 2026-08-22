@@ -11844,3 +11844,84 @@ and recovery `production.pro_m512` passes at `diff=0.001071`.  Exact host and
 device sources, correctness/resources, both isolated host extensions' hashes,
 three NCU reports/CSVs, and recovery evidence are archived under
 `iter619-r199-pro-m512-swap-gate`.
+
+## R200 rejected: dedicate the second dispatch warp to Pro M512 scheduling
+
+### Reason and temporary implementation
+
+Pro M512 remains 4.02% behind the surrounding PR383 mean.  The accepted
+kernel uses two dispatch warps, then lets the B-loader warp both claim routed
+tasks and stage B/SFB.  The scheduler topology highlighted by sgl-project
+DeepGEMM PR69 instead separates task production from operand loading.  R200
+tested that mechanism only for the exact hidden-7168 Pro M512 schedule: it
+reduced dispatch from two warps to one, converted the released warp into a
+dedicated scheduler, and retained the A-loader, B-loader, and one 128-thread
+math warpgroup.  The CTA therefore remained at 256 threads and its complete
+frontend warpgroup retained the same aggregate register budget.
+
+The scheduler consumed dispatch's CTA-local expert-count snapshot and filled
+the existing two-stage `TaskInfo` ring.  B became a third mailbox consumer and
+released each slot after copying the task, while A and the math warpgroup kept
+their existing consumption protocol.  The empty-barrier arrival count changed
+from 160 to 192 threads.  Reducing the dispatch barrier array from two entries
+to one initially exposed a compile-time 16-byte `TaskInfo` alignment failure;
+the final candidate inserted one parity-dependent barrier slot before the
+mailbox.  Other schedules, cross-rank wire completion, math, epilogue, and the
+PR411 M64 storage bound were unchanged.  The final temporary device/scheduler
+SHA256 values were `855c583a785a58e636579e8db2d95a051f4ddc695d6580ea54aab731514c7458`
+and `44a87dc63a04c1a881e63ea7b436e203d1d7ed6f703ab8a1ed0f167cb141ff62`.
+
+Eight-rank `production.pro_m512` passes at `diff=0.000714`.  The production
+cubin preserves `REG=128`, `STACK=0`, `LOCAL=0`, and `SHARED=1024`, so the
+candidate passes the numerical and resource gates.
+
+### Matched NCU evidence
+
+The matched one-rank/48-expert order was R200/R191/R200 with seed zero, cold
+L2, and identical 39-pass full NCU sections.  Percentages compare each
+candidate capture with the middle R191 control:
+
+| metric | R200 first | R191 control | R200 last | candidate change |
+| --- | ---: | ---: | ---: | ---: |
+| duration | 2.422912 ms | 2.428384 ms | 2.423840 ms | -0.225% / -0.187% |
+| elapsed cycles/SM | 311,315,178 | 310,657,748 | 310,916,444 | +0.212% / +0.083% |
+| executed instructions | 513,389,879 | 512,869,978 | 513,384,889 | +0.101% / +0.100% |
+| issued instructions | 513,477,070 | 512,913,198 | 513,473,483 | +0.110% / +0.109% |
+| issue active | 41.388% | 41.334% | 41.338% | +0.054 / +0.004 pp |
+| eligible warps/cycle | 0.520 | 0.521 | 0.519 | -0.001 / -0.002 |
+| short-scoreboard samples | 5,431 | 5,221 | 5,362 | +4.02% / +2.70% |
+| long-scoreboard samples | 57,271 | 39,524 | 57,576 | +44.90% / +45.67% |
+| barrier samples | 45,165 | 63,680 | 45,537 | -29.08% / -28.49% |
+| shared-load conflicts | 116,852 | 122,926 | 113,508 | -4.94% / -7.66% |
+| shared-store conflicts | 9,282,264 | 8,849,156 | 9,265,529 | +4.89% / +4.71% |
+
+The dedicated warp does what it was intended to do locally: barrier samples
+fall by about 29% and shared-load conflicts fall by 5--8%.  It does not remove
+work, however, and task consumption shifts the wait to data dependencies:
+long-scoreboard samples rise by about 45%, instruction count rises by 0.1%,
+and both elapsed-cycle captures regress.  The slightly lower NCU wall times
+therefore do not establish a mechanism win and required a distributed timing
+gate.
+
+### Eight-rank timing rejection
+
+The R200/R191/R200 production gate used seed zero, cold L2, one warmup, three
+observations, 20 launches per observation, and maximum-rank medians:
+
+| order | first | middle | last | R200 comparison |
+| --- | ---: | ---: | ---: | --- |
+| R200 / R191 / R200 | 2,581 us | 2,565 us | 2,649 us | R200 is 0.624% and 3.275% slower |
+
+R200 is slower than the same middle control on both sides, matching the NCU
+cycle and long-scoreboard regressions.  The separate scheduler is therefore
+not the missing Pro M512 critical-path overlap in this one-math-warpgroup H20
+schedule.  R200 is rejected before reverse-order formal timing, NSYS, or the
+43-scenario suite.
+
+Both source files are fully restored locally and on the pod to R191 SHA256
+`7abe0773a73b6295226872cd92762732c16a7115b7a08e3cdfa8bea738d0d56d`
+and `53bd25a68da38db8b6cdbb20db20ee31cae3f590bd1347e5d5c8775e0e1d1b0f`;
+recovery `production.pro_m512` passes at `diff=0.000904`.  The initial alignment
+failure, corrected sources, correctness/resources, three NCU reports/CSVs,
+distributed timing logs, hashes, and recovery evidence are archived under
+`iter620-r200-pro-m512-dedicated-scheduler-gate`.
