@@ -10120,3 +10120,73 @@ R174's correctness/resources/source/cubin/SASS/NCU, and the fresh R152 NCU
 control are archived under `iter555-r173-pro-m512-reg-rebalance-gate`,
 `iter556-r174-pro-m512-scoped-lds-gate`, and
 `iter557-r152-pro-m512-ncu-control`.
+
+## R175 rejected: batch the two current Pro M512 packed-row loads
+
+### Reason and temporary implementation
+
+R174 proved that a complete-row Pro M512 decoder can be made spill-free, but
+serializing address generation directly into each `LDS.64` exposed a costly
+short-scoreboard chain.  R175 tested the narrow point between that fully
+serial schedule and R127b's register-heavy current-plus-next-K32 lookahead:
+for each K32 group it issued both independent current `LDS.64` pairs first,
+kept only those two `uint2` values live, and then performed lookup, decode,
+and stores for both pairs.  It did not retain any next-K32 payload.
+
+The specialization was restricted to exact routed Pro M512.  Packed and
+expanded shared-memory layouts, B64 bank permutation, scale lookup, x8
+decode, WGMMA, pipeline stages, scheduler, epilogue, and every other shape
+were unchanged.  Production correctness passes at `diff=0.000710`.
+Production and one-rank profile cubins compile at 126 registers with zero
+stack/local memory and no `LDL` or `STL`.
+
+### NCU improvement is not a timing improvement
+
+Fresh one-rank/48-expert NCU at the same 1.80 GHz clock shows a real dynamic
+instruction reduction, but no reduction in the latency-limited critical
+path:
+
+| metric | R152 paired lookahead | R175 current-pair batch | change |
+| --- | ---: | ---: | ---: |
+| elapsed cycles | 4,004,326 | 3,987,838 | -0.41% |
+| warp instructions | 512,875,353 | 487,079,238 | -5.03% |
+| thread instructions | 16,188,657,803 | 15,363,829,586 | -5.10% |
+| issued warps/scheduler | 0.41 | 0.39 | -4.88% |
+| cycles with no eligible warp | 58.69% | 60.76% | +2.07 pp |
+| warp cycles/issued instruction | 9.63 | 10.14 | +5.30% |
+| sampled total stalls | 151,474 | 151,382 | -0.06% |
+| sampled barrier stalls | 63,849 | 65,312 | +2.29% |
+| sampled long-scoreboard stalls | 39,650 | 39,518 | -0.33% |
+| sampled short-scoreboard stalls | 5,274 | 6,187 | +17.31% |
+| sampled wait stalls | 15,809 | 15,181 | -3.97% |
+
+The two-load batch recovers most of R174's short-scoreboard regression and
+removes about five percent of instructions, but it still lowers eligible
+warp supply.  The small `-0.41%` cycle result was therefore promoted to the
+distributed gate rather than treated as sufficient evidence.
+
+### Formal A/B/A rejection
+
+The authoritative Pro M512 test uses eight H20 ranks, seed zero, cold L2,
+one warmup, three observations, and 20 launches per observation.  Acceptance
+uses maximum-rank median.  Both orders were run because the node exhibits
+multi-percent temporal drift:
+
+| order | first | middle | last | candidate comparison |
+| --- | ---: | ---: | ---: | --- |
+| R152 / R175 / R152 | 2,586 us | 2,566 us | 2,655 us | R175 is 0.77% and 3.35% faster |
+| R175 / R152 / R175 | 2,563 us | 2,534 us | 2,555 us | R175 is 1.14% and 0.83% slower |
+
+The positive order is therefore a time-order artifact: it does not reproduce
+when the candidate surrounds the control.  R175 fails the required
+double-order gate despite its instruction reduction.  NSYS and the full
+22-point Flash/Pro matrix are intentionally not run for a rejected candidate,
+because neither can override the authoritative timing failure.
+
+R175 is fully reverted to byte-identical R152 on both host and pod.  Its exact
+source, correctness and resource logs, production/profile cubins and SASS,
+NCU report/source counters, both formal timing orders, hashes, and the exact
+R152 source control are archived under
+`iter558-r175-pro-m512-current-pair-lds-gate`,
+`iter559-r175-pro-m512-formal`, and
+`iter560-r175-pro-m512-reverse-formal`.
