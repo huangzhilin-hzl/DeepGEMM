@@ -11117,3 +11117,107 @@ and recovery `production.pro_m8` passes at `diff=0.000716`.  Exact sources,
 hashes, correctness/resource logs, three NCU reports and CSV exports, and
 recovery output are archived under
 `iter592-r188-pro-m8-packed-scale-product-gate`.
+
+## R189 accepted: hide the Pro M8 scale pair under WGMMA
+
+### Reason, implementation, and scope
+
+R188 showed that replacing two independent FP32 products with one packed
+BF16 dependency reduces instructions but lengthens the critical path.  The
+same scale work is nevertheless independent of the in-flight WGMMA result.
+For the exact Pro M8 hot template (`hidden=7168`, local M8 policy,
+`N_SWAP=8`, fast math), there is exactly one activation-scale pair per lane.
+R189 vector-loads that pair, applies R180's unchanged two FP32
+scale-by-secondary products, and packs the BF16x2 multiplier before
+`warpgroup_wait`; the existing HFMA2 promotion consumes it immediately after
+the wait.
+
+The selector excludes cross-rank destinations whose runtime `N_SWAP` grows
+to 16/32/64, so those PR411-bound fallback templates retain R180's original
+post-wait loop.  No value, rounding order, address, decoder operation, WGMMA,
+stage release, scheduler, epilogue, or other specialization changes.  Unlike
+R143's regular-M8192 experiment, the one packed multiplier crosses only the
+WGMMA wait, not a next-stage decoder.  The retained header SHA256 is
+`1047639cd57876c1a0b6f8f5506949f29cb75a446b590f9fe6519b9a45fe9372`.
+
+### Correctness and resource gates
+
+Eight-rank `production.pro_m8` passes at `diff=0.000716`, identical to R180.
+The production cubin uses 128 registers/thread with `STACK=0` and `LOCAL=0`;
+the matched one-rank/48-expert cubin uses 107 registers with no stack or
+spills.  The complete final suite passes 41/41 scenarios, including all
+production Flash/Pro cases, both PR411 concentrated-routing bounds, physical
+ring wrap, shared experts, mixed protocols, masked routes, and eight random
+stress cases.
+
+### Matched NCU mechanism
+
+The matched R189/R180/R189 order used one rank, 48 experts, seed zero, cold
+L2, lineinfo, and identical 21-pass sections:
+
+| metric | R189 first | R180 control | R189 last | candidate range vs control |
+| --- | ---: | ---: | ---: | ---: |
+| elapsed cycles | 1,096,017 | 1,121,985 | 1,103,547 | -2.31% to -1.64% |
+| duration | 666.368 us | 679.488 us | 670.208 us | -1.93% to -1.37% |
+| executed instructions | 159,203,405 | 159,207,575 | 159,238,177 | effectively flat |
+| issued instructions | 159,267,057 | 159,231,211 | 159,273,502 | effectively flat |
+| issue active | 46.97% | 45.96% | 47.12% | +1.01 to +1.16 pp |
+| eligible warps/cycle | 0.636 | 0.625 | 0.638 | +0.011 to +0.013 |
+| warp cycles/issued instruction | 8.445 | 8.636 | 8.423 | -2.21% to -2.46% |
+| barrier samples | 12,556 | 13,196 | 12,336 | -4.9% to -6.5% |
+| short-scoreboard samples | 3,309 | 3,416 | 3,391 | -3.1% to -0.7% |
+| wait samples | 4,438 | 4,433 | 4,288 | +0.1% to -3.3% |
+
+The instruction stream is unchanged in size; the gain is scheduling.  Moving
+the only N8 multiplier ahead of the dependency wait raises eligible-warp
+supply and issue activity while lowering cycles per issued instruction.  The
+stable cycle reduction directly validates the intended overlap mechanism.
+
+### Authoritative R180 double-order timing
+
+Both orders use eight ranks, seed zero, cold L2, one warmup, 50 observations,
+20 launches per observation, and maximum-rank median:
+
+| order | first | middle | last | R189 comparison |
+| --- | ---: | ---: | ---: | --- |
+| R180 / R189 / R180 | 752.807 us | 737.821 us | 759.464 us | R189 is 1.99% and 2.85% faster |
+| R189 / R180 / R189 | 732.026 us | 752.468 us | 727.671 us | R189 is 2.72% and 3.30% faster |
+
+All four comparisons are positive.  The conservative retained improvement is
+therefore 1.99%, and its 1.99--3.30% range agrees with the independent NCU
+cycle mechanism.
+
+### Low-perturbation NSYS qualification
+
+Only rank zero was wrapped by NSYS while ranks 1--7 ran normally.  The
+R189/R180/R189 persistent-kernel durations are
+`1138.175/1160.607/1138.751 us`, making the two candidates 1.93% and 1.88%
+faster than the shared control.  This is the first Pro M8 NSYS sandwich in
+this sequence whose two sides agree with both NCU and authoritative timing.
+The initial capture-range attempt omitted `DG_NCU_RANGE=1`, generated no
+report, and is retained but excluded; the corrected three reports use the
+same prewarmed protocol.
+
+### Fresh PR383 residual
+
+The direct target comparison uses the same 50-observation maximum-rank
+standard in both execution orders:
+
+| order | first | middle | last | comparison |
+| --- | ---: | ---: | ---: | --- |
+| PR383 / R189 / PR383 | 724.482 us | 729.958 us | 743.135 us | R189 is 0.76% slower and 1.77% faster; 0.52% faster than control mean |
+| R189 / PR383 / R189 | 738.855 us | 725.403 us | 734.948 us | R189 is 1.85% and 1.32% slower |
+
+PR383 itself moves 2.54% between the first order's controls.  Across both
+orders, the three R189 medians average 734.587 us and the three PR383 medians
+average 731.006 us, leaving R189 about 0.49% slower.  Thus R189 does not claim
+a stable pointwise PR383 win, but it narrows the fresh R180 matrix's Pro M8
+residual from 3.31% to roughly 0.49% while preserving the branch's aggregate
+PR383 lead.  Remaining work must find another local per-block mechanism of at
+least about one percent or reduce the route-quantized maximum-rank tail.
+
+Exact candidate/control sources, hashes, correctness and resource logs,
+three NCU reports and CSV exports, both R180 timing orders, the complete
+41-scenario suite, three valid NSYS reports, and both PR383 orders are archived
+under `iter593-r189-pro-m8-prewait-scale-gate` through
+`iter598-r189-pr383-r189-pro-m8-reverse-formal`.
