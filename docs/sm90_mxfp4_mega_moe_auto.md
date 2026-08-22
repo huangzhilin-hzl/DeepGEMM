@@ -12873,3 +12873,94 @@ change must shorten the routed block's true critical path rather than merely
 reduce producer instruction count: in particular, avoid adding another
 transaction-barrier dependency, preserve 156 workers, and remain independent
 of rank-local token counts as required by PR411.
+
+## Rejected experiment R216: pre-decode packed-FP16 promotion scales
+
+### Motivation and implementation
+
+R207's all-phase packed-FP16 accumulator removes 9.92% of Pro M512's executed
+instructions and lowers the compiler footprint from 128 to 107 registers, but
+its isolated gain is limited by the barrier tail.  In the retained pipeline,
+the current WGMMA group is issued, the next packed-B stage is decoded, and only
+then are the current stage's two activation scales loaded and combined with the
+expert secondary scale before the WGMMA wait.  R216 used R207's 21-register
+headroom to move just the two final 32-bit half2 promotion multipliers ahead of
+next-stage decode.
+
+The exact routed Pro M512 selector and packed-FP16 WGMMA are identical to R207.
+After each WGMMA issue, R216 loads the current SFA pair, applies the unchanged
+overflow-safe x64 compensation and secondary scale, and converts the two
+results to half2.  Only those two registers remain live while the alternate
+expanded-B slot is decoded.  Row offsets and FP32 intermediates die before the
+decode, so this does not repeat the spill-prone long live ranges tested by the
+complete-row variants.  The decoder order, stage/barrier count, 156-worker
+grid, ring bounds, dispatch completion protocol, and every rank-visible
+selector remain unchanged; the PR411 cross-rank quorum rules are therefore
+unaffected.
+
+The R216 main-header SHA-256 was
+`ef02f7451db1f2730cc4974c39c79dab500c8172cee44a1c6b105a94f8d8a1ac`.
+Its MMA and WGMMA helper hashes were the exact R207 values
+`7c83089f2599aab83bad295b4c5af6b24ede8baa5519f33ee09854eb078648fc`
+and `1bb7eaee870367c715b3350f19a086b3f27409bfc4beeb52db50093324181b1f`.
+
+### Correctness, resources, and matched NCU mechanism
+
+Eight-rank `production.pro_m512` passed at `diff=0.000595`.  The production
+cubin remained at 107 registers, zero stack, zero local memory, and 1,024
+bytes of static shared memory.  The matched R216/R207/R216 NCU sandwich used
+one H20, one rank, 48 experts, capacity 8192, Pro M512, seed zero, cold L2, and
+seven-pass application replay.
+
+| Metric | R216 first | R207 control | R216 last | R216 change |
+| --- | ---: | ---: | ---: | ---: |
+| Duration | 2.390208 ms | 2.403392 ms | 2.394368 ms | -0.549% / -0.376% |
+| GPC elapsed cycles | 3,942,498 | 3,958,695 | 3,941,505 | -0.409% / -0.434% |
+| Average SM active cycles | 3,928,097 | 3,938,106 | 3,922,796 | -0.254% / -0.389% |
+| Executed SM instructions | 460,905,449 | 461,986,648 | 460,910,259 | -0.234% / -0.233% |
+| Executed thread instructions | 15,091,171,091 | 15,127,412,659 | 15,091,964,367 | -0.240% / -0.234% |
+| Warp cycles per instruction | 10.586 | 10.585 | 10.573 | +0.010% / -0.110% |
+| Barrier stall samples | 70,102 | 68,983 | 69,868 | +1.622% / +1.283% |
+| Long-scoreboard samples | 39,408 | 39,438 | 39,559 | -0.076% / +0.307% |
+| Short-scoreboard samples | 5,119 | 4,907 | 5,291 | +4.320% / +7.826% |
+| Wait samples | 12,725 | 14,172 | 12,911 | -10.210% / -8.898% |
+
+The intended schedule works: elapsed cycles fall on both sides, wait samples
+fall by 9--10%, and shared-memory wavefronts are byte-for-byte unchanged.  The
+small instruction reduction comes from no longer rematerializing scale-path
+state after next-stage decode.  However, carrying the two multipliers shifts
+pressure into barrier and short-scoreboard stalls, limiting the incremental
+gain over R207 to 0.38--0.55%.  Against the recent same-protocol R203 diagnostic
+the combined R216 path is about 1.49--1.66% faster in isolated duration, which
+was sufficient to enter the authoritative distributed gate.
+
+### Eight-rank formal result and decision
+
+The forward R216/R203/R216 gate used 15 observations, 20 launches per
+observation, one warmup, cold L2, seed zero, capacity 8192, and maximum-rank
+medians from `tests/bench_mega_moe_sm90.py`:
+
+| Metric | R216 first | R203 control | R216 last | Candidate change |
+| --- | ---: | ---: | ---: | ---: |
+| Maximum-rank median | 2,554 us | 2,553 us | 2,528 us | +0.04% / -0.98% |
+| Rank-zero median | 2,530 us | 2,543 us | 2,509 us | -0.51% / -1.34% |
+
+R216 improves rank zero on both sides, but the user-requested maximum-rank
+standard is authoritative and its first bracket regresses.  The two candidate
+maximum-rank medians average 2,541 us, only 0.47% faster than the control;
+that is still smaller than the route-quantized cross-rank tail.  R216 was
+therefore rejected without a reverse order, NSYS, or full matrix: the first
+formal bracket already makes all-four-bracket acceptance impossible.
+
+R216 was fully reverted to R203.  Correctness, source hashes, resources, the
+three NCU reports/CSVs, and the formal logs are stored under
+`iter660-r216-pro-m512-predecode-scale-gate`,
+`iter661-r216-pro-m512-predecode-scale-ncu`, and
+`iter662-r216-r203-r216-pro-m512-formal15`.
+
+This experiment closes scale preparation as the missing enhancement to R207.
+It removes a measurable local wait, but neither R207 nor R216 changes the
+maximum-rank block-count imbalance that dominates Pro M512.  A subsequent
+candidate must reduce latency per routed M64 block enough to exceed this tail
+or change rank-consistent work assignment without deriving any quorum or
+storage bound from rank-local token counts.
