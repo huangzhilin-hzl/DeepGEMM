@@ -11533,3 +11533,42 @@ recovery `production.pro_m512` passes at `diff=0.000715`.  All three source
 snapshots, correctness/resource logs, and recovery output are archived under
 `iter610-r193-pro-m512-factor-secondary-gate` through
 `iter612-r193b-pro-m512-serial-packed-secondary-gate`.
+
+## R194 rejected: complete-row decode for Flash M256/M512
+
+### Reason, shared selector, and new guards
+
+The R191 matrix leaves Flash M512 1.90% and Flash M256 0.78% behind the
+surrounding PR383 mean.  Host policy maps both points to the same regular
+hidden-4096 specialization: overlap and PRMT exponent extraction are enabled,
+L2 C/D swizzle and incremental descriptors are disabled, and the packed pair
+bank permutation is enabled.  R194 therefore treated them as one selector
+family rather than claiming an exact M512 specialization that the generated
+template does not contain.
+
+The temporary path reused the already correct small-M complete-row decoder.
+Each lane owned all four packed words of one N row, loaded two LDS.64 pairs,
+reused one exponent lookup, used the hidden-4096 x16 conversion helper, and
+published the unchanged expanded E4M3 address set.  Two permanent full-suite
+guards, `production.flash_m256` and `production.flash_m512`, were added because
+these final-benchmark points previously had no direct reference-output
+scenario.
+
+### Resource rejection
+
+Both eight-rank candidates pass numerically at `diff=0.000663/0.000662`, but
+their shared cubin uses `REG=128`, `STACK=32`, and `LOCAL=0`.  The temporary
+header SHA256 is
+`cb90329e4ceffb34e376e668587ec8f35517cb930e090ffb21496c9ac6f4b9bc`.
+As in the Pro M512 R127 family, keeping two packed pairs and their decoded
+results beside the regular 64-value WGMMA fragment exceeds the two-CTA
+register budget.  A machine-work reduction cannot be accepted with a local
+stack frame, so R194 is rejected before NCU, NSYS, or distributed timing.
+
+The device source is fully reverted locally and on the pod to R191 SHA256
+`7abe0773a73b6295226872cd92762732c16a7115b7a08e3cdfa8bea738d0d56d`.
+The two new guards are retained and recovery passes at
+`diff=0.000663/0.001004`; future complete suites contain 43 scenarios rather
+than 41.  Candidate/recovery source hashes, correctness logs, cubin resources,
+and both new guard outputs are archived under
+`iter613-r194-flash-m256-m512-full-row-gate`.
