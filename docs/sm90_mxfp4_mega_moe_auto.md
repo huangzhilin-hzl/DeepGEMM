@@ -10748,3 +10748,81 @@ both formal orders, recovery output, and hashes are archived under
 `iter580-r182-pro-m8-factor-vector-gate`,
 `iter581-r180-r182-r180-pro-m8-formal`, and
 `iter582-r182-r180-r182-pro-m8-reverse-formal`.
+
+## R183 rejected: stagger Pro M512 complete-row LDS lookahead
+
+### Reason and temporary implementation
+
+R156 established that Pro M512's maximum-rank tail is fixed work per routed
+M64 block.  R175 reduced that work by batching both current complete-row
+`LDS.64` pairs before decode, but its five-percent instruction reduction
+increased short-scoreboard stalls and produced only a 0.41% local cycle gain
+before failing reverse distributed timing.  R183 tested the unmeasured point
+between R175 and R127b's spilling four-pair lookahead.
+
+The exact routed Pro M512 selector retained complete-row scale/lookup reuse.
+It loaded both current pairs, decoded and stored pair zero, prefetched only
+the next K32 pair zero, decoded and stored pair one, and finally prefetched
+next pair one.  This stagger keeps one future load schedulable behind the
+other current pair's decoder without making all four current/future pairs
+simultaneously live.  Packed/expanded layouts, scale arithmetic, WGMMA,
+pipeline stages, epilogue, scheduler, and every other specialization were
+unchanged.
+
+### Correctness and resource gates
+
+Eight-rank `production.pro_m512` passes at `diff=0.000784`.  Both production
+and one-rank/48-expert profiler cubins use 126 registers/thread with zero
+stack, local allocation, and spills.  The candidate therefore preserves
+two-CTA occupancy and avoids R127b's 16-byte compiler frame.  Its exact header
+SHA256 is
+`608ff9289f6e9fcb0aaacfbf584fb031ca1cce84deda455f3710096e1f16066b`.
+
+### Matched NCU mechanism result
+
+Matched one-rank/48-expert NCU used an R183/R180/R183 ordering, seed zero,
+cold L2, lineinfo, identical sections, and the same generated signature:
+
+| metric | R183 first | R180 control | R183 last | candidate range vs control |
+| --- | ---: | ---: | ---: | ---: |
+| elapsed cycles | 3,962,458 | 3,983,360 | 3,966,410 | -0.52% to -0.43% |
+| duration | 2.4142 ms | 2.4272 ms | 2.4108 ms | -0.54% to -0.68% |
+| executed instructions | 487,082,093 | 512,870,711 | 487,080,112 | -5.03% |
+| issued instructions | 487,101,924 | 512,929,494 | 487,108,895 | -5.03% |
+| issue active | 39.44% | 41.35% | 39.44% | -1.91 pp |
+| eligible warps/cycle | 0.489 | 0.520 | 0.489 | -0.032 |
+| short-scoreboard samples | 4,317 | 5,266 | 4,306 | about -18% |
+| barrier samples | 66,950 | 63,733 | 66,903 | about +5% |
+
+The intended stagger works: unlike R175's 17% short-scoreboard increase, R183
+reduces those samples by about 18% while preserving the same five-percent
+instruction saving.  The local cycle gain improves slightly to 0.43--0.52%,
+but complete-row ownership still lowers eligible-warp supply and moves stalls
+to WGMMA/barrier waits.
+
+### Authoritative double-order rejection
+
+The final Pro M512 contract uses eight ranks, seed zero, cold L2, one warmup,
+three observations, 20 launches per observation, and maximum-rank median.
+Both orders use fresh per-source caches and fixed source hashes:
+
+| order | first | middle | last | R183 comparison |
+| --- | ---: | ---: | ---: | --- |
+| R180 / R183 / R180 | 2,540 us | 2,529 us | 2,545 us | R183 is 0.43% and 0.63% faster |
+| R183 / R180 / R183 | 2,539 us | 2,608 us | 2,624 us | R183 is 2.65% faster and 0.61% slower |
+
+The first order is double-positive, but the last candidate in the reverse
+order loses to the shared R180 control.  The 0.43--0.52% local mechanism is
+still smaller than the multi-percent time drift visible in the reverse run,
+so R183 fails the required reproducibility gate.  NSYS and the full matrix
+are not advanced after authoritative rejection.
+
+The temporary source is fully reverted locally and on the pod.  The restored
+header is byte-identical to R180 at
+`cf91f518a72aec9c897b617b565a81031d5fdcdb80f653a85c7bb59baf3d2fd9`,
+and recovery `production.pro_m512` passes at `diff=0.000714`.  Candidate and
+control sources, correctness/PTXAS logs, three NCU reports, both formal
+orders, recovery output, and hashes are archived under
+`iter583-r183-pro-m512-staggered-row-decode-gate`,
+`iter584-r180-r183-r180-pro-m512-formal`, and
+`iter585-r183-r180-r183-pro-m512-reverse-formal`.
