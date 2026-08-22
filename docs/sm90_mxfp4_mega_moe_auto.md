@@ -12429,3 +12429,118 @@ not merely move it after WGMMA.  R206 correctness, resources, source snapshots,
 three NCU reports/CSVs, and the preceding residual diagnostic are archived
 locally under `.codex-artifacts/iter642-r206-curated-artifacts` and on the pod
 under `iter642-r206-curated-artifacts`.
+
+## Rejected experiment R207: persistent packed-FP16 Pro M512 accumulation
+
+### Motivation and implementation
+
+R207 followed the condition identified by R206 instead of discarding the
+packed WGMMA immediately.  The exact fast-math Pro M512 selector still used the
+SM90 FP16-output WGMMA, but its cross-K-block accumulator also remained packed
+as `half2`.  The promotion loop converted each combined block scale to `half2`
+and applied `__hfma2` directly to the packed WGMMA fragment.  Only the final
+epilogue expanded the persistent sum to `float2`.  This removed R206's
+half2-to-float2-to-BF16 round trip while leaving every other shape, strict-math
+mode, ring bound, scheduler, and wire protocol unchanged.
+
+The eight-rank production Pro M512 gate passed at `diff=0.000595`.  Ptxas used
+107 registers with zero stack and zero spill stores/loads, versus R203's 128
+registers and the same spill-free state.  The source SHA-256 values were
+`df7291f7f044579b6984a7dfc824b2fb33dcc617ee6cfeb7be4325b91bc47f6d`,
+`7c83089f2599aab83bad295b4c5af6b24ede8baa5519f33ee09854eb078648fc`, and
+`1bb7eaee870367c715b3350f19a086b3f27409bfc4beeb52db50093324181b1f`.
+
+### Matched NCU result
+
+The one-rank R207/R203/R207 NCU sandwich used the same Pro M512, 48-expert,
+seed-zero, cold-L2, 20-launch application-replay protocol as R206.
+
+| Metric | R207 first | R203 control | R207 last | Candidate change |
+| --- | ---: | ---: | ---: | ---: |
+| Duration | 2.202912 ms | 2.228480 ms | 2.203232 ms | -1.15% / -1.13% |
+| GPC elapsed cycles | 3,947,902 | 3,991,734 | 3,948,155 | -1.10% / -1.09% |
+| SM elapsed cycles | 3,938,726 | 3,985,706 | 3,940,249 | -1.18% / -1.14% |
+| Executed SM instructions | 461,972,072 | 512,863,531 | 461,978,261 | -9.92% / -9.92% |
+| Thread instructions | 14,809 million | 16,453 million | 14,811 million | about -9.99% |
+| Issue active | 37.51% | 41.18% | 37.50% | -3.67 / -3.68 pp |
+| Warp cycles per instruction | 10.593 | 9.651 | 10.579 | +9.76% / +9.62% |
+| Barrier stall samples | 68,804 | 63,878 | 69,104 | +7.71% / +8.18% |
+| Long-scoreboard samples | 39,626 | 39,473 | 39,739 | +0.39% / +0.67% |
+| Short-scoreboard samples | 5,009 | 5,237 | 4,982 | -4.35% / -4.87% |
+| Wait samples | 14,087 | 15,911 | 14,023 | -11.46% / -11.87% |
+
+Keeping the entire path packed therefore removes 9.92% of executed
+instructions and turns R206's regression into an isolated-kernel win.  The
+gain is limited by higher barrier pressure and greater latency per issued
+instruction, so the candidate proceeded to the authoritative distributed
+gate rather than being accepted from NCU alone.
+
+### Authoritative distributed timing and decision
+
+Both eight-rank orders used 15 observations, 20 launches per observation, one
+warmup, cold L2, seed zero, and maximum-rank medians.
+
+| Order | First | Middle | Last | Candidate comparisons |
+| --- | ---: | ---: | ---: | --- |
+| R207 / R203 / R207 | 2,529 us | 2,566 us | 2,506 us | -1.44% / -2.34% |
+| R203 / R207 / R203 | 2,554 us | 2,550 us | 2,542 us | -0.16% / +0.31% |
+
+R207 wins both forward brackets, but the reverse order contains one 0.31%
+regression; rank zero similarly regresses by 0.44% and 0.32% against the two
+controls.  Its three candidate maximum-rank medians average 2,528.33 us versus
+2,554.00 us for the three R203 controls, an aggregate 1.00% gain, but that does
+not satisfy the required all-four-brackets acceptance rule.  R207 was rejected
+without NSYS or full-matrix qualification.  The gate, NCU reports/source, and
+two formal orders are on the pod under `iter643` through `iter646`.
+
+## Rejected experiment R208: full-row pair decoding on the R207 register budget
+
+### Motivation and implementation
+
+R207 freed 21 compiler registers, so R208 tested whether the previously
+spill-limited complete-row decoder could now overlap two packed-word pairs per
+K32 group.  It enabled the full-row lookahead only for the exact packed-FP16
+selector and retained Pro M512's original shift-and-mask exponent extraction.
+No scheduler, barrier count, ring storage, or inter-rank protocol changed.
+
+The production Pro M512 gate passed at `diff=0.000598`.  Ptxas used 117
+registers, zero stack, and zero spills, confirming that the extra ten-register
+live range fit within R207's saved budget.
+
+### Matched NCU result and decision
+
+The R208/R203/R208 NCU sandwich used the same one-rank protocol.
+
+| Metric | R208 first | R203 control | R208 last | Candidate change |
+| --- | ---: | ---: | ---: | ---: |
+| Duration | 2.212512 ms | 2.228960 ms | 2.226144 ms | -0.74% / -0.13% |
+| GPC elapsed cycles | 3,975,613 | 4,003,423 | 3,993,029 | -0.69% / -0.26% |
+| Executed SM instructions | 378,950,047 | 512,864,114 | 378,954,309 | -26.11% / -26.11% |
+| Thread instructions | 12,158,017,581 | 16,451,290,858 | 12,156,698,572 | -26.10% / -26.10% |
+| Issue active | 31% | 41% | 31% | -10 pp / -10 pp |
+| Warp cycles per instruction | 12.990 | 9.640 | 13.003 | +34.76% / +34.89% |
+| Barrier stall samples | 76,067 | 63,657 | 75,864 | +19.49% / +19.18% |
+| Long-scoreboard samples | 41,679 | 39,684 | 41,878 | +5.03% / +5.53% |
+| Short-scoreboard samples | 3,871 | 5,236 | 3,805 | -26.07% / -27.33% |
+| Wait samples | 12,406 | 15,805 | 12,552 | -21.51% / -20.58% |
+| Warpgroup-arrive samples | 201 | 342 | 212 | -41.23% / -38.01% |
+
+Although complete-row decoding removes another 16.6% of R207's SM
+instructions, the longer lookahead dependency increases warp latency by about
+35%, barrier samples by about 19%, and long-scoreboard samples by about 5%.
+The resulting duration gains are only 0.74% and 0.13%, below the 1.5% NCU gate
+on both sides.  R208 was reverted without distributed timing or NSYS.  Its
+correctness/resource gate and three NCU reports are on the pod under `iter647`
+and `iter648`.
+
+### Updated direction after R207 and R208
+
+R207 proves that packed-FP16 persistence is numerically viable for the exact
+production case and materially reduces scalar work, but its roughly 1% mean
+gain is smaller than distributed run-order variance.  R208 proves that using
+the freed registers for longer decoder lookahead is counterproductive: fewer
+instructions do not help when they serialize the shared-memory and barrier
+critical path.  The retained implementation is again R203.  The next candidate
+must reduce the R207 barrier/long-scoreboard penalty or move independent work
+into its latency slots; extending decoder value lifetimes is explicitly ruled
+out.
