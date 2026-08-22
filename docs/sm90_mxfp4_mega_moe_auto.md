@@ -11622,3 +11622,56 @@ control sources, correctness/resource output, all three NCU reports/CSVs, and
 the recovery log are archived under
 `iter614-r195-flash-m16-factor-secondary-gate-final` locally and
 `iter614-r195-flash-m16-factor-secondary-gate` on the H20 pod.
+
+## R196 rejected: scoped complete-row decode for Flash M256/M512
+
+### Reason and implementation
+
+R194 showed that complete-row ownership for the shared hidden-4096 regular
+specialization is numerically correct but creates a 32-byte stack frame.
+R174 had independently removed the analogous Pro M512 frame by placing the
+packed-row address calculation and `LDS.64` in one inline-PTX scope.  R196
+combined these mechanisms for the Flash M256/M512 selector: one lane reused a
+single E4M3 exponent lookup across all four packed K32 words, while two scoped
+pair loads rematerialized their swizzled addresses immediately before decode.
+Packed/expanded layouts, arithmetic, WGMMA, pipeline stages, epilogue, and all
+other selectors were unchanged.  The temporary header SHA256 was
+`01a426bba3f66c9de7040aea64dade0fc7d8ceaa0e4b80db7ec339e8328ad9ed`.
+
+Eight-rank `production.flash_m256` and `production.flash_m512` pass at
+`diff=0.000663/0.000662`.  Both production cubins compile at `REG=125`,
+`STACK=0`, `LOCAL=0`, and `SHARED=1024`, improving R194's
+`REG=128, STACK=32` result and proving that the scoped address/load boundary
+removes the compiler frame.
+
+### NCU rejection
+
+Matched one-rank/32-expert Flash M512 used an R196/R191/R196 order, seed zero,
+cold L2, and identical 39-pass full NCU sections.  Percentages compare each
+candidate capture with the middle control:
+
+| metric | R196 first | R191 control | R196 last | candidate change |
+| --- | ---: | ---: | ---: | ---: |
+| duration | 914.336 us | 903.456 us | 915.808 us | +1.204% / +1.367% |
+| elapsed cycles/SM | 1,508,168 | 1,489,115 | 1,505,295 | +1.280% / +1.087% |
+| executed instructions | 181,290,937 | 185,726,569 | 181,282,070 | -2.388% / -2.393% |
+| issued instructions | 182,137,036 | 186,579,496 | 182,116,100 | -2.381% / -2.392% |
+| issue active | 38.707% | 40.159% | 38.777% | -3.614% / -3.441% |
+| barrier samples | 13,437 | 14,532 | 13,381 | -7.535% / -7.920% |
+| short-scoreboard samples | 4,104 | 1,770 | 4,212 | +131.864% / +137.966% |
+| long-scoreboard samples | 21,555 | 21,472 | 21,645 | +0.387% / +0.806% |
+| wait samples | 6,557 | 6,680 | 6,484 | -1.841% / -2.934% |
+
+R196 removes about 2.39% of dynamic instructions and some barrier waiting,
+but directly coupling address generation to each shared load more than
+doubles short-scoreboard samples and lowers issue activity.  Both candidate
+captures are over one percent slower in cycles and duration, so this is a
+stable local regression rather than benchmark drift.  R196 is rejected
+before distributed timing, NSYS, or the 43-scenario suite.
+
+The source is fully reverted locally and on the pod to R191 SHA256
+`7abe0773a73b6295226872cd92762732c16a7115b7a08e3cdfa8bea738d0d56d`;
+recovery M256/M512 passes at `diff=0.000663/0.000662`.  Candidate/control
+sources, correctness and resources, all three NCU reports/CSVs, and recovery
+logs are archived under
+`iter615-r196-flash-m256-m512-scoped-full-row-gate`.
