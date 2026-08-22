@@ -11790,3 +11790,57 @@ recovery `production.flash_m16` passes at `diff=0.000654`.  Correctness,
 resources, NCU reports/CSVs, exact sources, recovery, and formal logs are
 archived under `iter617-r198-flash-m16-cached-source-mask-gate` and
 `iter618-r191-r198-r191-flash-m16-formal`.
+
+## R199 rejected: extend mature Pro swap-AB to M512
+
+### Reason and temporary implementation
+
+The R191 matrix leaves Pro M512 4.02% behind the surrounding PR383 mean, and
+R156 attributes its distributed tail to fixed work on the rank with the most
+routed M64 blocks.  The mature Pro swap-AB path is retained through M128, and
+the rejected R131 Pro M256 extension had reduced matched one-rank duration by
+4.56% while removing almost all regular-decoder shared-load replay.  R199
+therefore tested the previously uncovered exact Pro M512 crossover.  The host
+selector enabled the existing hidden-7168 swap-AB implementation only when
+`num_tokens == 512`; all device arithmetic, cross-rank storage and completion
+protocols, and the other 21 final-matrix points were unchanged.
+
+Eight-rank `production.pro_m512` passes at `diff=0.000708`.  The production
+cubin preserves `REG=128`, `STACK=0`, `LOCAL=0`, and `SHARED=1024`, so the
+candidate passes the numerical and resource gates.
+
+### Matched NCU rejection
+
+The matched one-rank/48-expert order was R199/R191/R199 with seed zero, cold
+L2, and identical 39-pass full NCU sections.  Percentages compare each
+candidate capture with the middle R191 control:
+
+| metric | R199 first | R191 control | R199 last | candidate change |
+| --- | ---: | ---: | ---: | ---: |
+| duration | 2.533248 ms | 2.427904 ms | 2.535488 ms | +4.339% / +4.432% |
+| elapsed cycles/SM | 4,157,374 | 3,985,633 | 4,176,586 | +4.309% / +4.791% |
+| executed instructions | 732,190,980 | 512,901,616 | 732,228,850 | +42.755% / +42.762% |
+| issued instructions | 732,245,144 | 512,902,792 | 732,223,415 | +42.767% / +42.763% |
+| issue active | 56.472% | 41.346% | 56.399% | +15.126 / +15.053 pp |
+| eligible warps/cycle | 0.805 | 0.521 | 0.803 | +0.284 / +0.282 |
+| short-scoreboard samples | 4,398 | 5,396 | 4,343 | -18.50% / -19.51% |
+| long-scoreboard samples | 40,041 | 39,478 | 40,148 | +1.43% / +1.70% |
+| barrier samples | 52,498 | 63,442 | 52,459 | -17.25% / -17.31% |
+| shared-load conflicts | 131,776 | 128,024 | 132,558 | +2.93% / +3.54% |
+| shared-store conflicts | 7,411,596 | 8,656,591 | 7,280,031 | -14.38% / -15.90% |
+
+Unlike sparse small-M expert blocks, the M512 route distribution gives most
+work to nearly full M64 blocks.  N64 swap-AB therefore cannot delete tensor
+work; it adds the two weight-half and promotion schedules to every block.
+Lower barrier, short-scoreboard, and shared-store-conflict counts do not repay
+the 42.8% instruction increase, and both elapsed-cycle captures regress by
+more than four percent.  This closes the direct Pro M512 swap-AB crossover.
+
+R199 fails the local mechanism gate before distributed timing, NSYS, or the
+43-scenario suite.  The host selector and extension are fully restored to
+R191; the device header remains byte-identical to R191 at SHA256
+`7abe0773a73b6295226872cd92762732c16a7115b7a08e3cdfa8bea738d0d56d`,
+and recovery `production.pro_m512` passes at `diff=0.001071`.  Exact host and
+device sources, correctness/resources, both isolated host extensions' hashes,
+three NCU reports/CSVs, and recovery evidence are archived under
+`iter619-r199-pro-m512-swap-gate`.
