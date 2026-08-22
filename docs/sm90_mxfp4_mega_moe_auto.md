@@ -9628,3 +9628,121 @@ controls regressed by about 9.5%; a serialized timeline capture cannot satisfy
 the failed acceptance condition.  Source, resource/correctness logs, NCU
 reports/CSV, and the formal sandwich are archived under `iter541` through
 `iter543`.
+
+## Refreshed PR383 residuals after R166
+
+Before selecting another mechanism, the unchanged R152 production kernel was
+remeasured over the complete goal matrix in one H20 pod.  Each point uses the
+goal-standard seed zero, one warmup, cold L2, 20 launches per observation, 50
+observations for M <= 128, three observations for M >= 256, and maximum-rank
+median.  The order is native-FP8 PR383, MXFP4 R152, native-FP8 PR383.  Both
+controls use the same source, seed, shapes, and pod; PR383's older benchmark
+CLI does not expose the warmup/L2 flags, but its source performs one warmup
+and calls `bench_kineto` with `flush_l2=True`.
+
+| model | M | first PR383 us | R152 us | second PR383 us | vs first | vs second |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Flash | 8 | 304.497 | 297.836 | 296.952 | -2.19% | +0.30% |
+| Flash | 16 | 308.783 | 335.886 | 309.086 | +8.78% | +8.67% |
+| Flash | 32 | 326.120 | 324.810 | 328.010 | -0.40% | -0.98% |
+| Flash | 64 | 366.510 | 352.077 | 362.729 | -3.94% | -2.94% |
+| Flash | 128 | 432.405 | 419.805 | 435.618 | -2.91% | -3.63% |
+| Flash | 256 | 491.397 | 504.187 | 519.321 | +2.60% | -2.91% |
+| Flash | 512 | 923.100 | 917.179 | 935.178 | -0.64% | -1.92% |
+| Flash | 1024 | 1558.253 | 1494.000 | 1524.944 | -4.12% | -2.03% |
+| Flash | 2048 | 2712.414 | 2735.000 | 2713.755 | +0.83% | +0.78% |
+| Flash | 4096 | 5103.000 | 5130.000 | 5103.000 | +0.53% | +0.53% |
+| Flash | 8192 | 9795.000 | 9905.000 | 9797.000 | +1.12% | +1.10% |
+| Pro | 8 | 709.447 | 739.016 | 701.901 | +4.17% | +5.29% |
+| Pro | 16 | 1001.508 | 926.339 | 1005.525 | -7.51% | -7.88% |
+| Pro | 32 | 1098.189 | 1001.000 | 1096.324 | -8.85% | -8.69% |
+| Pro | 64 | 1157.289 | 1029.000 | 1154.855 | -11.09% | -10.90% |
+| Pro | 128 | 1271.320 | 1179.500 | 1277.347 | -7.22% | -7.66% |
+| Pro | 256 | 1627.878 | 1622.000 | 1621.613 | -0.36% | +0.02% |
+| Pro | 512 | 2399.545 | 2584.000 | 2408.474 | +7.69% | +7.29% |
+| Pro | 1024 | 3995.000 | 3915.000 | 4022.000 | -2.00% | -2.66% |
+| Pro | 2048 | 6982.000 | 6911.000 | 7027.000 | -1.02% | -1.65% |
+| Pro | 4096 | 12900.000 | 13016.000 | 12909.000 | +0.90% | +0.83% |
+| Pro | 8192 | 25043.000 | 25290.000 | 25067.000 | +0.99% | +0.89% |
+
+The Flash geometric means are 932.882/932.046/935.095 us, so R152 is
+0.09%/0.33% faster than the controls.  The Pro geometric means are
+2622.830/2560.736/2624.955 us, so R152 is 2.37%/2.45% faster.  R152 therefore
+already wins the aggregate comparison, but it is not pointwise dominant.
+Flash M16 is the next target because its +8.78%/+8.67% residual is reproduced
+against both controls with 50 observations.  Pro M512 is also large at
++7.69%/+7.29%, but has only three observations; Pro M8 is
++4.17%/+5.29%.
+
+The three complete logs are archived under
+`iter544-pr383-r152-pr383-full-matrix`.
+
+### sgl-project PR 69 thread-role audit
+
+The 32-dispatch/96-non-epilogue-warp topology from sgl-project/DeepGEMM PR 69
+does not reduce this kernel's launch width.  The current CTA already has 64
+dispatch threads, 64 non-epilogue producer threads, and 128 math/epilogue
+threads: 256 total.  Its role limits are 48/48/208 registers per thread,
+which consume exactly 32,768 registers per CTA and permit the required two
+resident CTAs per SM.  Moving one warp from dispatch to the producer group
+would still launch 256 threads and would require a third producer role beyond
+the existing A+SFA and B+SFB warps.
+
+That topology solved a register-allocation issue for a larger upstream FP8
+configuration; it does not remove this branch's MXFP4 decode.  R44 already
+tested the closest applicable direction by moving decode into the producer
+side, exposed decode latency on the critical path, and regressed distributed
+timing by more than 245%.  No source experiment is justified from PR 69
+without a new third-producer workload or a demonstrated reduction below 256
+threads.
+
+## R167 rejected: fuse each Flash M16 packed pair into one x16 asm block
+
+### Reason and temporary implementation
+
+R152's accepted complete-row Flash M16 decoder loads two adjacent packed words
+with `LDS.64`, builds one exponent lookup per K32 group, then calls the x8
+conversion helper once for each word.  R158 had rejected an x16 conversion for
+regular Pro M512, but that result did not cover the full-row Flash M16 path.
+R167 therefore added a temporary x16 overload which accepts the already-built
+lookup and selected it only when `kHidden == 4096` and
+`kLocalSwapABTokens == 16`.  It kept the lookup count, packed addresses,
+decoded byte order, expanded-B store addresses, WGMMA schedule, and epilogue
+unchanged.  The intended mechanism was a shorter compiler-visible temporary
+live range, not less required conversion arithmetic.
+
+Production Flash M16 and the all-ranks-to-rank-zero PR411 hotspot pass at
+`diff=0.000654/0.000663`.  The eight-rank correctness specialization compiles
+at 128 registers with zero stack and spill; the matched one-rank/32-expert
+profile specialization compiles at 118 registers, 1,024 bytes static shared,
+and zero stack/local/spill.  Both resource results are unchanged from R152.
+
+### NCU and machine-code rejection
+
+Matched one-rank/32-expert, seed-zero, cold-L2 NCU gives:
+
+| metric | R152 | R167 | change |
+| --- | ---: | ---: | ---: |
+| duration | 261.76 us | 260.54 us | -0.47% |
+| warp instructions | 60,227,742 | 60,231,937 | +0.0070% |
+| thread instructions | 1,874,086,570 | 1,874,204,601 | +0.0063% |
+| bit instructions | 231,727,726 | 231,727,726 | unchanged |
+| integer instructions | 785,976,970 | 786,110,206 | +0.0169% |
+| memory instructions | 131,339,565 | 131,598,249 | +0.1970% |
+| shared-load conflicts | 5,135 | 5,468 | +6.49% |
+| shared-store conflicts | 1,322,425 | 1,326,670 | +0.32% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+
+The 1.22-us profiler movement is not a mechanism.  `nvdisasm` produces 8,799
+lines for both cubins, and the two complete SASS files have the identical
+SHA256
+`a379653ae6490f7fa418268e86e5b0da6363276c56a2df11d1416212deb2eb36`.
+PTXAS has reconstructed the exact R152 instruction stream from the larger asm
+block.  The tiny dynamic counter differences are profiler replay/task
+ownership noise, not source work removal.
+
+R167 is stopped before NSYS and distributed timing because it cannot change
+runtime machine code, and is fully reverted to R152.  Correctness/resource
+evidence is archived under `iter545-r167-flash-m16-x16-gate`; NCU reports,
+raw CSV, cubin resource output, complete SASS, hashes, and opcode diagnostics
+are under `iter546-r167-flash-m16-ncu`.
