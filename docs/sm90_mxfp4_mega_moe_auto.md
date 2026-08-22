@@ -12964,3 +12964,59 @@ maximum-rank block-count imbalance that dominates Pro M512.  A subsequent
 candidate must reduce latency per routed M64 block enough to exceed this tail
 or change rank-consistent work assignment without deriving any quorum or
 storage bound from rank-local token counts.
+
+## Rejected experiment R217: runtime swap-AB for Pro M512 tail blocks
+
+### Motivation and distinction from R199
+
+The seed-zero Pro M512 route has 78 routed M64 blocks on its heaviest rank but
+only 62 on the lightest.  Most of the excess blocks are the second, partially
+filled block of experts whose receive count exceeds 64.  R199 enabled swap-AB
+for the entire Pro M512 specialization and regressed because almost-full first
+blocks paid 42.8% more instructions.  It did not test a hybrid orientation.
+
+R217 kept R203's regular M64xN128 path for `valid_m>32` and invoked the mature
+N8/N16/N32 swap-AB path only for individual partial tasks with `valid_m<=32`.
+The selector was restricted to the exact routed Pro M512 template.  Runtime
+`valid_m` affected only CTA-local arithmetic; the compile-time worker quorum,
+ring bounds, dispatch completion protocol, and every PR411 cross-rank decision
+remained unchanged.
+
+### Compile, numerical, and resource gates
+
+The first JIT attempt exposed one extra closing brace in the prototype and is
+retained only as an invalid build diagnostic.  After restoring balanced scope,
+three executable variants were screened:
+
+| Variant | Tail swap schedule | Fast promotion | Correctness diff | Registers | Stack |
+| --- | --- | --- | ---: | ---: | ---: |
+| R217a | both weight halves in one schedule | scalar FP32/BF16 | 0.019511 | 128 | 352 B |
+| R217b | both weight halves in one schedule | packed BF16/HFMA2 | 0.020691 | 128 | 64 B |
+| R217c | sequential half0/half1 reuse | packed BF16/HFMA2 | 0.020325 | 128 | 16 B |
+
+The corresponding header SHA-256 values were
+`cdc0bfdd9658653c707c9b12bbc64516a5abe66cafcc6f3647c8d8c7381adcbf`,
+`6ff80d7a145fc459d932c7ee74e42b47fdd6106d7fe79657a14bfcdafd13adf9`,
+and `f582d2e3536790b2a677fe30b990dba87fa2f3ca3a973c7960258ec579f452e4`.
+All three exceed the production tolerance of 0.01.  Matching the mature
+packed promotion and then its sequential fragment reuse does not recover the
+regular path's output contract.  The runtime union of regular and swap state
+also creates a stack frame in every variant, even when the two swap halves are
+serialized; R203 is 128 registers with zero stack and spills.
+
+### Decision and updated direction
+
+R217 was rejected before timing, NCU, or NSYS.  It fails both mandatory gates:
+the best numerical result is still about twice the accepted tolerance, and the
+best resource variant still introduces a 16-byte frame.  No performance claim
+is made from these cubins.  The implementation was fully reverted to the exact
+R203 header hash
+`80237849c5870eea3e8af0fb74efb9a207d40fecce9a7d0346408f90c9df8b1e`.
+Build diagnostics, all three correctness logs, hashes, JIT cubins, and resource
+reports are under `iter663-r217-pro-m512-hybrid-tail-swap-gate`.
+
+R217 closes mixing regular and swap-AB orientations inside the existing fused
+kernel.  The heavy-rank tail remains the right diagnosis, but addressing it
+requires a representation with one numerical/accumulator contract or a
+separate rank-consistent kernel phase; compiling both orientations into the
+same CTA path is neither numerically compatible nor spill-free.
