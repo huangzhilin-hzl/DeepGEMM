@@ -9556,3 +9556,75 @@ fully reverted.  NSYS was not advanced after the NCU mechanism gate and the
 authority comparison both failed; a timeline capture cannot reverse either
 criterion.  Source, resource/correctness logs, NCU reports/CSV, and the formal
 sandwich are archived under `iter538` through `iter540`.
+
+## R166 rejected: bulk-stage the exact Flash M16 scale payload
+
+FlashInfer PR 4589's V4 layout makes every K128-stage payload contiguous so a
+producer can replace per-cell transfers with bulk stage loads.  This branch
+already has the essential preprocessing half of that mechanism: R53 stores one
+K128-by-N scale stage contiguously and R54 publishes it with 32 aligned
+`LDG.128` plus 32 `STS.128` lane operations.  R45-R47 changed the math
+warpgroup's shared-memory scale lookup, not this producer transfer, so a bulk
+producer load remained an uncovered experiment.
+
+### Direction and correctness gate
+
+R166 kept the public processed-weight triple, packed-weight TMA, decoder,
+156-CTA/two-resident-CTA topology, and every non-Flash-M16 specialization
+unchanged.  Only exact DSV4 Flash M16 replaced the producer warp's register
+mediated scale copy with one 512-byte `cp.async.bulk` into the existing SFB
+stage.  The copy shared the packed-weight full mbarrier, whose expected byte
+count increased from 8192 to 8704.  No extra shared memory was allocated.
+
+Production Flash M16 and the all-ranks-to-rank-zero PR411 hotspot pass at
+`diff=0.000654/0.000663`.  The target cubin stays at 128 registers, zero stack,
+zero spills, and zero local-memory sectors, proving that both the transaction
+count and cross-rank safety contracts remain valid.
+
+### One-rank NCU mechanism result
+
+Matched one-rank/32-expert cold-L2 NCU shows that the intended instruction
+substitution worked locally:
+
+| metric | R152 | R166 | change |
+| --- | ---: | ---: | ---: |
+| duration | 261.280 us | 260.544 us | -0.28% |
+| warp instructions | 60,239,503 | 60,315,838 | +0.13% |
+| thread instructions | 1,874,319,302 | 1,861,475,256 | -0.69% |
+| memory instructions | 131,760,230 | 128,754,140 | -2.28% |
+| integer instructions | 786,171,927 | 773,606,485 | -1.60% |
+| global-load sectors | 832,291 | 68,141 | -91.81% |
+| DRAM read | 429.163 MB | 429.191 MB | +0.01% |
+| L2 read lookup miss | 4,300,835 | 4,301,071 | +0.01% |
+| shared-load conflicts | 5,522 | 5,683 | +2.92% |
+| shared-store conflicts | 1,312,238 | 1,400,612 | +6.73% |
+| local load/store sectors | 0 / 0 | 0 / 0 | unchanged |
+
+The bulk request removes the producer's lane-wise global loads as intended and
+does not increase external traffic.  It nevertheless adds an async request and
+slightly more warp/shared-store work.  The local duration improvement is only
+0.28%, so the distributed gate remains decisive.
+
+### Eight-rank rejection
+
+The authority-aligned R152/R166/R152 sandwich uses 50 observations, 20
+launches per observation, one warmup, cold L2, seed zero, and maximum-rank
+median:
+
+| first R152 us | R166 us | change | second R152 us | reverse change |
+| ---: | ---: | ---: | ---: | ---: |
+| 343.992 | 376.767 | +9.53% | 344.0715 | +9.50% |
+
+Rank zero also regresses from 324.952/320.8015 us to 353.907 us
+(+8.91%/+10.32%), so this is not merely a different maximum-work rank.  The
+extra bulk transaction and its full-barrier completion are benign in the
+isolated profile but unfavorable when all eight ranks concurrently execute
+dispatch, NVLink, and GEMM work.  The data does not by itself distinguish
+fabric contention from producer-pipeline serialization, but it conclusively
+rules out this one-bulk-copy form.
+
+R166 is fully reverted.  NSYS was not advanced after both authoritative
+controls regressed by about 9.5%; a serialized timeline capture cannot satisfy
+the failed acceptance condition.  Source, resource/correctness logs, NCU
+reports/CSV, and the formal sandwich are archived under `iter541` through
+`iter543`.
