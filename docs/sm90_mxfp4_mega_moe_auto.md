@@ -10190,3 +10190,61 @@ R152 source control are archived under
 `iter558-r175-pro-m512-current-pair-lds-gate`,
 `iter559-r175-pro-m512-formal`, and
 `iter560-r175-pro-m512-reverse-formal`.
+
+## R176 rejected: two-CTA Flash M16 activation multicast
+
+### Reason and temporary direction
+
+R161 attributes the distributed Flash M16 residual to two extra tiny expert
+blocks on the maximum-work rank.  Decoder and compact-TMA micro-optimizations
+through R175 did not shorten that fixed block cost.  The SM100 MegaMoE
+scheduler already supports two CTAs per task, and Hopper TMA can multicast a
+shared activation tile inside a cluster, so R176 tested a higher-leverage but
+still exact-shape topology for routed Flash M16 only.
+
+The temporary host selector launched cluster size two.  The device scheduler
+made one task claim cover two adjacent N128 tiles, mapped the peer CTAs to the
+two N indices, and had the leader multicast the identical A and SFA stage to
+both CTAs.  Each CTA retained its own B/SFB load, MXFP4 decode, WGMMA,
+epilogue, output counter, dispatch, combine, and 128-thread math owner.  The
+intended mechanism was therefore twofold: halve activation/SFA transactions
+and halve dynamic scheduler claims without serializing the two N tasks.
+
+### Correctness-gate deadlock and protocol audit
+
+The first eight-rank production Flash M16 test entered the persistent kernel
+but held all eight GPUs at 100% utilization without producing a result.  A
+one-rank/no-dist reproduction also held its single GPU at 100% until the
+60-second hard timeout, proving that the failure was inside the CTA-cluster
+protocol rather than NVLink or the cross-rank rendezvous.
+
+Two concrete cluster-consumer omissions were then repaired independently:
+
+1. R176a counted the peer B-loader's 32 threads in the remote TaskInfo empty
+   barrier and released the mailbox immediately after copying TaskInfo into
+   registers.  This prevented the leader from overwriting a slot before all
+   three peer consumers had observed it.
+2. R176b changed the pipeline empty barrier from four local math-warp arrivals
+   to eight cluster-wide arrivals.  Lanes 0 and 1 released the corresponding
+   barriers in both CTAs, matching the established SM90 multicast GEMM stage
+   lifetime.
+
+Both repaired variants still deterministically timed out in the one-rank
+gate at 90 seconds with the GPU at 100%.  The existing Humming kernel lets its
+dispatch, A-loader, B-loader, and math/combine branches leave their persistent
+loops at different times; making their shared stages and task mailboxes
+distributed requires an end-to-end cluster lifetime protocol, not a narrow
+TMA substitution.  Continuing to add isolated barrier arrivals would risk a
+latent cross-CTA use-after-release or deadlock.
+
+There is consequently no valid before/after latency measurement for R176:
+R152 returns and passes the same one-rank Flash M16 scenario at
+`diff=0.000649`, whereas R176/R176a/R176b do not complete within their
+60/90-second bounds.  The candidate fails before NCU, NSYS, and distributed
+timing; profiler output cannot exist for a non-terminating kernel.
+
+Both host and device files are restored to byte-identical R152 and the host
+extension is force rebuilt.  The original eight-rank hang log, three one-rank
+diagnostic logs, exact R176b device and R176 host sources, build logs, recovery
+correctness log, and hashes are archived under
+`iter561-r176-flash-m16-cluster2-gate`.
