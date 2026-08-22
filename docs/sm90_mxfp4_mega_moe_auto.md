@@ -11011,3 +11011,55 @@ and recovery `production.flash_m16` passes at `diff=0.000654`.  Exact candidate
 sources/hashes, correctness and PTXAS logs, the profiler cubin, and recovery
 output are archived under
 `iter590-r186-flash-m16-shared-pair-address-gate`.
+
+## R187 rejected: C++ offset reuse for Flash M16 LDS.64 pairs
+
+### Reason and implementation
+
+R186 tied both `LDS.64` operations and four result registers into one opaque
+inline-assembly block and spilled in the production specialization.  R187
+isolated address arithmetic from load lifetime: it retained the original two
+independent C++ `ptx::ld_shared<uint2>` calls and next-K32 lookahead, computed
+the first B64-swizzled pair offset normally, and obtained the other pair's
+offset with `xor 8`.  Only exact routed Flash M16 selected this expression;
+the loaded address set, result lifetime, decode, stores, and all non-target
+specializations remained unchanged.  The temporary header SHA256 was
+`791a1b08f9bd853f2b626149f8f7a43ca67ddafd7b35ff90fd2a5425d132f9a5`.
+
+Eight-rank `production.flash_m16` and the PR411 concentrated-routing hotspot
+pass at `diff=0.000654/0.000663`.  Unlike R186, the production cubin preserves
+128 registers with `STACK=0` and `LOCAL=0`; the matched one-rank/32-expert
+cubin uses 118 registers with no stack or spills.
+
+### Matched NCU rejection
+
+The matched order was R187/R180/R187 on the same H20, one rank, 32 experts,
+seed zero, cold L2, lineinfo, and identical 21-pass sections:
+
+| metric | R187 first | R180 control | R187 last | candidate range vs control |
+| --- | ---: | ---: | ---: | ---: |
+| elapsed cycles | 437,728 | 434,259 | 436,730 | +0.80% to +0.57% |
+| duration | 264.704 us | 264.608 us | 265.216 us | +0.04% to +0.23% |
+| executed instructions | 60,055,824 | 60,247,061 | 60,056,059 | -0.317% |
+| issued instructions | 60,099,032 | 60,268,205 | 60,095,966 | about -0.28% |
+| eligible warps/cycle | 0.620 | 0.614 | 0.620 | about +0.005 |
+| short-scoreboard samples | 744 | 794 | 724 | -6.3% to -8.8% |
+| long-scoreboard samples | 4,568 | 4,515 | 4,585 | +1.2% to +1.6% |
+| barrier samples | 5,364 | 5,344 | 5,380 | +0.4% to +0.7% |
+
+The address CSE is real and avoids R186's resource failure, but its 0.32%
+instruction saving does not shorten the critical path.  Both candidate
+captures take more elapsed cycles; reduced short-scoreboard waiting is
+offset by higher long-scoreboard and barrier waiting.  R187 therefore fails
+the local mechanism gate before formal distributed timing, NSYS, or the full
+matrix.  This closes offset-only variants of the complete-row dual-LDS path:
+a future decoder change needs a larger instruction reduction without merging
+the four load outputs or weakening lookahead.
+
+R187 is fully reverted locally and on the pod.  The restored header is
+byte-identical to R180 at
+`cf91f518a72aec9c897b617b565a81031d5fdcdb80f653a85c7bb59baf3d2fd9`,
+and recovery `production.flash_m16` passes at `diff=0.000654`.  Exact sources,
+hashes, correctness/resource logs, three NCU reports and CSV exports, and
+recovery output are archived under
+`iter591-r187-flash-m16-offset-xor-gate`.
