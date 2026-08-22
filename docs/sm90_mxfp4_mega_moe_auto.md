@@ -9831,3 +9831,48 @@ at resource/correctness, with no NCU, NSYS, or distributed A/B timing, and is
 fully reverted to byte-identical R152.  The failing log, generated kernel,
 cubin, source snapshots, resource report, and hashes are archived under
 `iter548-r168-dispatch-decode-gate`.
+
+## R169 rejected: dispatch-assisted Flash M16 scale lookup only
+
+### Reason and temporary implementation
+
+R168 showed that moving the complete packed-B decoder to the idle dispatch
+warps exceeds their resource budget.  R169 tested a deliberately smaller unit
+of work: the dispatch warps only precomputed the four K32 E4M3 lookup words for
+each B row, while the 128-thread math warpgroup retained all packed-word loads,
+nibble extraction, decoded-byte stores, WGMMA issue, and task ownership.
+
+The exact eight-rank DSV4 Flash M16 specialization reused 4 KiB of the dead
+dispatch send buffer after routed pull for `128 rows * 4 K32 groups * uint2`.
+It also reused three combine mbarriers during GEMM and reinitialized them before
+combine.  No producer role, dynamic shared-memory allocation, packed address,
+or expanded-B address changed.  The math warpgroup used the dispatch result only
+after a ready probe and otherwise retained R152's local lookup, so the experiment
+did not delay the first tasks while dispatch was still active.
+
+Production Flash M16 correctness passes at `diff=0.000665`.  The exact generated
+eight-rank cubin nevertheless fails the zero-stack resource gate:
+
+| resource | R152 | R169 |
+| --- | ---: | ---: |
+| registers/thread | 128 | 128 |
+| stack frame | 0 B | 32 B |
+| static shared | 1,024 B | 1,024 B |
+| explicit local allocation | 0 B | 0 B |
+| PTXAS spill stores / loads | 0 / 0 B | 48 / 52 B |
+
+R152 contains no `LDL` or `STL`.  R169's SASS contains 24 local-memory
+instructions: seven stack slots are established near kernel entry, then
+recovered at widely separated PCs in dispatch, GEMM, the epilogue, and the
+final barrier path, followed by another group of stack stores.  This is not a
+single short-lived lookup temporary that can be scoped away.  The runtime
+ready/job/stop handoff extends pre-existing cross-phase state beyond the
+kernel's 128-register static ceiling.
+
+R169 is therefore stopped before NCU, NSYS, or distributed timing.  There is
+no valid before/after latency comparison for this rejected round: correctness
+passes, but stack and spills make it ineligible for benchmarking.  The source
+is fully reverted to byte-identical R152.  The production log, generated
+kernel, cubins, full SASS, local-memory opcode extracts, resource reports,
+source snapshot, and hashes are archived under
+`iter549-r169-dispatch-lookup-gate`.
