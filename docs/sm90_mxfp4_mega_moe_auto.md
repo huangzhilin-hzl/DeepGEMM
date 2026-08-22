@@ -11572,3 +11572,53 @@ The two new guards are retained and recovery passes at
 than 41.  Candidate/recovery source hashes, correctness logs, cubin resources,
 and both new guard outputs are archived under
 `iter613-r194-flash-m256-m512-full-row-gate`.
+
+## R195 rejected: factor Flash M16 secondary scale
+
+### Reason and implementation
+
+R191 still spends one expert-wide `mxfp4_secondary` multiply in every
+per-K-block BF16 promotion for Flash M16.  R195 tested whether that invariant
+factor could be removed from the hot loop without the spill observed in the
+regular-epilogue R193 variants.  Under the exact hidden-4096, 16-token,
+packed-BF16 swap-AB selector, the candidate retained the activation scale and
+overflow-safe x64 compensation in each promotion, then applied the secondary
+once to the 32 packed BF16 pairs with unrolled `HMUL2` instructions after all
+K blocks completed.  Its temporary header SHA256 was
+`67c04f5c661d62c924bbedc378b47e751338663e202866a179f468a7e757a0e4`.
+
+The candidate passes `production.flash_m16` at `diff=0.000654` and the
+PR411-derived concentrated hotspot at `diff=0.000663`.  Unlike R193, the
+packed epilogue preserves the resource contract: `REG=128`, `STACK=0`, and
+`LOCAL=0`.
+
+### NCU rejection
+
+The one-rank, 32-expert, seed-zero R195/R191/R195 NCU sandwich used cold L2
+and identical 13-pass sections.  Percentages below compare each candidate
+capture with the middle R191 control:
+
+| metric | R195 first | R191 control | R195 last | candidate change |
+| --- | ---: | ---: | ---: | ---: |
+| duration | 261.632 us | 260.960 us | 259.072 us | +0.258% / -0.724% |
+| executed instructions | 57,646,468 | 58,339,072 | 57,662,732 | -1.187% / -1.159% |
+| issued instructions | 57,700,216 | 58,367,500 | 57,675,399 | -1.143% / -1.186% |
+| issue active | 42.960% | 43.481% | 43.379% | -1.199% / -0.235% |
+| barrier samples | 5,437 | 5,384 | 5,458 | +0.984% / +1.374% |
+| short-scoreboard samples | 720 | 676 | 648 | +6.509% / -4.142% |
+| wait samples | 1,845 | 1,898 | 1,923 | -2.792% / +1.317% |
+
+R195 removes about 1.17% of the dynamic instructions, but both captures lose
+issue activity and add barrier samples.  Kernel duration straddles the
+control and averages only 0.233% lower, which is below the repeatability gate
+and does not establish a critical-path win.  R195 is therefore rejected
+before distributed timing, NSYS, or the 43-scenario suite.
+
+The source is fully reverted locally and on the pod to the accepted R191
+SHA256
+`7abe0773a73b6295226872cd92762732c16a7115b7a08e3cdfa8bea738d0d56d`;
+recovery `production.flash_m16` passes at `diff=0.000654`.  Candidate and
+control sources, correctness/resource output, all three NCU reports/CSVs, and
+the recovery log are archived under
+`iter614-r195-flash-m16-factor-secondary-gate-final` locally and
+`iter614-r195-flash-m16-factor-secondary-gate` on the H20 pod.
