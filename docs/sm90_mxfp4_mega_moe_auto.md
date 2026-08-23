@@ -13186,3 +13186,83 @@ rewriting the final cast/store expression; it requires less work per routed
 M64 block or a rank-consistent structural change that reduces the 78-block
 heavy-rank tail without deriving quorum or storage bounds from local token
 counts.
+
+## Rejected experiment R220: pair two N128 CTAs into one clustered N256 task
+
+### Reason and implementation
+
+PR383's routed Pro M512 path uses an N256 Linear2 tile, while the retained
+MXFP4 kernel uses independent N128 work items.  R43 had already shown that
+putting two math warpgroups in one CTA is catastrophic for small-M H20
+occupancy, so R220 tested a narrower alternative already supported by the
+scheduler abstraction: keep the 156-CTA, 256-thread grid and each CTA's
+independent A/B pipeline and single math warpgroup, but launch exact routed
+Pro M512 as 78 two-CTA clusters.  The cluster leader claimed one logical N256
+task and broadcast the task descriptor; cluster ranks zero and one evaluated
+the adjacent N128 halves.
+
+The specialization was exact for no-shared-expert hidden-7168 M512 with the
+accepted bank-permuted decoder and regular Linear2 output.  It changed the
+launch cluster dimension from one to two, instantiated
+`MegaMoEScheduler<..., 2>`, multiplied the task-mailbox empty-barrier quorum
+by two, added cluster initialization synchronization, used cluster rank in the
+N-block calculation, and let only the leader advance the shared task stream.
+It did not change dispatch/combine completion, cross-rank storage bounds,
+ring capacity, or expert-routing decisions, preserving the PR411 safety
+invariants.
+
+### Correctness and resource gate
+
+The eight-rank `production.pro_m512` test passed at `diff=0.000826`, and JIT
+diagnostics confirmed a `{156, 1}` grid, 256 threads per CTA, cluster dimension
+two, cooperative launch, and 101,600 bytes of dynamic shared memory.  Both the
+R203 control and R220 benchmark-capacity-8192 cubins use 128 registers, 1,024
+bytes static shared memory, zero stack, zero local allocation, and no spill.
+The R220 benchmark cubin SHA-256 is
+`97b3cf19bbd76bf8e349ff0295186db35dbfe7e4c3f4441f8b551d68f4128b57`;
+the matched R203 capacity-8192 control is
+`55db04196c25b07ba1e493d5bff064b90f2520b1dab70c6df7f7d89ccfa022c2`.
+
+### Eight-rank performance and machine-code cause
+
+The formal gate used seed zero, capacity 8192, one warmup, 15 observations,
+20 launches per observation, cold L2, and the maximum-rank median from
+`tests/bench_mega_moe_sm90.py`:
+
+| version | max-rank median | change vs R203 | rank-zero median | interpretation |
+| --- | ---: | ---: | ---: | --- |
+| PR383 residual control | 2,420.874 us | -5.18% | not recorded | target |
+| R203 latest recovery | 2,553 us | control | 2,542 us | retained baseline |
+| R220 two-CTA clustered task | 2,595 us | +1.65% | 2,563 us | regressed |
+
+R220 is 7.19% slower than PR383.  Grouping did halve logical task claims, but
+it also reduced independent scheduling units from 156 CTAs to 78 inseparable
+cluster pairs.  That loss of tail scheduling freedom matters on the fixed
+route whose ranks have 62--78 M64 blocks.  Matched capacity-8192 SASS shows
+that the broadcast path is not free even though register occupancy is
+unchanged:
+
+| static SASS count | R203 | R220 | delta |
+| --- | ---: | ---: | ---: |
+| total instructions | 5,668 | 6,292 | +624 |
+| `BRA*` | 70 | 88 | +18 |
+| `LDG*` | 73 | 87 | +14 |
+| `LDS*` | 77 | 79 | +2 |
+| `STS*` | 83 | 93 | +10 |
+| `BAR*` | 38 | 38 | 0 |
+
+### Decision and updated direction
+
+R220 was rejected at the authoritative distributed gate and fully reverted to
+R203.  It did not proceed to NCU/NSYS: the production metric regressed 1.65%
+against the immediate parent, while resource and SASS evidence already locate
+the failure in extra scheduler/broadcast work plus coarser tail scheduling,
+not occupancy or spilling.  Correctness, source snapshots, formal timing,
+cubins, resource reports, hashes, and matched SASS counts are archived under
+`iter667-r220-pro-m512-two-cta-task-cluster` on the H20 pod.
+
+This closes scheduler-only N256 grouping.  A future two-CTA experiment would
+need to remove duplicated payload work, such as a proven cluster-multicast A
+load, without coupling task retirement or reducing independent heavy-rank
+tail scheduling; merely sharing the task descriptor moves in the wrong
+direction.
