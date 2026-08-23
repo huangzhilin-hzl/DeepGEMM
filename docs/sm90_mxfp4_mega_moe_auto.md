@@ -13101,3 +13101,88 @@ Correctness, resource reports, hashes, the excluded reversed-count smoke run,
 the valid R203 15x20 recovery baseline, and both R218 15x20 timing logs are
 archived under `iter664-r203-resume-baseline` and
 `iter665-r218-pro-m512-packed-regular-l2` on the H20 pod.
+
+## Rejected experiment R219: compose packed-FP16 accumulation with direct L2 publication
+
+### Reason and implementation
+
+R207 reduced the exact routed Pro M512 specialization from 128 to 107
+registers by keeping both the FP16-output WGMMA fragment and its persistent
+cross-K sum as `half2`.  R218 separately showed that consuming R203's packed
+BF16 sum directly in the regular L2 epilogue spills at the 128-register peak.
+R219 tested the previously uncovered composition: use R207's 21-register
+headroom, omit its 64-float final expansion for routed Linear2, convert each
+final `half2` pair to `bfloat162` at the point of use, and issue the existing
+32-bit shared store directly.
+
+The selector remained exact for fast-math routed hidden-7168 M512 with the
+accepted bank-permuted MXFP4 decoder, no C/D swizzle, and no shared experts.
+Linear1 still expanded the packed accumulator because SwiGLU consumes FP32;
+all other specializations retained R203.  Scheduler ordering, 156-worker grid,
+ring bounds, dispatch completion protocol, and cross-rank storage decisions
+were unchanged, so the PR411 quorum and concentrated-routing constraints were
+not weakened.
+
+### Correctness and resource gate
+
+Eight-rank `production.pro_m512` passed at `diff=0.000595`.  The capacity-512
+and benchmark-capacity-8192 cubins both used 107 registers, 1,024 bytes static
+shared memory, zero stack, zero local allocation, and no `LDL`/`STL`.  R219
+therefore avoided R218's spill failure exactly as intended.  The capacity-512
+cubin SHA-256 was
+`4347fa6b8afe21f174d599e8561e288418a1108cbfd7f132c21683245e839d71`;
+the authoritative capacity-8192 cubin was
+`974e2b49a5cf4e43349c470a55bd7aa60b0c6c7986a2ba39f200d404b638bc87`.
+
+### Eight-rank performance and machine-code cause
+
+R219 and the restored byte-exact R207 control used 15 observations, 20
+launches per observation, one warmup, cold L2, seed zero, capacity 8192, and
+maximum-rank medians from `tests/bench_mega_moe_sm90.py`.  The latest same-
+protocol R203 recovery and the 15-observation PR383 residual control are shown
+for context:
+
+| version | max-rank median | change vs R207 | rank-zero median | interpretation |
+| --- | ---: | ---: | ---: | --- |
+| PR383 residual control | 2,420.874 us | -4.24% | not recorded | target |
+| R207 packed-FP16 control | 2,528 us | control | 2,515 us | immediate control |
+| R219 packed-FP16 + direct L2 | 2,550 us | +0.87% | 2,533 us | regressed |
+| R203 latest recovery | 2,553 us | +0.99% | 2,542 us | retained baseline |
+
+R219 is only 0.12% faster than the independent R203 recovery but 0.87% slower
+than its immediate R207 parent and remains 5.33% slower than PR383.  Static
+SASS explains why no conversion saving appears.  R207 and R219 have identical
+counts for `HADD2` (184), `HFMA2` (96), `LDS` (80), and `STS` (132), as well
+as the same 107-register resource footprint.  Ptxas had already folded R207's
+FP32 expansion and BF16 repack into the same pairwise conversion/store work.
+R219 changes only control flow:
+
+| static SASS count | R207 | R219 | delta |
+| --- | ---: | ---: | ---: |
+| total instructions | 6,172 | 6,220 | +48 |
+| `BRA` | 374 | 390 | +16 |
+| `BSSY` | 80 | 96 | +16 |
+| `BSYNC` | 80 | 96 | +16 |
+
+Moving pair conversion inside the valid-row store condition prevents the
+compiler from preserving R207's predicated epilogue and adds one divergent
+control region per unrolled chunk.  There is no hidden arithmetic reduction
+to recover by further rearranging this path: at best, removing the 48 control
+instructions returns to byte-equivalent R207, which already failed the
+four-bracket acceptance rule.
+
+### Decision and updated direction
+
+R219 was rejected at the authoritative distributed gate and fully reverted to
+R203.  No NCU or NSYS run is claimed for this candidate: the production metric
+already regresses against the immediate parent, and SASS proves that the
+intended instruction saving does not exist.  Correctness, both formal logs,
+source snapshots, cubins, resource output, and opcode-count diff are under
+`iter666-r219-pro-m512-packed-accum-direct-l2` on the H20 pod.
+
+This closes direct regular-L2 publication for both R203's packed BF16 state
+and R207's packed FP16 state.  The remaining Pro M512 gap cannot be removed by
+rewriting the final cast/store expression; it requires less work per routed
+M64 block or a rank-consistent structural change that reduces the 78-block
+heavy-rank tail without deriving quorum or storage bounds from local token
+counts.
