@@ -832,6 +832,31 @@ def _full_scenarios(
             fast_math=True,
             activation_clamp=10.0,
         )),
+        # Compatibility probes intentionally exercise dimensions rather than
+        # model-name dispatch.  They cover shared experts and wider top-k so
+        # optimization selectors cannot silently assume the DSV4 topology.
+        ('compat.h6144_i2048_e256_topk8_shared1_m512', dict(
+            num_max_tokens_per_rank=512,
+            num_tokens=512,
+            hidden=6144,
+            intermediate_hidden=2048,
+            num_experts=32 * num_ranks,
+            num_topk=8,
+            num_shared_experts=1,
+            fast_math=True,
+            activation_clamp=10.0,
+        )),
+        ('compat.h7168_i3072_e896_topk16_shared2_m512', dict(
+            num_max_tokens_per_rank=512,
+            num_tokens=512,
+            hidden=7168,
+            intermediate_hidden=3072,
+            num_experts=112 * num_ranks,
+            num_topk=16,
+            num_shared_experts=2,
+            fast_math=True,
+            activation_clamp=10.0,
+        )),
         ('production.pro_m8', dict(
             num_max_tokens_per_rank=128,
             num_tokens=8,

@@ -13498,3 +13498,110 @@ enough setup to erase the wait reduction; one call preserves setup but spills
 state across WGMMA.  The next iteration must return to an algorithmic
 PR383-versus-R203 comparison—especially work count, tile shape, and rank-tail
 behavior—rather than retain more decoder state across the saturated math warp.
+
+## Rejected experiment R224: globally predecoded E4M3 dual residency
+
+### First-principles hypothesis and implementation
+
+The direct PR383 comparison showed that R203 spends far more warp instructions
+on online MXFP4 conversion.  R224 tested the upper bound of eliminating that
+work: preprocess every routed E2M1 value into its exact E4M3 byte once, retain
+the original compact tuple for compatibility, and let the regular-M kernel TMA
+the E4M3 bytes directly.  The device path then skipped scale fetch, lookup,
+sign reconstruction, and the packed-to-expanded shared-memory decoder.
+
+The prototype was selected only by workload properties (`M >= 256` and no
+small-M swap-AB), not by model name, expert count, hidden size, or exact M.
+It used three independent 16-KiB expanded-B stages.  An initial attempt reused
+the C/D allocation for one B stage and produced NaNs because producer prefetch
+crossed the epilogue lifetime; the independent allocation fixed correctness.
+The final cubin had 127 registers, zero local allocation, and no compiler
+stack spill, and sustained two CTAs per H20 SM.
+
+The byte accounting is decisive.  Online decoding reads 0.5 byte of E2M1 plus
+one UE8M0 byte per 32 values, or 0.53125 byte/value.  Predecoded execution reads
+one E4M3 byte/value, 1.882x the routed-weight traffic.  Because this prototype
+also retained the compact checkpoint representation, routed-weight residency
+rose from 0.53125 to 1.53125 byte/value, or 2.882x.  The experiment is therefore
+acceptable only if removing conversion is substantially more valuable than
+both the extra traffic and the model-memory cost.
+
+### Correctness and broader-topology gate
+
+The independent-stage implementation passed the existing eight-rank Pro M512
+case at `diff=0.000708`.  It also passed two topology probes at `M=512`:
+
+| topology probe | result |
+| --- | ---: |
+| H6144, I2048, E256, top-k 8, one shared expert | `diff=0.000703` |
+| H7168, I3072, E256 diagnostic shard, top-k 16, two shared experts | `diff=0.000715` |
+
+The probes were motivated by the public GLM-5.2 and Kimi-K3 configurations,
+but the selector and kernel contain no model-name branches.  R224 was then
+fully reverted, while the permanent full-suite tests were strengthened to use
+H6144/I2048/E256/top-k-8/shared-1 and H7168/I3072/E896/top-k-16/shared-2.  These
+are topology compatibility tests, not a claim of full model semantic support;
+for example, activation and routed-intermediate conventions still need an
+explicit integration contract.  The final R203 source passed those permanent
+eight-rank cases at `diff=0.000687` and `diff=0.000751`, respectively.
+
+### Matched NCU and NSYS mechanism profile
+
+The current R224 specialization and the same source with predecode disabled
+were profiled on one H20 with Pro M512, E384, seed zero, capacity 8192, cold L2,
+one selected persistent-kernel launch, and separate warmed JIT caches.  NCU
+used the same five-pass hardware-counter set for both sides:
+
+| metric | compact online decode | predecoded E4M3 | predecoded change |
+| --- | ---: | ---: | ---: |
+| NCU kernel duration | 12.942656 ms | 12.827712 ms | -0.89% |
+| DRAM bytes read | 13.854616 GB | 25.752786 GB | +85.88% |
+| DRAM throughput | 26.888% | 50.186% | +23.30 points |
+| L2 requested bytes | 40.512317 GB | 64.232825 GB | +58.55% |
+| L2 throughput | 32.913% | 58.553% | +25.64 points |
+| SM-subpartition instructions | 2,835,086,837 | 1,202,225,845 | -57.59% |
+| average active SM cycles | 21,304,974.4 | 21,116,190.4 | -0.89% |
+| dynamic shared memory | 101.600 KiB | 109.792 KiB | +8.192 KiB |
+
+NSYS independently measured the selected persistent kernel at 11.783443 ms
+for compact decode and 11.648981 ms for predecode, a 1.14% local improvement.
+Thus the implementation removed the intended instruction work, but the 85.9%
+extra DRAM traffic consumed almost all of the isolated single-rank gain.
+
+### Eight-rank performance gate
+
+The final A/B used exactly the same source except for the predecode selector,
+eight H20 ranks, seed zero, capacity 8192, one warmup, 20 observations, 20
+launches per observation, cold L2, and maximum-rank medians:
+
+| model / M | compact | predecoded | predecoded change |
+| --- | ---: | ---: | ---: |
+| Flash / 256 | 509.644 us | 530.365 us | +4.07% |
+| Flash / 512 | 909.788 us | 904.423 us | -0.59% |
+| Flash / 1024 | 1,543.0 us | 1,527.0 us | -1.04% |
+| Pro / 256 | 1,679.5 us | 1,675.5 us | -0.24% |
+| Pro / 512 | 2,558.5 us | 2,546.5 us | -0.47% |
+| Pro / 1024 | 3,918.0 us | 3,953.0 us | +0.89% |
+
+The mixed result does not satisfy a general acceptance rule: the largest
+effect is a Flash-M256 regression, Pro-M1024 also regresses, and every apparent
+gain is at most 1.04% despite 2.882x routed-weight residency.  An exact-M or
+model-name allowlist could select the favorable cells, but would merely encode
+this sample and would be fragile for other expert counts, top-k values, shared
+experts, and route distributions.
+
+### Decision and next admissible direction
+
+R224 was rejected and the quad tensor contract, host predecoder, descriptors,
+extra shared-memory stage, and kernel specialization were fully reverted to
+R203.  NCU reports, NSYS reports, aligned eight-rank matrices, build logs, and
+JIT caches are archived under `iter672-r224-predecode-profile`; the earlier
+correctness/debug artifacts are under
+`iter671-r224-pro-m512-predecoded-dual-residency` on the H20 pod.
+
+This closes global full-weight predecode.  A future conversion optimization is
+admissible only if it keeps compact global traffic and amortizes conversion
+over real tile reuse; its selector must be derived from bytes per useful MAC,
+reuse multiplicity, and occupancy rather than a model or exact shape.  Until
+such reuse exists, reducing scheduler/rank-tail work or reducing decoder setup
+without increasing global bytes is the sounder path toward PR383.
