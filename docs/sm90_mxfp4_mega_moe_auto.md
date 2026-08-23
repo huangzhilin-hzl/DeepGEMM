@@ -13266,3 +13266,94 @@ need to remove duplicated payload work, such as a proven cluster-multicast A
 load, without coupling task retirement or reducing independent heavy-rank
 tail scheduling; merely sharing the task descriptor moves in the wrong
 direction.
+
+## Rejected experiment R221: balance next-stage Linear2 decode across two WGMMA flights
+
+### Reason and implementation
+
+The retained R203 Linear2 loop issues two independent K64 WGMMA groups for an
+N128 output tile, but decodes the complete next-stage MXFP4 weight tile only
+after the second group.  NCU source counters had therefore left a testable
+latency-hiding opportunity: move one of the two paired-row decode groups below
+the first WGMMA issue and leave the second group below the second issue.
+
+R221 templated `prepare_stage_weights` with a paired-row interval and a
+publication flag.  Exact fast-math routed Pro M512 decoded row group zero after
+the first K64 WGMMA, decoded row group one after the second K64 WGMMA, and kept
+the original single async-proxy fence plus warpgroup synchronization after the
+second half.  The selector required hidden 7168, the accepted bank-permuted
+paired-row decoder, regular Linear2 C/D, and no swap-AB path.  All other shapes
+kept R203.  Dispatch/combine completion, task claiming, grid size, routing,
+ring capacity, and cross-rank bounds were unchanged, so the PR411 safety
+invariants were unaffected.
+
+### Correctness and resource gate
+
+Eight-rank `production.pro_m512` passed at `diff=0.000710`.  The distributed
+capacity-8192 cubin used 128 registers, 1,024 bytes static shared memory, zero
+stack, and zero local allocation.  The candidate source SHA-256 was
+`1d74198cdd6c3e4a99888468dc0492a5aa7d51834b2eaa6bbfb108902f272ef0`;
+the capacity-8192 cubin SHA-256 was
+`189d993b3bd124f6aec2aa400c8eabf2251a8d3c478d9302eb411e9ca7622132`.
+
+### Eight-rank formal performance
+
+R221/R203/R221 used the same seed-zero capacity-8192 route, one warmup, 15
+observations, 20 launches per observation, cold L2, and maximum-rank medians
+from `tests/bench_mega_moe_sm90.py`:
+
+| bracket | max-rank median | change vs middle R203 | rank-zero median | range |
+| --- | ---: | ---: | ---: | ---: |
+| R221 first | 2,577 us | +0.08% | 2,549 us | 2,534--2,707 us |
+| R203 middle | 2,575 us | control | 2,545 us | 2,531--2,678 us |
+| R221 last | 2,553 us | -0.85% | 2,539 us | 2,515--2,716 us |
+
+The mean of the two candidate medians is 2,565 us, 0.39% faster than the
+middle R203 run, but the first bracket regresses and the distributed spread is
+larger than the apparent gain.  It therefore fails the strict all-bracket
+acceptance rule.  Relative to the 2,420.874-us PR383 residual control, the
+candidate mean remains 5.95% slower.
+
+### Matched NCU cause
+
+Because the scheduling mechanism was plausible despite the noisy production
+gate, R221/R203/R221 also received complete 39-pass NCU application-replay
+profiles on the exact no-dist Pro M512, E48, capacity-8192 specialization with
+cold L2, seed zero, and uncontrolled clocks.  Both candidate sides reproduce
+the same instruction and stall signature:
+
+| NCU metric | R221 first | R203 middle | R221 last | candidate effect |
+| --- | ---: | ---: | ---: | --- |
+| kernel duration | 2.232928 ms | 2.239840 ms | 2.220736 ms | -0.31% / -0.85% |
+| average active SM cycles | 3,970,038.9 | 3,984,278.3 | 3,969,786.0 | -0.36% / -0.36% |
+| SM subpartition instructions | 516,684,133 | 512,877,941 | 516,681,413 | +0.742% / +0.742% |
+| average warp latency | 9.538351 | 9.652588 | 9.538479 | -1.18% / -1.18% |
+| all barrier samples | 61,846 | 64,145 | 61,778 | -3.58% / -3.69% |
+| WGMMA barrier samples | 22,156 | 24,441 | 22,175 | -9.35% / -9.27% |
+| long-scoreboard samples | 39,789 | 39,603 | 39,802 | +0.47% / +0.50% |
+| short-scoreboard samples | 5,693 | 5,219 | 5,640 | +9.08% / +8.07% |
+| excessive shared wavefronts | 2,828,122 | 2,828,122 | 2,828,122 | unchanged |
+
+The split does exactly what it intended: it removes about 9.3% of sampled
+WGMMA barrier waiting and about 0.36% of active cycles.  It nevertheless calls
+the decoder lambda twice, so each half rematerializes the packed/expanded
+shared addresses, local N index, scale address, and scale-word load.  That
+raises executed instructions by 0.742% and short-scoreboard stalls by 8--9%,
+neutralizing the exposed-latency reduction at the eight-rank gate.
+
+### Decision and updated direction
+
+R221 was rejected as a production change and fully reverted to byte-exact
+R203.  NSYS was intentionally skipped because the formal distributed gate did
+not pass on both candidate brackets; NCU already isolated an in-kernel cause.
+Correctness, source snapshot, formal timing logs, both candidate NCU reports,
+the matched R203 NCU report, source counters, cubins, resource reports, and
+hashes are archived under
+`iter668-r221-pro-m512-balanced-l2-next-decode` on the H20 pod.
+
+R222 should retain the proven two-flight placement but eliminate repeated
+decoder setup.  The narrow first step is to load the next-stage scale word once
+and pass it to both half-decodes; address hoisting should be added only if the
+128-register resource gate remains spill-free.  Acceptance still requires a
+correct R221-derived implementation to beat R203 on both sides of a formal
+distributed bracket, not merely improve single-rank NCU duration.
