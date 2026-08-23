@@ -13357,3 +13357,80 @@ and pass it to both half-decodes; address hoisting should be added only if the
 128-register resource gate remains spill-free.  Acceptance still requires a
 correct R221-derived implementation to beat R203 on both sides of a formal
 distributed bracket, not merely improve single-rank NCU duration.
+
+## Rejected experiment R222: carry one scale word across the balanced decode
+
+### Reason and implementation
+
+R221 proved that balancing the next-stage Linear2 decode removes about 9.3%
+of sampled WGMMA barrier waiting, but two calls to the decoder added 0.742%
+executed instructions and 8--9% short-scoreboard stalls.  R222 tested the
+narrowest redundant operation identified by source inspection: load each
+next-stage N row's four packed scale exponents once before the first half and
+pass that `scale_word` to both half-decodes instead of recalculating the scale
+address and issuing a second shared load.
+
+The exact selector and two-flight placement were otherwise identical to R221.
+All non-Pro-M512 specializations retained the original one-call R203 decoder.
+Scheduler, routing, dispatch/combine completion, ring capacity, storage bounds,
+and cross-rank quorum remained unchanged.
+
+### Correctness and resource gate
+
+Eight-rank `production.pro_m512` passed at `diff=0.000710`.  The formal
+capacity-8192 cubin used 128 registers, 1,024 bytes static shared memory, zero
+stack, and zero local allocation, so extending the scale value across the
+first promotion did not create an explicit spill.  Candidate source SHA-256
+was `e0b461e5da7c552f08dc276ad20c8bbb35305b95d1653057b7890cb102ce3453`;
+the distributed capacity-8192 cubin SHA-256 was
+`a072db4668d8a4f04d1e94c4939b0af74afe47b4c299a4e4874ea16fb1fad6ca`.
+
+### Eight-rank performance and SASS result
+
+The R222/R203/R222 gate again used seed zero, capacity 8192, one warmup, 15
+observations, 20 launches per observation, cold L2, and maximum-rank medians:
+
+| bracket | max-rank median | change vs middle R203 | rank-zero median | range |
+| --- | ---: | ---: | ---: | ---: |
+| R222 first | 2,594 us | +0.62% | 2,587 us | 2,559--2,657 us |
+| R203 middle | 2,578 us | control | 2,556 us | 2,518--2,728 us |
+| R222 last | 2,565 us | -0.50% | 2,560 us | 2,523--2,653 us |
+
+The two candidate medians average 2,579.5 us, 0.06% slower than the immediate
+R203 control and 6.55% slower than the 2,420.874-us PR383 residual control.
+It therefore fails both the all-bracket acceptance rule and the mean result.
+
+Matched R221 and R222 capacity-8192 SASS confirms that the attempted hoist is
+far smaller than R221's measured dynamic overhead:
+
+| static SASS count | R221 | R222 | delta |
+| --- | ---: | ---: | ---: |
+| total instructions | 6,356 | 6,348 | -8 |
+| `LDS` | 81 | 80 | -1 |
+| `LEA` | 129 | 128 | -1 |
+| `IMAD` | 969 | 970 | +1 |
+| `BRA` | 376 | 376 | 0 |
+| `STS` | 132 | 132 | 0 |
+
+Keeping one scale word live eliminates the expected second `LDS` and one
+address instruction, but leaves the second invocation's packed pointer,
+expanded pointer, row mapping, and loop prologue.  The eight-instruction static
+reduction is too small to produce a stable distributed gain and may add
+scheduler pressure at the existing 128-register ceiling even without a spill.
+
+### Decision and updated direction
+
+R222 was rejected and fully reverted to byte-exact R203.  No new NCU or NSYS
+claim is made for R222: the formal gate is neutral-to-negative, while the
+matched R221 NCU profile plus the R221/R222 SASS diff already tests the stated
+mechanism.  Correctness, source snapshot, both candidate brackets, middle
+control, cubin, resource output, SASS, and hashes are archived under
+`iter669-r222-pro-m512-hoist-scale-word` on the H20 pod.
+
+R223 should make the inter-flight promotion and second WGMMA issue a midpoint
+callback inside one complete decoder invocation.  That layout keeps R221's
+proven wait reduction and R222's single scale load, but also gives the compiler
+one packed/expanded/local-N prologue and one row loop.  Its first gate is not
+timing: the capacity-8192 SASS must materially recover R221's 3.8-million
+dynamic-instruction increase without exceeding 128 registers or introducing
+local memory.
