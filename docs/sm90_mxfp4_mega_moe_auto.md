@@ -13434,3 +13434,67 @@ one packed/expanded/local-N prologue and one row loop.  Its first gate is not
 timing: the capacity-8192 SASS must materially recover R221's 3.8-million
 dynamic-instruction increase without exceeding 128 registers or introducing
 local memory.
+
+## Rejected experiment R223: one decoder call with an inter-flight midpoint
+
+### Reason and implementation
+
+R222 showed that carrying only the scale word across the two R221 half-decodes
+removes one `LDS` but does not remove the second decoder prologue.  R223 tested
+the complete composition proposed by R222: invoke the paired-row decoder once,
+finish row group zero, execute a compile-time midpoint callback that promotes
+the first K64 fragment and issues the second K64 WGMMA, then decode row group
+one before the original single async-proxy fence and warpgroup sync.
+
+Only the exact bank-permuted, regular-C/D hidden-7168 Linear2 path used the
+midpoint.  The ordinary decoder was wrapped with a compile-time no-op callback
+for every other specialization.  No scheduler, routing, completion, grid,
+storage-bound, or cross-rank protocol changed.
+
+### Correctness and resource/SASS gate
+
+Eight-rank `production.pro_m512` passed at `diff=0.000708`, so all 128 threads
+reached the midpoint consistently and the WGMMA promotion order was correct.
+The performance precondition failed, however.  The capacity-8192 cubin stayed
+at 128 registers and 1,024 bytes static shared memory but acquired a 48-byte
+stack frame.  SASS contains 12 `STL` and 16 `LDL` instructions, whereas R203,
+R221, and R222 have zero stack, `STL`, and `LDL`.
+
+| static SASS count | R221 two calls | R223 one call | delta |
+| --- | ---: | ---: | ---: |
+| total instructions | 6,356 | 6,498 | +142 |
+| `LDS` | 81 | 82 | +1 |
+| `STS` | 132 | 132 | 0 |
+| `LDL` | 0 | 16 | +16 |
+| `STL` | 0 | 12 | +12 |
+| `LEA` | 129 | 132 | +3 |
+| `IMAD` | 969 | 949 | -20 |
+| `BRA` | 376 | 376 | 0 |
+
+The callback itself was inlined: there are no `CALL`, `PRET`, or `RET`
+instructions.  The stack is instead caused by lifetime overlap.  A single
+invocation keeps packed/expanded pointers, scale state, row mapping, and
+decoder temporaries live while the first accumulator fragment is promoted and
+the second WGMMA is issued at an already saturated 128-register limit.  Ptxas
+moves that state to the stack, reversing the intended instruction saving.
+
+Candidate source SHA-256 was
+`b0798ed779bd16c4e39aecfee2f2a5a45eef258a80f20ace5a40d78fcf49d694`;
+the capacity-8192 cubin SHA-256 was
+`2d19adfc2a09defc54602fda4b71ac7d12c42a973c0903361310031ea0cc6e06`.
+
+### Decision and updated direction
+
+R223 was rejected before timing and fully reverted to byte-exact R203.  No
+formal benchmark, NCU, or NSYS result is claimed: a stack-free resource gate is
+mandatory for this persistent kernel, and static SASS already proves a larger
+instruction body.  Build, correctness, source, cubin, resource report, SASS,
+counts, and hashes are archived under
+`iter670-r223-pro-m512-single-call-midpoint` on the H20 pod.
+
+R221--R223 jointly close row-balanced decoder splitting at the current
+128-register accumulator footprint.  Two calls preserve lifetimes but repeat
+enough setup to erase the wait reduction; one call preserves setup but spills
+state across WGMMA.  The next iteration must return to an algorithmic
+PR383-versus-R203 comparison—especially work count, tile shape, and rank-tail
+behavior—rather than retain more decoder state across the saturated math warp.
