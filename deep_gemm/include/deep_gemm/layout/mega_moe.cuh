@@ -39,18 +39,10 @@ CUTLASS_HOST_DEVICE constexpr T get_num_padded_sf_pool_tokens(T num_max_pool_tok
     return get_num_sf_ring_tokens(num_max_pool_tokens, block_m);
 }
 
-// Shared L2 input SF capacity for a fixed schedule block size.
-template <typename T>
-CUTLASS_HOST_DEVICE constexpr T get_num_shared_sf_tokens(
-    const T& num_max_tokens_per_rank, const T& block_m) {
-    return math::constexpr_ceil_div<T>(num_max_tokens_per_rank, block_m) * 128;
-}
-
-// Backward-compatible worst case over all candidate BLOCK_M values.
+// Shared L2 input SF capacity: worst-case aligned SF pages over all candidate BLOCK_M.
 template <typename T>
 CUTLASS_HOST_DEVICE constexpr T get_num_max_shared_sf_tokens(const T& num_max_tokens_per_rank) {
-    return get_num_shared_sf_tokens(
-        num_max_tokens_per_rank, static_cast<T>(kMinCandidateBlockM));
+    return math::constexpr_ceil_div<T>(num_max_tokens_per_rank, kMinCandidateBlockM) * 128;
 }
 
 // Per-token source metadata for combine write-back
@@ -437,16 +429,14 @@ struct MegaMoEBuffer {
                   const uint32_t& num_sf_ring_tokens,
                   const bool& with_sf,
                   const uint32_t& num_shared_experts = 0,
-                  const ScaleLayoutSpec& scale_layout_spec = ScaleLayoutSpec(),
-                  const uint32_t shared_sf_block_m = kMinCandidateBlockM) {
+                  const ScaleLayoutSpec& scale_layout_spec = ScaleLayoutSpec()) {
         // Workspace
         workspace = Workspace(base, num_ranks, num_experts,
                               num_max_tokens_per_rank, num_topk, num_ring_tokens);
 
         // Shared
         const auto shared_intermediate_hidden = intermediate_hidden * num_shared_experts;
-        const auto num_max_shared_sf_tokens = with_sf ? get_num_shared_sf_tokens(
-            num_max_tokens_per_rank, shared_sf_block_m) : 0u;
+        const auto num_max_shared_sf_tokens = with_sf ? get_num_max_shared_sf_tokens(num_max_tokens_per_rank) : 0u;
 
         // A zero-initialized spec is the backward-compatible SM100 default.
         // Keeping the scale row sizes explicit prevents an SM90 K64 L2 scale
