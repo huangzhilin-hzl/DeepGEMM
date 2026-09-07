@@ -975,6 +975,53 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     // =====================================================================
     if (warp_idx < kNumDispatchWarps) {
         DG_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of topk");
+#if defined(DG_SM90_REPLICATED_LOCAL_DISPATCH)
+        DG_STATIC_ASSERT(kReplicatedInput and not kHasSharedExperts,
+                         "Local dispatch requires replicated routed inputs");
+        // Identical inputs already reside on each expert owner's GPU. One
+        // warp per local expert builds its source list in token/top-k order,
+        // without sending metadata or waiting for peer input buffers. The
+        // existing L2 broadcast/combine still returns every route to all ranks.
+        for (uint32_t expert = sm_idx * kNumDispatchWarps + warp_idx;
+             expert < kNumExpertsPerRank;
+             expert += kNumSMs * kNumDispatchWarps) {
+            const uint32_t global_expert =
+                sym_buffer.rank_idx * kNumExpertsPerRank + expert;
+            uint32_t count = 0;
+            for (uint32_t offset = 0; offset < num_tokens * kNumTopk;
+                 offset += 32) {
+                const uint32_t slot = offset + lane_idx;
+                const bool matched = slot < num_tokens * kNumTopk and
+                    __ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + slot) ==
+                        static_cast<int64_t>(global_expert);
+                const uint32_t mask = __ballot_sync(0xffffffffu, matched);
+                if (matched) {
+                    const uint32_t local_slot = count +
+                        __popc(mask & ((1u << lane_idx) - 1u));
+                    *workspace.get_src_token_topk_idx_ptr(
+                        expert, sym_buffer.rank_idx, local_slot) = slot;
+                }
+                count += __popc(mask);
+            }
+            for (uint32_t source = lane_idx; source < kNumRanks; source += 32)
+                *workspace.get_expert_recv_count_ptr(source, expert) =
+                    source == sym_buffer.rank_idx ? count : 0;
+            // Publish every lane's metadata before the scheduler sees the
+            // existing all-ranks completion tag. This is a local GPU fence;
+            // no other GPU produces or consumes the dispatch source lists.
+            __threadfence();
+            __syncwarp();
+            if (lane_idx == 0) {
+                const uint64_t status =
+                    (static_cast<uint64_t>(kNumSMs * kNumRanks) << 32) | count;
+                ptx::atomic_add(workspace.get_expert_recv_count_sum_ptr(expert), status);
+            }
+        }
+        sm90_grid_sync<kNumSMs, kDispatchGridSyncIndex>(
+            workspace, sm_idx, thread_idx,
+            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }
+        );
+#else
         constexpr uint32_t kNumActivateLanes = kNumTokensPerWarp * kNumTopk;
         const auto read_topk_idx = [&](const auto& process) {
             #pragma unroll
@@ -1068,6 +1115,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
             false, true);
 
+#endif
+
         // Selected Pro buckets make both dispatch warps and the B-loader
         // scheduler independently poll and load the same completed expert
         // totals. Publish one warp's snapshot through the dispatch scratch
@@ -1130,6 +1179,10 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
             uint32_t token_idx_in_rank = 0;
             const uint32_t token_idx_in_expert = token_idx - expert_start_idx;
 
+#if defined(DG_SM90_REPLICATED_LOCAL_DISPATCH)
+            current_rank_in_expert_idx = sym_buffer.rank_idx;
+            token_idx_in_rank = token_idx_in_expert;
+#else
             // At small routed Flash M, most experts receive at most one route
             // from each source rank. Select the source directly from the
             // nonempty mask in that common case; preserve the general
@@ -1192,6 +1245,8 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 for (uint32_t i = 0; i < kNumRanksPerLane; ++ i)
                     remaining[i] -= cute::min(remaining[i], length);
             }
+
+#endif
 
             const uint32_t src_token_topk_idx = *workspace.get_src_token_topk_idx_ptr(
                 current_expert_idx, current_rank_in_expert_idx, token_idx_in_rank);

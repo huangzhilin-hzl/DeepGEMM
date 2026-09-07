@@ -113,8 +113,14 @@ public:
         // full M64 block from all source ranks (including uneven-rank input).
         // Preserve the local bucket for policy selection, but use a separate
         // cross-rank-safe bound for epilogue storage.
+        // Replicated-input ownership bounds each expert by the input token
+        // count, rather than num_ranks * num_tokens. Keep an A/B switch while
+        // validating latency and all routing edge cases on H20.
+        const bool replicated_token_bound = args.replicated_input and
+            get_env("DG_SM90_MOE_REPLICATED_TOKEN_BOUND", 0);
         const uint32_t max_swap_ab_tokens =
-            args.num_ranks > 1 ? 64 : local_swap_ab_tokens;
+            args.num_ranks > 1 and not replicated_token_bound ?
+                64 : local_swap_ab_tokens;
         const bool packed_bf16_swap_epilogue =
             args.num_shared_experts == 0 and
             ((args.hidden == 4096 and
@@ -135,7 +141,9 @@ public:
             args.num_tokens >= kL2CDSwizzleMinTokens;
         const bool sparse_dispatch_completion =
             args.hidden == 4096 and
-            (args.num_tokens == 32 or args.num_tokens == 1024);
+            (args.num_tokens == 32 or args.num_tokens == 1024 or
+             (args.num_tokens <= 128 and
+              get_env("DG_SM90_MOE_SPARSE_DISPATCH", 0)));
         return fmt::format(R"(
 {}
 #include <deep_gemm/impls/sm90_fp8_mega_moe.cuh>
@@ -163,8 +171,12 @@ static void __instantiate_kernel() {{
     >);
 }};
 )",
-    sparse_dispatch_completion ?
-        "#define DG_SM90_SPARSE_DISPATCH_COMPLETION 1" : "",
+    std::string(sparse_dispatch_completion ?
+        "#define DG_SM90_SPARSE_DISPATCH_COMPLETION 1\n" : "") +
+        (args.replicated_input and args.num_shared_experts == 0 and
+         args.hidden == 4096 and args.num_tokens <= 128 and
+         get_env("DG_SM90_MOE_REPLICATED_LOCAL_DISPATCH", 0) ?
+            "#define DG_SM90_REPLICATED_LOCAL_DISPATCH 1\n" : ""),
     args.num_max_tokens_per_rank,
     args.hidden, args.intermediate_hidden,
     args.num_experts, args.num_topk,
