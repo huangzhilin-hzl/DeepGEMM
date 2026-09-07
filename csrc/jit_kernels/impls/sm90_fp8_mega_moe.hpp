@@ -46,6 +46,7 @@ public:
         int num_ring_tokens, num_sf_ring_tokens;
         float activation_clamp;
         bool fast_math;
+        bool replicated_input;
         MegaMoESM90Config config;
 
         // Runtime arguments. num_tokens also selects compile-time MXFP4
@@ -158,7 +159,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
-        {}, {}, {}
+        {}, {}, {}, {}
     >);
 }};
 )",
@@ -179,7 +180,8 @@ static void __instantiate_kernel() {{
     use_prmt_mxfp4_exponent ? "true" : "false",
     use_incremental_mxfp4_descriptor ? "true" : "false",
     bank_permute_mxfp4_pair_loads ? "true" : "false",
-    args.num_ring_tokens, args.num_sf_ring_tokens, args.num_shared_experts);
+    args.num_ring_tokens, args.num_sf_ring_tokens, args.num_shared_experts,
+    args.replicated_input ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -262,7 +264,8 @@ static void sm90_fp8_mxfp4_mega_moe(
     const float& activation_clamp,
     const bool& fast_math,
     const torch::Tensor& l1_mxfp4_secondary,
-    const torch::Tensor& l2_mxfp4_secondary
+    const torch::Tensor& l2_mxfp4_secondary,
+    const bool& replicated_input
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -426,6 +429,7 @@ static void sm90_fp8_mxfp4_mega_moe(
         .num_sf_ring_tokens = num_sf_ring_tokens,
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
+        .replicated_input = replicated_input,
         .config = persistent_config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,

@@ -193,7 +193,8 @@ static void sm90_mega_moe(
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool& replicated_input
 ) {
     const auto [l1_weights, l1_mxfp4_weights_sf, l1_mxfp4_secondary] = l1_weights_tuple;
     const auto [l2_weights, l2_mxfp4_weights_sf, l2_mxfp4_secondary] = l2_weights_tuple;
@@ -388,7 +389,8 @@ static void sm90_mega_moe(
                             num_tokens, num_topk,
                             hidden, intermediate_hidden,
                             activation_clamp, fast_math,
-                            l1_mxfp4_secondary, l2_mxfp4_secondary);
+                            l1_mxfp4_secondary, l2_mxfp4_secondary,
+                            replicated_input);
 
     if (get_env<int>("DG_COMM_KERNEL_DEBUG"))
         sym_buffer.zero_();
@@ -408,14 +410,15 @@ static void fp8_mxfp4_mega_moe(
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math) {
+    const bool& fast_math,
+    const bool& replicated_input) {
     sm90_mega_moe(
         y, l1_weights_tuple, l2_weights_tuple,
         shared_l1_weights_tuple_opt, shared_l2_weights_tuple_opt,
         cumulative_local_expert_recv_stats,
         sym_buffer, sym_buffer_ptrs, rank_idx,
         num_max_tokens_per_rank, num_experts, num_topk,
-        recipe, activation, activation_clamp_opt, fast_math);
+        recipe, activation, activation_clamp_opt, fast_math, replicated_input);
 }
 
 static void register_sm90_apis(pybind11::module_& m) {

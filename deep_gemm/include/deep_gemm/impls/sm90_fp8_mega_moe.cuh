@@ -268,7 +268,8 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     bool kBankPermuteMXFP4PairLoads, \
     uint32_t kNumRingTokens, \
     uint32_t kNumSFRingTokens, \
-    uint32_t kNumSharedExperts
+    uint32_t kNumSharedExperts, \
+    bool kReplicatedInput
 
 #define DG_SM90_FP8_MOE_KERNEL_ARGS_DECL \
     void* y, \
@@ -343,7 +344,7 @@ CUTLASS_DEVICE void sm90_nvlink_barrier(
     kUsePRMTMXFP4Exponent, \
     kUseIncrementalMXFP4Descriptor, \
     kBankPermuteMXFP4PairLoads, \
-    kNumRingTokens, kNumSFRingTokens, kNumSharedExperts
+    kNumRingTokens, kNumSFRingTokens, kNumSharedExperts, kReplicatedInput
 
 template <DG_SM90_FP8_MOE_TEMPLATE_PARAMS>
 CUTLASS_DEVICE void
@@ -983,7 +984,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                 if (i + (lane_idx / kNumTopk) < num_tokens and lane_idx < kNumActivateLanes) {
                     const int expert_idx = static_cast<int>(
                         __ldg(input_topk_idx_buffer.get_base_ptr<int64_t>() + i * kNumTopk + lane_idx));
-                    if (expert_idx >= 0)
+                    // Replicated decode tokens have one dispatch owner.
+                    // All ranks retain the full routing mask for COMBINE.
+                    const uint32_t input_token_idx = i + lane_idx / kNumTopk;
+                    if (expert_idx >= 0 and
+                        (not kReplicatedInput or
+                         input_token_idx % kNumRanks == sym_buffer.rank_idx))
                         process(i * kNumTopk + lane_idx, expert_idx);
                 }
                 __syncwarp();
@@ -3818,8 +3824,15 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             dst_token.get_base_ptr(),
                             n_idx * kCombineElementBytes +
                                 lane_in_row * kScatterBytesPerLane);
-                        auto mapped_dst_ptr = sym_buffer.map(dst_ptr, dst_rank_idx);
-
+                        // Preserve replicated output within the existing
+                        // NVLink epilogue and its completion barrier.
+                        constexpr uint32_t kDestinations =
+                            kReplicatedInput and not is_shared_phase ? kNumRanks : 1;
+                        #pragma unroll
+                        for (uint32_t destination = 0;
+                             destination < kDestinations; ++ destination) {
+                        auto mapped_dst_ptr = sym_buffer.map(
+                            dst_ptr, kDestinations > 1 ? destination : dst_rank_idx);
                         if constexpr (kScatterBytesPerLane == 32) {
                             const auto packed0 =
                                 *reinterpret_cast<uint4*>(smem_ptr);
@@ -3839,6 +3852,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                             // The width assertion above leaves only the 4-byte case.
                             *reinterpret_cast<uint32_t*>(mapped_dst_ptr) =
                                 *reinterpret_cast<uint32_t*>(smem_ptr);
+                        }
                         }
                     }
 

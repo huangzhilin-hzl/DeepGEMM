@@ -335,7 +335,8 @@ def fp8_mxfp4_mega_moe(y: torch.Tensor,
                        recipe: Tuple[int, int, int] = (1, 1, 32),
                        activation: str = 'swiglu',
                        activation_clamp: Optional[float] = None,
-                       fast_math: bool = True):
+                       fast_math: bool = True,
+                       replicated_input: bool = False):
     """Run the SM90 Humming-compatible MXFP4 MegaMoE path.
 
     Routed weights must be processed triples
@@ -349,6 +350,13 @@ def fp8_mxfp4_mega_moe(y: torch.Tensor,
     :func:`transform_shared_weights_for_fp8_mega_moe_sm90` and copy the
     input K128 FP32 scales into ``sym_buffer.shared_l1_acts_sf`` before launch.
     ``shared_l1_acts`` itself aliases ``sym_buffer.x``.
+
+    ``replicated_input=True`` requires identical token counts, quantized
+    activations, scales, top-k indices and weights on every rank. Each token
+    is dispatched only by rank ``token_idx % world_size``; the L2 epilogue
+    broadcasts each contribution into all ranks' combine buffers. Outputs
+    remain replicated without an additional collective. Do not enable this
+    for ordinary EP inputs or CP prefill shards.
     """
     if not isinstance(sym_buffer, SM90SymmBuffer):
         raise TypeError(
@@ -424,7 +432,7 @@ def fp8_mxfp4_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts, sym_buffer.num_topk,
         recipe,
         activation, activation_clamp,
-        fast_math
+        fast_math, replicated_input
     )
 
 def bf16_mega_moe(y: torch.Tensor,
