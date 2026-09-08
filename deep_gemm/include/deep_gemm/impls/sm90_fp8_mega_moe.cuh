@@ -372,6 +372,12 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
     constexpr uint32_t kNumExpertsPerRank = kNumExperts / kNumRanks;
     constexpr uint32_t kNumRingBlocks = kNumRingTokens / BLOCK_M;
     constexpr bool kHasSharedExperts = kNumSharedExperts > 0;
+#ifdef DG_SM90_MOE_DEFER_L1_PROMOTION
+    constexpr bool kDeferL1Promotion = true;
+#else
+    constexpr bool kDeferL1Promotion = false;
+#endif
+
     DG_STATIC_ASSERT(not kSmallMSwapAB or
                          ((kHidden == 4096 or kHidden == 7168) and
                           not kHasSharedExperts),
@@ -2783,8 +2789,9 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                         issue_swap_wgmma.template operator()<
                                             1, 1, 0, 4>(
                                             stage_idx, expanded_slot);
-                                        promote_swap_ab.template operator()<
-                                            0, 1, 1, false>(stage_idx, 0);
+                                        if constexpr (not kDeferL1Promotion)
+                                            promote_swap_ab.template operator()<
+                                                0, 1, 1, false>(stage_idx, 0);
                                     } else {
                                         issue_swap_wgmma.template operator()<
                                             0, 1, 0, 2>(
@@ -2865,6 +2872,17 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                             next_stage,
                                             expanded_slot ^ 1u);
                                     }
+                                }
+                                // Both independent WGMMA fragments stay live
+                                // while the disjoint next expanded slot is
+                                // prepared. Preserve wait and BF16 operation
+                                // order within each weight half, and release
+                                // the current SFA stage only after half 1.
+                                if constexpr (kDeferL1Promotion and
+                                              is_linear1_phase and
+                                              kPipelineWeightHalves) {
+                                    promote_swap_ab.template operator()<
+                                        0, 1, 1, false>(stage_idx, 0);
                                 }
                                 if constexpr (kPipelineWeightHalves) {
                                     promote_swap_ab.template operator()<

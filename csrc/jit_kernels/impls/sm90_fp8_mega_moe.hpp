@@ -174,6 +174,11 @@ static void __instantiate_kernel() {{
     std::string(args.num_ranks == 1 and args.num_shared_experts == 0 and
         args.hidden == 4096 and args.intermediate_hidden == 512 and
         args.num_experts == 128 and args.num_tokens >= 3 and args.num_tokens <= 16 and
+        get_env("DG_SM90_MOE_DEFER_L1_PROMOTION", 0) ?
+        "#define DG_SM90_MOE_DEFER_L1_PROMOTION 1\n" : "") +
+    std::string(args.num_ranks == 1 and args.num_shared_experts == 0 and
+        args.hidden == 4096 and args.intermediate_hidden == 512 and
+        args.num_experts == 128 and args.num_tokens >= 3 and args.num_tokens <= 16 and
         get_env("DG_SM90_MOE_NARROW_ACTIVATION_TMA", 0) ?
         "#define DG_SM90_MOE_NARROW_ACTIVATION_TMA 1\n" : "") +
     std::string(sparse_dispatch_completion ?
