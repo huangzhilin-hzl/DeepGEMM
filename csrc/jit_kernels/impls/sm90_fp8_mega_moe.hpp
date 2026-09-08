@@ -171,6 +171,11 @@ static void __instantiate_kernel() {{
     >);
 }};
 )",
+    std::string(args.num_ranks == 1 and args.num_shared_experts == 0 and
+        args.hidden == 4096 and args.intermediate_hidden == 512 and
+        args.num_experts == 128 and args.num_tokens >= 3 and args.num_tokens <= 16 and
+        get_env("DG_SM90_MOE_NARROW_ACTIVATION_TMA", 0) ?
+        "#define DG_SM90_MOE_NARROW_ACTIVATION_TMA 1\n" : "") +
     std::string(sparse_dispatch_completion ?
         "#define DG_SM90_SPARSE_DISPATCH_COMPLETION 1\n" : "") +
         (args.replicated_input and args.num_shared_experts == 0 and
@@ -314,11 +319,17 @@ static void sm90_fp8_mxfp4_mega_moe(
     // widened later; the current Humming schedule resolves both to 128.
     const int tma_block_k = std::min(config.block_k, kGranK);
     const int tma_block_n = std::min(config.block_n, 256);
+    const bool narrow_activation_tma = num_ranks == 1 and num_shared_experts == 0 and
+        hidden == 4096 and intermediate_hidden == 512 and num_experts_per_rank == 128 and
+        num_tokens >= 3 and num_tokens <= 16 and
+        get_env("DG_SM90_MOE_NARROW_ACTIVATION_TMA", 0);
+    const int load_activation_m = narrow_activation_tma ?
+        (num_tokens <= 8 ? 8 : 16) : config.block_m;
     const int pool_tokens = num_ring_tokens;
     const int sf_stride_tokens = num_sf_ring_tokens;
     const auto tensor_map_l1_acts = make_tma_2d_desc(l1_acts,
                                                      hidden, pool_tokens,
-                                                     tma_block_k, config.block_m,
+                                                     tma_block_k, load_activation_m,
                                                      static_cast<int>(l1_acts.stride(-2)),
                                                      128);
     const auto tensor_map_l1_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l1_acts_sf,
@@ -347,7 +358,7 @@ static void sm90_fp8_mxfp4_mega_moe(
                                                        0);
     const auto tensor_map_l2_acts = make_tma_2d_desc(l2_acts,
                                                      intermediate_hidden, pool_tokens,
-                                                     tma_block_k, config.block_m,
+                                                     tma_block_k, load_activation_m,
                                                      static_cast<int>(l2_acts.stride(-2)),
                                                      128);
     const auto tensor_map_l2_acts_sf = make_tma_sf_desc(cute::UMMA::Major::MN, l2_acts_sf,

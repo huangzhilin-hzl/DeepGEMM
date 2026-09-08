@@ -501,6 +501,14 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
 
     // SM90 MegaMoE uses one CTA per work item; A and B are CTA-local.
     constexpr uint32_t LOAD_BLOCK_M    = BLOCK_M;
+#ifdef DG_SM90_MOE_NARROW_ACTIVATION_TMA
+    DG_STATIC_ASSERT(kSmallMSwapAB and kNumRanks == 1 and not kHasSharedExperts and
+                     kMaxSwapABTokens <= 16,
+                     "Narrow activation TMA requires the existing small-M token bound");
+    constexpr uint32_t kTMAActivationRows = kMaxSwapABTokens;
+#else
+    constexpr uint32_t kTMAActivationRows = LOAD_BLOCK_M;
+#endif
     constexpr uint32_t LOAD_BLOCK_N    = BLOCK_N;
     constexpr uint32_t kSwizzleAMode   = 128;
     constexpr uint32_t kSwizzleBMode   = 128;
@@ -1437,7 +1445,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                     #pragma unroll
                     for (uint32_t k_tile = 0;
                          k_tile < kNumTMATilesPerStage; ++ k_tile) {
-                        tma::copy<kTMATileK, LOAD_BLOCK_M,
+                        tma::copy<kTMATileK, kTMAActivationRows,
                                   kSwizzleAMode, a_dtype_t>(
                             tensor_map_a_ptr, full_barriers[stage_idx],
                             smem_a[stage_idx] +
@@ -1460,7 +1468,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 1);
                         }
                         full_barriers[stage_idx]->arrive_and_expect_tx(
-                            SMEM_A_SIZE_PER_STAGE +
+                            kTMAActivationRows * BLOCK_K * sizeof(a_dtype_t) +
                                 (BLOCK_K / kGranK) * BLOCK_M * sizeof(float));
                     } else {
                         // L2 SFA per-64: one TMA per scale group.
@@ -1476,7 +1484,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 1);
                         }
                         full_barriers[stage_idx]->arrive_and_expect_tx(
-                            SMEM_A_SIZE_PER_STAGE +
+                            kTMAActivationRows * BLOCK_K * sizeof(a_dtype_t) +
                                 kNumL2SFAKGroups * BLOCK_M * sizeof(float));
                     }
                     } else {
