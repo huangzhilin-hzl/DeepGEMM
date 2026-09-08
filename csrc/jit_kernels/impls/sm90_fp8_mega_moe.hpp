@@ -350,7 +350,13 @@ static void sm90_fp8_mxfp4_mega_moe(
     // from this row-major global buffer into their own SMEM tile.
     // One warpgroup produces and stores the complete post-SwiGLU tile.
     constexpr int l1_output_box_n = MegaMoESM90Config::block_n / 2;
-    constexpr int l1_output_box_m = MegaMoESM90Config::block_m;
+    // The small-M consumer only reads the first 8/16 activation rows.
+    // Keep the physical row-major staging and ring unchanged, but omit the
+    // unused padding rows from this asynchronous TMA output store.
+    const bool narrow_l1_store_tma = narrow_activation_tma and
+        get_env("DG_SM90_MOE_NARROW_L1_STORE_TMA", 0);
+    const int l1_output_box_m = narrow_l1_store_tma ?
+        load_activation_m : MegaMoESM90Config::block_m;
     const auto tensor_map_l1_output = make_tma_2d_desc(l2_acts,
                                                        intermediate_hidden, pool_tokens,
                                                        l1_output_box_n, l1_output_box_m,
