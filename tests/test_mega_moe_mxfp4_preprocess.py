@@ -314,7 +314,14 @@ def test_explicit_wrapper_rejects_wrong_local_expert_shard_before_launch():
         _unload_fake_package(package_name)
 
 
-def test_explicit_wrapper_forwards_only_processed_triples():
+@pytest.mark.parametrize(
+    'replicated_kwargs, expected_replicated',
+    [({}, False), ({'replicated_input': False}, False), ({'replicated_input': True}, True)],
+    ids=['default', 'explicit-false', 'explicit-true'],
+)
+def test_explicit_wrapper_forwards_only_processed_triples(
+    replicated_kwargs, expected_replicated,
+):
     mega, package_name = _load_mega_api_for_cpu()
     calls = []
 
@@ -348,20 +355,21 @@ def test_explicit_wrapper_forwards_only_processed_triples():
         mega.fp8_mxfp4_mega_moe(
             y, processed_l1, processed_l2, buffer,
             recipe=(1, 1, 32), activation='swiglu',
-            activation_clamp=10.0, fast_math=False)
+            activation_clamp=10.0, fast_math=False, **replicated_kwargs)
     finally:
         _unload_fake_package(package_name)
 
     assert len(calls) == 1
     args = calls[0]
-    assert len(args) == 16
+    assert len(args) == 17
     assert args[0] is y
     assert args[1] is processed_l1 and len(args[1]) == 3
     assert args[2] is processed_l2 and len(args[2]) == 3
     assert args[3] is None and args[4] is None
     assert args[7] == [0x1234]
     assert args[12] == (1, 1, 32)
-    assert args[13:] == ('swiglu', 10.0, False)
+    assert args[13:16] == ('swiglu', 10.0, False)
+    assert args[16] is expected_replicated
 
 
 def test_sm90_buffer_uses_dedicated_alignment_and_twelve_view_abi():

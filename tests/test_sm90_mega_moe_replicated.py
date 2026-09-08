@@ -2,7 +2,8 @@
 
 Run with: python tests/test_sm90_mega_moe_replicated.py --num-processes 8
 Uses different expert shards, identical input buffers, receive-count checks,
-empty/masked/imbalanced routes, and repeated CUDA Graph replay.
+independent reference storage, empty/masked/imbalanced routes, and repeated
+CUDA Graph replay with fresh inputs and routing on every replay.
 """
 
 import argparse
@@ -10,6 +11,7 @@ import json
 
 import torch
 import torch.distributed as dist
+
 
 def _quantize_grouped_mxfp4(weight):
     from deep_gemm.utils import per_token_cast_to_fp4
@@ -56,55 +58,70 @@ def worker(local_rank, args):
     )
     cases = [(m, "random") for m in (0, 1, 3, 8, 16, 64, 128, 256)]
     cases += [(16, "masked"), (128, "concentrated")]
+    reference_buffer = None
     try:
+        # A non-replicated reference must not seed the tested combine slots:
+        # otherwise a missing broadcast can read the reference's old values.
+        reference_buffer = deep_gemm.get_symm_buffer_for_sm90_mega_moe(
+            group, experts, 256, topk, hidden, intermediate
+        )
         for fast_math in (True, False):
             for m, routing in cases:
-                acts = torch.randn(m, hidden, device="cuda", dtype=torch.bfloat16)
-                quant, scales = per_token_cast_to_fp8(
-                    acts, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False
-                )
-                scores = torch.randn(m, experts, device="cuda")
-                values, ids = scores.topk(topk, dim=-1)
-                weights = values.softmax(-1)
-                if routing == "concentrated":
-                    ids.copy_(torch.arange(topk, device="cuda").expand(m, topk))
-                if routing == "masked":
-                    ids.fill_(-1)
-                    weights.zero_()
-                else:
-                    mask = torch.rand(m, topk, device="cuda") < 0.1
-                    ids.masked_fill_(mask, -1)
-                    weights.masked_fill_(mask, 0)
-                if m:
-                    for tensor in (quant, scales, ids, weights):
-                        dist.broadcast(tensor.view(torch.uint8), src=0, group=group)
-                buffer.x[:m].copy_(quant)
-                buffer.x_sf[:m].copy_(scales)
-                buffer.topk_idx[:m].copy_(ids)
-                buffer.topk_weights[:m].copy_(weights)
-                counts = torch.bincount(ids[ids >= 0], minlength=experts)
-                expected = counts[rank * local_experts : (rank + 1) * local_experts]
                 recv = torch.zeros(local_experts, device="cuda", dtype=torch.int32)
+                reference_recv = torch.zeros_like(recv)
                 reference = torch.empty(m, hidden, device="cuda", dtype=torch.bfloat16)
                 output = torch.empty_like(reference)
 
-                def run(y, replicated):
+                def prepare_inputs():
+                    acts = torch.randn(m, hidden, device="cuda", dtype=torch.bfloat16)
+                    quant, scales = per_token_cast_to_fp8(
+                        acts, use_ue8m0=False, gran_k=128, use_packed_ue8m0=False
+                    )
+                    scores = torch.randn(m, experts, device="cuda")
+                    values, ids = scores.topk(topk, dim=-1)
+                    weights = values.softmax(-1)
+                    if routing == "concentrated":
+                        ids.copy_(torch.arange(topk, device="cuda").expand(m, topk))
+                    if routing == "masked":
+                        ids.fill_(-1)
+                        weights.zero_()
+                    else:
+                        mask = torch.rand(m, topk, device="cuda") < 0.1
+                        ids.masked_fill_(mask, -1)
+                        weights.masked_fill_(mask, 0)
+                    if m:
+                        for tensor in (quant, scales, ids, weights):
+                            dist.broadcast(tensor.view(torch.uint8), src=0, group=group)
+                    for target in (buffer, reference_buffer):
+                        target.x[:m].copy_(quant)
+                        target.x_sf[:m].copy_(scales)
+                        target.topk_idx[:m].copy_(ids)
+                        target.topk_weights[:m].copy_(weights)
+                    counts = torch.bincount(ids[ids >= 0], minlength=experts)
+                    return counts[rank * local_experts : (rank + 1) * local_experts]
+
+                def run(y, target, stats, replicated):
                     deep_gemm.fp8_mxfp4_mega_moe(
                         y,
                         l1,
                         l2,
-                        buffer,
-                        cumulative_local_expert_recv_stats=recv,
+                        target,
+                        cumulative_local_expert_recv_stats=stats,
                         activation_clamp=10.0,
                         fast_math=fast_math,
                         replicated_input=replicated,
                     )
 
-                run(reference, False)
-                torch.cuda.synchronize()
-                assert torch.equal(recv.long(), expected * world)
-                recv.zero_()
-                run(output, True)
+                def check_reference(expected):
+                    reference_recv.zero_()
+                    run(reference, reference_buffer, reference_recv, False)
+                    torch.cuda.synchronize()
+                    assert torch.equal(reference_recv.long(), expected * world)
+
+                expected = prepare_inputs()
+                check_reference(expected)
+                output.fill_(float("nan"))
+                run(output, buffer, recv, True)
                 torch.cuda.synchronize()
                 assert torch.equal(recv.long(), expected)
                 torch.testing.assert_close(output, reference, rtol=0, atol=0)
@@ -112,13 +129,22 @@ def worker(local_rank, args):
 
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
-                    run(output, True)
-                recv.zero_()
-                for _ in range(4):
-                    graph.replay()
+                    run(output, buffer, recv, True)
                 torch.cuda.synchronize()
-                torch.testing.assert_close(output, reference, rtol=0, atol=0)
-                assert torch.equal(recv.long(), expected * 4)
+                recv.zero_()
+                cumulative_expected = torch.zeros_like(expected)
+                for _ in range(4):
+                    # Keep the captured addresses fixed, but change their data.
+                    # Each replay must overwrite old contributions and output.
+                    expected = prepare_inputs()
+                    check_reference(expected)
+                    output.fill_(float("nan"))
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    cumulative_expected += expected
+                    torch.testing.assert_close(output, reference, rtol=0, atol=0)
+                    assert bool(torch.isfinite(output).all())
+                    assert torch.equal(recv.long(), cumulative_expected)
                 del graph
                 dist.barrier(group=group)
                 if rank == 0:
@@ -131,11 +157,14 @@ def worker(local_rank, args):
                                 "bitwise_equal": True,
                                 "receive_counts": "passed",
                                 "graph_replays": 4,
+                                "graph_input_updates": 4,
                             }
                         ),
                         flush=True,
                     )
     finally:
+        if reference_buffer is not None:
+            reference_buffer.destroy()
         buffer.destroy()
         dist.destroy_process_group()
 
