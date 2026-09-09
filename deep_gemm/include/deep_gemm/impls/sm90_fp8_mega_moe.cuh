@@ -1605,6 +1605,16 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                         const auto* weight_sf_words =
                             reinterpret_cast<const uint32_t*>(weight_sf_base) +
                             k_block_idx * shape_n + local_n_idx;
+#if DG_SM90_MOE_WEIGHT_SF_COPY == 2
+                        // The existing blocked scale layout is contiguous:
+                        // one 512-byte bulk copy, tracked by the same full
+                        // transaction barrier as the packed weight tile.
+                        if (elected)
+                            ptx::tma_load_1d(
+                                smem_sfb[stage_idx], weight_sf_words,
+                                full_barriers[stage_idx], SMEM_SFB_SIZE_PER_STAGE,
+                                cute::TMA::CacheHintSm90::EVICT_NORMAL);
+#else
                         const uint4 scale_words = __ldg(
                             reinterpret_cast<const uint4*>(weight_sf_words) +
                             lane_idx);
@@ -1613,6 +1623,7 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
                                 lane_idx,
                             scale_words.x, scale_words.y,
                             scale_words.z, scale_words.w);
+#endif
                     } else {
                         #pragma unroll
                         for (uint32_t local_n = lane_idx; local_n < BLOCK_N;
@@ -1645,8 +1656,11 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
 
                 if (elected) {
                     full_barriers[stage_idx]->arrive_and_expect_tx(
-                        use_mxfp4_task ? SMEM_B_PACKED_SIZE_PER_STAGE :
-                                          SMEM_B_SIZE_PER_STAGE);
+                        use_mxfp4_task ? SMEM_B_PACKED_SIZE_PER_STAGE
+#if DG_SM90_MOE_WEIGHT_SF_COPY == 2
+                            + (kCoalescedMXFP4WeightSF ? SMEM_SFB_SIZE_PER_STAGE : 0)
+#endif
+                            : SMEM_B_SIZE_PER_STAGE);
                 }
                 __syncwarp();
                 if constexpr (is_shared_phase)
