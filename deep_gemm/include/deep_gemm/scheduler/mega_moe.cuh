@@ -196,6 +196,11 @@ struct MegaMoEScheduler {
     // Pre-cached per-expert token counts.
     // Layout: `stored_num_tokens_per_expert[i]` holds expert (i * 32 + lane_idx)'s count.
     uint32_t stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
+#if DG_SM90_MOE_CACHED_TASK_OFFSETS
+    // Counts are immutable after dispatch completion. Cache each lane's
+    // exclusive expert pool offset once, then reuse it for every N tile.
+    uint32_t stored_pool_offsets[kNumExpertsPerLane] = {};
+#endif
     uint32_t num_total_m_blocks = 0;
 
     // Per-scheduler warmup waves; all CTA-pair schedulers together form one global wave.
@@ -260,6 +265,19 @@ struct MegaMoEScheduler {
     CUTLASS_DEVICE void finalize_expert_recv_count() {
         __syncwarp();
 
+#if DG_SM90_MOE_CACHED_TASK_OFFSETS
+        uint32_t block_offset = 0;
+        #pragma unroll
+        for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
+            const uint32_t num_m_blocks =
+                math::ceil_div(stored_num_tokens_per_expert[i], BLOCK_M);
+            const uint32_t inclusive_num_m_blocks =
+                math::warp_inclusive_sum(num_m_blocks, ptx::get_lane_idx());
+            stored_pool_offsets[i] = block_offset +
+                inclusive_num_m_blocks - num_m_blocks;
+            block_offset += ptx::exchange(inclusive_num_m_blocks, 31);
+        }
+#endif
         num_total_m_blocks = get_num_total_pool_blocks();
         const uint32_t num_total_l1_tasks = num_total_m_blocks * kNumL1Clusters;
         const uint32_t num_task_groups = kNumSMs / kNumCTAsPerTask;
@@ -348,15 +366,21 @@ struct MegaMoEScheduler {
             }
         }
 
+#if !DG_SM90_MOE_CACHED_TASK_OFFSETS
         uint32_t block_offset = 0;
+#endif
         #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
             // Reduce whether task fall in the expert
             const uint32_t expert_idx = i * 32 + lane_idx;
             const uint32_t num_tokens = stored_num_tokens_per_expert[i];
             const uint32_t num_m_blocks = math::ceil_div(num_tokens, BLOCK_M);
+#if DG_SM90_MOE_CACHED_TASK_OFFSETS
+            const uint32_t lane_pool_block_offset = stored_pool_offsets[i];
+#else
             const uint32_t inclusive_num_m_blocks = math::warp_inclusive_sum(num_m_blocks, lane_idx);
             const uint32_t lane_pool_block_offset = block_offset + inclusive_num_m_blocks - num_m_blocks;
+#endif
             const bool is_owner = expert_idx < kNumExpertsPerRank and
                 m_block_idx >= lane_pool_block_offset and m_block_idx < lane_pool_block_offset + num_m_blocks;
             const uint32_t owner_mask = __ballot_sync(0xffffffff, is_owner);
@@ -370,7 +394,9 @@ struct MegaMoEScheduler {
                 result.m_block_idx = ptx::exchange(owner_m_block_idx, owner_lane_idx);
                 result.valid_m = ptx::exchange(owner_valid_m, owner_lane_idx);
             }
+#if !DG_SM90_MOE_CACHED_TASK_OFFSETS
             block_offset += ptx::exchange(inclusive_num_m_blocks, 31);
+#endif
         }
         return result;
     }
