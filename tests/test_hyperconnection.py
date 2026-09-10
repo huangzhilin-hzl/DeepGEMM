@@ -47,6 +47,77 @@ def test_hc_prenorm_gemm() -> None:
 
 
 
+@test_filter(lambda: get_arch_major() == 9)
+def test_hc_prenorm_register_lifetime() -> None:
+    """Exercise the RS WGMMA loop tail and output reuse under CUDA Graphs."""
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        for m in (192, 240, 256):
+            for num_splits in (16, 19, 20):
+                # K has 256 blocks: split19 executes 14 steps in its first
+                # nine CTAs and 13 in the rest, crossing the unrolled tail.
+                generator = torch.Generator(device='cuda').manual_seed(286)
+                sources = [torch.randn((m, 16384), dtype=torch.bfloat16,
+                                       device='cuda', generator=generator)
+                           for _ in range(2)]
+                a = sources[0].clone()
+                # BF16-valued FP32 weights are exact in TF32, so the
+                # reference checks register lifetime without input rounding.
+                b = torch.randn((24, 16384), dtype=torch.bfloat16,
+                                device='cuda', generator=generator).float()
+                d = torch.empty((num_splits, m, 24), device='cuda')
+                s = torch.empty((num_splits, m), device='cuda')
+
+                def run():
+                    deep_gemm.tf32_hc_prenorm_gemm(
+                        a, b, d, s, num_splits=num_splits)
+
+                run()
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    run()
+                torch.cuda.current_stream().wait_stream(stream)
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    run()
+
+                first_state = None
+                for state in (0, 1, 0):
+                    a.copy_(sources[state])
+                    run()
+                    first = (d.clone(), s.clone())
+                    reference_d = a.float() @ b.T
+                    reference_s = a.float().square().sum(-1)
+                    # Use the existing HC test's numerical reference bound.
+                    diff = max(calc_diff(d.sum(0), reference_d),
+                               calc_diff(s.sum(0), reference_s))
+                    assert diff < 1e-8, (m, num_splits, state, diff)
+                    if state == 0:
+                        if first_state is None:
+                            first_state = first
+                        else:
+                            assert all(torch.equal(x.view(torch.uint8), y.view(torch.uint8))
+                                       for x, y in zip(first, first_state)), (m, num_splits, 'revisit')
+                    for kind in ('ordinary', 'graph'):
+                        for repeat in range(32):
+                            d.fill_(float('nan'))
+                            s.fill_(float('nan'))
+                            run() if kind == 'ordinary' else graph.replay()
+                            assert all(torch.isfinite(x).all().item() for x in (d, s)), (
+                                m, num_splits, state, kind, repeat, 'nonfinite')
+                            assert all(torch.equal(x.view(torch.uint8), y.view(torch.uint8))
+                                       for x, y in zip((d, s), first)), (
+                                           m, num_splits, state, kind, repeat, 'raw repeat')
+                del graph
+                print(f' > HC register lifetime: {m=}, {num_splits=}, '
+                      'three input states, 32 ordinary and 32 Graph replays passed')
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+
+
 if __name__ == '__main__':
     torch.manual_seed(0)
     random.seed(0)
@@ -54,4 +125,5 @@ if __name__ == '__main__':
     print('Library path:')
     print(f' > {deep_gemm.__path__}\n')
 
+    test_hc_prenorm_register_lifetime()
     test_hc_prenorm_gemm()

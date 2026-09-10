@@ -165,6 +165,8 @@ sm90_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
 
         #pragma unroll kNumStages < 8 ? kNumStages : kNumStages / 2
         for (uint32_t s = 0; s < num_total_stages; ++ s) {
+            // Complete the prior register-A WGMMA before loading the next A fragment.
+            ptx::warpgroup_wait<0>();
             // Wait TMA arrival
             const auto& stage_idx = s % kNumStages;
             full_barriers[stage_idx]->wait((s / kNumStages) & 1);
@@ -202,7 +204,6 @@ sm90_tf32_hc_prenorm_gemm_impl(const uint32_t shape_m,
                 sqr_sum_acc_1 += a_float2_0.y * a_float2_0.y + a_float2_1.y * a_float2_1.y;
             }
 
-            ptx::warpgroup_wait<0>();
             if (s > 0)
                 empty_barriers[(s - 1) % kNumStages]->arrive();
 
