@@ -86,6 +86,13 @@ public:
     };
 
     static std::string generate_impl(const Args& args) {
+        const int release_fence = get_env("DG_SM90_MOE_EP8_RELEASE_FENCE", 2);
+        DG_HOST_ASSERT(release_fence >= 0 and release_fence <= 3);
+        const bool select_release_fence = args.num_ranks == 8 and
+            args.num_shared_experts == 0 and args.hidden == 4096 and
+            args.intermediate_hidden == 2048 and args.num_experts == 256 and
+            args.num_topk == 6 and args.num_tokens > 0;
+
         const bool overlap_mxfp4_scale_path =
             args.hidden >= 4096 or
             args.num_tokens <= kSM90MoeMaxLatencyOverlapTokens;
@@ -171,6 +178,12 @@ static void __instantiate_kernel() {{
     >);
 }};
 )",
+    std::string(select_release_fence and release_fence == 1 ?
+        "#define DG_SM90_MOE_EP8_RELEASE_FENCE 1\n" :
+        select_release_fence and release_fence == 2 ?
+        "#define DG_SM90_MOE_EP8_RELEASE_FENCE 2\n" :
+        select_release_fence and release_fence == 3 ?
+        "#define DG_SM90_MOE_EP8_RELEASE_FENCE 3\n" : "") +
     std::string(args.num_ranks == 1 and args.num_shared_experts == 0 and
         args.replicated_input and args.fast_math and
         args.hidden == 4096 and args.intermediate_hidden == 512 and

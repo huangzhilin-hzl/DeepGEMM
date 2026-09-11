@@ -1678,6 +1678,17 @@ sm90_fp8_mega_moe_core(DG_SM90_FP8_MOE_CORE_ARGS_DECL) {
         const uint32_t warp_idx_in_wg = epilogue_warp_idx;
 
         const auto arrive_empty_barrier = [&](const uint32_t& s) {
+#if defined(DG_SM90_MOE_EP8_RELEASE_FENCE)
+            // All lanes consume staged SFA; only lane zero signals reuse.
+            // Diagnose generic-read / async-refill ordering separately from
+            // the warp rendezvous. Keep all arithmetic and slot counts fixed.
+#if DG_SM90_MOE_EP8_RELEASE_FENCE >= 2
+            cutlass::arch::fence_view_async_shared();
+#endif
+#if DG_SM90_MOE_EP8_RELEASE_FENCE != 3
+            __syncwarp();
+#endif
+#endif
             if (lane_idx == 0)
                 empty_barriers[s]->arrive();
         };
